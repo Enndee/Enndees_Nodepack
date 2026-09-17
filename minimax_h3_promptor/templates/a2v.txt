@@ -1,0 +1,40 @@
+## Task Type: Audio-to-Video (A2V)
+
+This is an AUDIO-TO-VIDEO generation task. NO image or video is provided. ONLY an audio reference is provided. Build the visuals around the provided sound, synchronizing the scene, action, and sound design to the audio reference.
+
+### Reference label
+
+Use the official audio label for the provided audio: <Audio 1>. Keep this label consistent throughout the prompt. When the audio maps to a target speaker, reuse that speaker's global ID in the definition, e.g. <Audio 1> is the voice-timbre reference for ... (S1).
+
+### Output Format
+
+Write EXACTLY three fields in this order, each on its own line:
+
+1. integrated_multimodal_description: [Shot 1] ...
+2. overall_soundscape: ...
+3. non_diegetic_music: ...
+
+### Structure of integrated_multimodal_description
+
+- Begin [Shot 1] with the overall style and initial composition (e.g. "Cinematic, live-action, a medium-wide shot frames..."). Choose the style from the user's text or the audio's tone.
+- Build the world AROUND the provided sound: synchronize the on-screen action, pacing, and cut rhythm to the audio reference.
+- Do NOT add a timestamp to [Shot 1]. Number later shots sequentially with strictly increasing cut times formatted as MM:SS.mmm (e.g. "[Shot 2] At 00:03.000, the camera cuts to...").
+- Write camera movement as natural English within the shot, including motion type + amplitude + speed when meaningful.
+- Give vocal sources stable IDs (S1), (S2), etc. Write dialogue inside <d> with a language tag: <d>[English] ...</d>. Preserve the exact words verbatim. If the voice is directly copied from the audio, cite <Audio 1> as its source.
+- Place any visibly displayed text in English double quotation marks.
+
+### overall_soundscape
+
+Use 1–4 English sentences in one continuous paragraph to summarize ambient sound, physical action sounds, and non-verbal human sounds across the full video. Explicitly map the visual sound sources to <Audio 1> (e.g. lips moving, objects hitting) and state whether the audio signal is copied or referenced. Do not repeat dialogue or diegetic music here. Use "N/A" only for complete silence.
+
+### non_diegetic_music
+
+Use 1–3 English sentences to describe audience-only background music: instrumentation, tempo, rhythm, and dynamic changes. If <Audio 1> provides the score, state that it is directly reused as the audience-only score. Do not use abstract mood words. Use "N/A" when there is no non-diegetic music.
+
+### Example A2V Prompt
+
+integrated_multimodal_description: [Shot 1] Live-action, cinematic, a medium-wide shot frames a street musician tuning a guitar on a quiet evening corner. The camera pushes in with small amplitude at slow speed as the musician begins to play, matching each chord change to the rhythm carried by <Audio 1>. The sounds of footsteps and rattling coins appear in sync with the music's beat. [Shot 2] At 00:04.000, the shot cuts to a close-up of the musician's fingers striking the strings, while passersby pause and nod along in time with <Audio 1>.
+
+overall_soundscape: Quiet street ambience with distant traffic underneath. Footsteps and the soft clink of coins land in sync with <Audio 1>, which is referenced for pacing rather than copied.
+
+non_diegetic_music: N/A

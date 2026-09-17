@@ -1,0 +1,47 @@
+## Task Type: Image-to-Video (I2V)
+
+This is an IMAGE-TO-VIDEO generation task. ONE reference image is provided as the first frame anchor. The image is the actual first frame of the video at 0.00 seconds and belongs to [Shot 1]. No audio is referenced.
+
+### Critical First-Frame Alignment
+
+The first line of the final prompt MUST be this exact instruction, followed by one blank line before the core fields:
+
+"For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced."
+
+Use the angle-bracketed label <Picture 1> exactly as shown. Do NOT write "Image1".
+
+### Output Format
+
+After the first-frame instruction and one blank line, write EXACTLY three fields in this order, each on its own line:
+
+1. integrated_multimodal_description: [Shot 1] ...
+2. overall_soundscape: ...
+3. non_diegetic_music: ...
+
+### Structure of integrated_multimodal_description
+
+- Begin [Shot 1] by clearly establishing the style, subjects, composition, and scene anchors visible in <Picture 1>, then describe the next action. Recommended flow: first-frame anchor → action onset → continuous development → result or reaction.
+- Preserve the subject's identity, clothing, colors, key objects, and spatial relationships from <Picture 1> throughout.
+- Do NOT introduce new characters not visible in <Picture 1>.
+- Do NOT add a timestamp to [Shot 1]. Number later shots sequentially with strictly increasing cut times formatted as MM:SS.mmm (e.g. "[Shot 2] At 00:03.000, the camera cuts to...").
+- Write camera movement as natural English within the shot, including motion type + amplitude + speed when meaningful. Begin from <Picture 1>'s composition.
+- Give vocal sources stable IDs (S1), (S2), etc. Write dialogue inside <d> with a language tag: <d>[English] ...</d>. Preserve the exact words verbatim.
+- Place any visibly displayed text in English double quotation marks.
+
+### overall_soundscape
+
+Use 1–4 English sentences in one continuous paragraph to summarize ambient sound, physical action sounds, and non-verbal human sounds across the full video. Do not repeat dialogue, singing, or diegetic music here. Use "N/A" only for complete silence.
+
+### non_diegetic_music
+
+Use 1–3 English sentences to describe audience-only background music: instrumentation, tempo, rhythm, and dynamic changes. Do not use abstract mood words. Use "N/A" when there is no non-diegetic music.
+
+### Example I2V Prompt
+
+For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.
+
+integrated_multimodal_description: [Shot 1] Live-action, cinematic, the young woman shown in <Picture 1> remains beside the rain-covered train window, preserving her appearance, clothing, seat position, and the carriage layout. The camera trucks right with small amplitude at slow speed as she lifts her gaze from the folded letter toward the passing city lights. Her reflection moves across the glass while the quiet, breathy young woman (S1) says: <d>[English] I get off at the next station.</d> She folds the letter along its existing crease.
+
+overall_soundscape: The train wheels produce a steady metallic rhythm beneath a low ventilation hum. Rain ticks against the window while paper rustles softly in her hands.
+
+non_diegetic_music: N/A

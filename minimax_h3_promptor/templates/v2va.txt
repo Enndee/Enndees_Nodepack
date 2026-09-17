@@ -1,0 +1,45 @@
+## Task Type: Video-to-Video-Audio (V2VA)
+
+This is a VIDEO-TO-VIDEO generation task with an AUDIO reference. A reference video and an audio track are provided. Use the video for its motion, composition, subject, camera movement, cuts, rhythm, or temporal structure, and synchronize the audio to the target video.
+
+### Reference labels
+
+Use the official labels for the provided references:
+- <Video 1> — the reference video (editing source, continuation starting point, or whole-video temporal structure)
+- <Audio 1> — the audio reference (voice, music, sound effects, or pacing)
+
+Keep both labels consistent throughout the prompt. <Video 1> and <Audio 1> are numbered independently. State whether the audio is copied (fully_copy / partially_copy) or merely referenced (reference / weak_reference).
+
+### Output Format
+
+Write EXACTLY three fields in this order, each on its own line:
+
+1. integrated_multimodal_description: [Shot 1] ...
+2. overall_soundscape: ...
+3. non_diegetic_music: ...
+
+### Structure of integrated_multimodal_description
+
+- Begin [Shot 1] with the overall style and initial composition (e.g. "Cinematic, live-action, a medium-wide shot frames...").
+- Describe the continuous motion and continuity across the full video segment, maintaining spatial and temporal coherence.
+- Cite <Video 1> naturally where its source state, structure, or continuation relationship applies.
+- Synchronize the on-screen action and sound design to <Audio 1>. When a referenced subject speaks, retain both the visual reference label and the speaker ID: <Subject 1> (S1) ... says, <d>[English] ...</d>. If <Audio 1> supplies the voice, cite it as the source.
+- Do NOT add a timestamp to [Shot 1]. Number later shots sequentially with strictly increasing cut times formatted as MM:SS.mmm (e.g. "[Shot 2] At 00:03.000, the shot cuts to...").
+- Write camera movement as natural English within the shot, including motion type + amplitude + speed when meaningful.
+- Place any visibly displayed text in English double quotation marks.
+
+### overall_soundscape
+
+Use 1–4 English sentences in one continuous paragraph to summarize ambient sound, physical action sounds, and non-verbal human sounds across the full video. Explicitly state how the visual action interacts with <Audio 1> and whether the audio signal is copied or referenced. Do not repeat dialogue or diegetic music here. Use "N/A" only for complete silence.
+
+### non_diegetic_music
+
+Use 1–3 English sentences to describe audience-only background music: instrumentation, tempo, rhythm, and dynamic changes. If <Audio 1> provides the score, state that it is directly reused as the audience-only score. Do not use abstract mood words. Use "N/A" when there is no non-diegetic music.
+
+### Example V2VA Prompt
+
+integrated_multimodal_description: [Shot 1] Live-action, cinematic, a medium shot frames a dancer rehearsing in a loft studio, preserving the framing and body movement of <Video 1>. The camera pans right with small amplitude at slow speed as the dancer's steps land in sync with the rhythm of <Audio 1>. [Shot 2] At 00:04.000, the shot cuts to a close-up of the dancer's feet, the camera tracking the motion as each beat from <Audio 1> drives a new step.
+
+overall_soundscape: Loft room tone with soft reverb. The dancer's footsteps and breath land in sync with <Audio 1>, which is referenced for rhythm rather than copied directly.
+
+non_diegetic_music: N/A

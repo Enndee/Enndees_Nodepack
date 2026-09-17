@@ -1,0 +1,48 @@
+## Task Type: First/Last Frame (FL2VA)
+
+This is a FIRST/LAST FRAME generation task. TWO reference images define the start and end states: <Picture 1> is the opening frame, <Picture 2> is the ending frame. Describe the continuous path between them.
+
+### Critical Frame Alignment
+
+The first line of the final prompt MUST be this exact instruction, followed by one blank line before the core fields:
+
+"How the reference pictures align with the target video — Picture 1 (from Shot 1) aligns with the 0.00-second mark of the target video; Picture 2 (from Shot N) aligns with the S.SS-second mark of the target video."
+
+Use the plain labels "Picture 1" and "Picture 2" in this instruction line exactly as shown. Replace N with the index of the actual final shot and S.SS with the effective video duration formatted to exactly two decimal places (e.g. 5.00, 10.00, 15.00). The instruction must be the first line, followed by one blank line before the core fields.
+
+### Output Format
+
+After the alignment instruction and one blank line, write EXACTLY three fields in this order, each on its own line:
+
+1. integrated_multimodal_description: [Shot 1] ...
+2. overall_soundscape: ...
+3. non_diegetic_music: ...
+
+### Structure of integrated_multimodal_description
+
+- Focus on how the subject moves, how poses change, how objects are manipulated, how the composition evolves, and how the scene or lighting transitions from <Picture 1> to <Picture 2>.
+- Recommended flow: first-frame state → observable intermediate changes → progressively narrowing differences → last-frame state.
+- FL2VA generally favors a single long take so the model can interpolate continuously from the first frame to the last frame. Use multiple shots only when explicitly specified. The last frame must be reached by the final [Shot N] at the end of the video.
+- Subject count, identity, and props must remain consistent between both frames. No teleportation, no hard cuts, no fade or cross-dissolve transitions.
+- Begin [Shot 1] by establishing the style and composition visible in <Picture 1>. Do NOT add a timestamp to [Shot 1]. Number later shots sequentially with strictly increasing cut times formatted as MM:SS.mmm.
+- Write camera movement as natural English within the shot, including motion type + amplitude + speed when meaningful.
+- Give vocal sources stable IDs (S1), (S2), etc. Write dialogue inside <d> with a language tag: <d>[English] ...</d>. Preserve the exact words verbatim.
+- Place any visibly displayed text in English double quotation marks.
+
+### overall_soundscape
+
+Use 1–4 English sentences in one continuous paragraph to summarize ambient sound, physical action sounds, and non-verbal human sounds across the full video. Do not repeat dialogue, singing, or diegetic music here. Use "N/A" only for complete silence.
+
+### non_diegetic_music
+
+Use 1–3 English sentences to describe audience-only background music: instrumentation, tempo, rhythm, and dynamic changes. Do not use abstract mood words. Use "N/A" when there is no non-diegetic music.
+
+### Example FL2VA Prompt
+
+How the reference pictures align with the target video — Picture 1 (from Shot 1) aligns with the 0.00-second mark of the target video; Picture 2 (from Shot 1) aligns with the 8.00-second mark of the target video.
+
+integrated_multimodal_description: [Shot 1] Live-action, cinematic, a rain-soaked cyclist begins in the position and framing established by <Picture 1>, holding a closed black umbrella beside a silver bicycle. The camera pulls out with small amplitude at slow speed as she releases the bicycle handle, raises the umbrella above her shoulder, and presses the runner upward until the canopy opens. Water rolls from the expanding fabric while she steps beneath it, rotates the handle into the final angle, and settles into the pose, spacing, and composition established by <Picture 2> at the end of the shot.
+
+overall_soundscape: Rain falls steadily on the pavement, followed by the metallic click of the umbrella runner and the soft snap of the canopy opening. Water drips from the bicycle frame as distant traffic passes.
+
+non_diegetic_music: N/A

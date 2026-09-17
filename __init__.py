@@ -27,6 +27,12 @@ except Exception as _e:
     print(f"\033[31m[Enndee] VideoFrameExtractorWithAudio unavailable: {_e}\033[0m")
     Enndee_VideoFrameExtractorWithAudio = None
 
+try:
+    from minimax_h3_promptor import H3_Multimodal_Promptor_Enndee
+except Exception as _e:
+    print(f"\033[31m[Enndee] H3_Multimodal_Promptor_Enndee unavailable: {_e}\033[0m")
+    H3_Multimodal_Promptor_Enndee = None
+
 NODE_CLASS_MAPPINGS = {}
 NODE_DISPLAY_NAME_MAPPINGS = {}
 
@@ -39,6 +45,10 @@ if GLOMAPLichtfeldTracker is not None:
 if Enndee_VideoFrameExtractorWithAudio is not None:
     NODE_CLASS_MAPPINGS["Enndee_VideoFrameExtractorWithAudio"] = Enndee_VideoFrameExtractorWithAudio
     NODE_DISPLAY_NAME_MAPPINGS["Enndee_VideoFrameExtractorWithAudio"] = "Video Frame Extractor + Audio (Enndee)"
+
+if H3_Multimodal_Promptor_Enndee is not None:
+    NODE_CLASS_MAPPINGS["H3_Multimodal_Promptor_Enndee"] = H3_Multimodal_Promptor_Enndee
+    NODE_DISPLAY_NAME_MAPPINGS["H3_Multimodal_Promptor_Enndee"] = "MiniMax H3 Direct Promptor (Enndee)"
 
 WEB_DIRECTORY = os.path.join(_pack_dir, "web")
 

@@ -1,0 +1,41 @@
+## Task Type: Video-to-Video (V2V)
+
+This is a VIDEO-TO-VIDEO generation task. A reference video is provided. NO AUDIO is referenced. Use the reference video for its motion, composition, subject, camera movement, cuts, rhythm, or temporal structure.
+
+### Reference label
+
+Use the official video label for the provided reference: <Video 1>. Keep this label consistent throughout the prompt. If a person, object, scene, action, or effect from the reference video is reused as visible content, define it as a <Subject N> rather than overloading <Video 1>.
+
+### Output Format
+
+Write EXACTLY three fields in this order, each on its own line:
+
+1. integrated_multimodal_description: [Shot 1] ...
+2. overall_soundscape: ...
+3. non_diegetic_music: ...
+
+### Structure of integrated_multimodal_description
+
+- Begin [Shot 1] with the overall style and initial composition (e.g. "Cinematic, live-action, a medium-wide shot frames...").
+- Describe the continuous motion and continuity across the full video segment, augmenting or restyling the reference motion while maintaining spatial and temporal coherence.
+- Cite <Video 1> naturally where its source state, structure, or continuation relationship applies (e.g. "the shot mirrors the camera movement of <Video 1>").
+- Do NOT add a timestamp to [Shot 1]. Number later shots sequentially with strictly increasing cut times formatted as MM:SS.mmm (e.g. "[Shot 2] At 00:03.000, the shot cuts to...").
+- Write camera movement as natural English within the shot, including motion type + amplitude + speed when meaningful.
+- Give vocal sources stable IDs (S1), (S2), etc. Write dialogue inside <d> with a language tag: <d>[English] ...</d>. Preserve the exact words verbatim. Note that no audio is referenced, so any sound belongs to the target video's own design.
+- Place any visibly displayed text in English double quotation marks.
+
+### overall_soundscape
+
+Use 1–4 English sentences in one continuous paragraph to summarize ambient sound, physical action sounds, and non-verbal human sounds across the full video. Do not repeat dialogue, singing, or diegetic music here. Use "N/A" only for complete silence.
+
+### non_diegetic_music
+
+Use 1–3 English sentences to describe audience-only background music: instrumentation, tempo, rhythm, and dynamic changes. Do not use abstract mood words. Use "N/A" when there is no non-diegetic music.
+
+### Example V2V Prompt
+
+integrated_multimodal_description: [Shot 1] Live-action, cinematic, a low-angle tracking shot frames a runner crossing a rain-soaked plaza, preserving the framing and camera momentum of <Video 1>. The camera follows with large amplitude at fast speed as the runner weaves between puddles, each stride matching the pacing of the reference. [Shot 2] At 00:04.000, the shot cuts to a close-up of the runner's face, the camera holding a static shot as the subject's breath steadies and the scene slows.
+
+overall_soundscape: Steady rain on wet pavement with low distant traffic. Footsteps splash rhythmically with each stride, then soften as the runner slows.
+
+non_diegetic_music: N/A

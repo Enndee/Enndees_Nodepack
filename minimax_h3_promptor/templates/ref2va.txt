@@ -1,0 +1,129 @@
+## Task Type: Omni Reference (Ref2VA)
+
+This is an OMNI REFERENCE (full-reference) generation task. Multiple media references (images, videos, audio) are combined. Write each section in English; preserve the original language only for dialogue and lyrics inside <d> and for text visibly present in the scene.
+
+### Output Format
+
+Write EXACTLY six sections in this order, each with its header followed by its content:
+
+1. subject_definitions:
+2. summary:
+3. retention_analysis:
+4. detailed_description:
+5. overall_soundscape:
+6. non_diegetic_music:
+
+Do NOT use other section headers such as [REFERENCE USE], [IDENTITY / CONTINUITY LOCKS], [SCENE], [DIALOGUE], [SHOT LIST], [SOURCE MASTER], [EDIT], or [PRESERVE]. Use only the six official sections listed above.
+
+### Reference labels
+
+Use exactly four types of angle-bracketed labels:
+- <Subject N> — reusable visible content that will appear in the target video: people, animals, objects, clothing, props, scenes, backgrounds, environments, styles, actions, expressions, poses. This INCLUDES scenes and locations taken from an image (e.g. a room, a background). When a subject comes from an image, cite the image-sources inside the definition (e.g. "<Subject 4> is the room environment shown in <Picture 2>...").
+- <Picture N> — a reference image used as a CONCRETE FRAME ANCHOR: a shot's first frame, last frame, keyframe, edited keyframe, or storyboard/shot-planning reference. Use a standalone <Picture N> ONLY when the image itself anchors a specific frame or shot. Do NOT create a standalone <Picture N> for an image that merely supplies a character, object, scene, or style.
+- <Video N> — a reference video providing an editing source, continuation starting point, or whole-video temporal structure
+- <Audio N> — an audio signal that is copied or referenced
+
+CRITICAL PICTURE vs SUBJECT RULE: A standalone <Picture N> entry is used ONLY when a reference image serves as a concrete frame anchor (first frame, last frame, keyframe, or storyboard). If a reference image defines a character, object, scene, environment, or style, create a <Subject N> and cite the image inside that definition instead — do NOT add a separate <Picture N> entry for it. Scenes and locations from images are <Subject N>, not <Picture N>.
+
+STRICT ENFORCEMENT (apply this every time): When the user's description refers to a location, room, environment, or background from an image (e.g. "the room in picture 2", "the entrance to the room in picture 2"), you MUST define that location as a <Subject N> and cite the image inside it. You MUST NOT emit a standalone "<Picture N> is the room..." line for it. A <Picture N> standalone entry is reserved EXCLUSIVELY for a frame the camera literally starts on, ends on, or uses as a keyframe/storyboard. If an image is only a location/scene/character/object source, it NEVER gets its own <Picture N> line.
+
+WRONG (do NOT do this):
+<Picture 2> is the room seen through the doorway...   ← a room is a Subject, not a standalone Picture
+
+CORRECT (do this):
+<Subject 3> is the room environment shown in <Picture 2>, featuring...   ← room is a Subject, Picture 2 cited inside
+
+DECLARATION RULE: Every reference label (<Picture N>, <Subject N>, <Video N>, <Audio N>) that appears ANYWHERE in summary, retention_analysis, or detailed_description MUST be declared in subject_definitions. Never use a label you have not defined.
+
+SUBJECT PLACEMENT RULE (never show a subject's source frame): A <Subject N> is a character/object/scene that lives INSIDE the video. It must NEVER be presented as its own complete source image or frame. Do NOT "cut to" or display a subject's entire reference image, and do NOT use a subject image's background (e.g. a removed/black background on a cutout) as a scene, backdrop, or final frame. When a subject comes from a cutout image (background removed, transparent, or black), use ONLY the foreground character's appearance (face, hair, body, clothing); the shot must remain in the established location, and any camera push-in, zoom, or close-up on the subject happens within that location. A subject's source image defines its likeness only — never a frame, background, or shot composition.
+
+Once assigned, a label keeps the same meaning across all six sections. <Video N> and <Audio N> are numbered independently. Give each piece of referenced content a narrow, truthful role; never let "use the references" stand in for a proper definition.
+
+### subject_definitions
+
+Define EVERY piece of referenced content that will be used later. Give each item its own line and explain what its label denotes, its reference role, and the main features to follow. Name the source asset when provenance must be explicit.
+
+- Use a standalone <Picture N> line ONLY for a concrete frame anchor (first/last frame, keyframe, or storyboard).
+- If an image only defines a character, object, scene, or style, create a <Subject N> and cite the image inside its definition (e.g. "<Subject 1> is the man from <Picture 1>..."). Do NOT also add a standalone <Picture N> for that image.
+- Scenes/rooms/backgrounds from images become <Subject N> (e.g. "<Subject 4> is the room environment shown in <Picture 2>...").
+
+Rule: before finalizing, verify that every label used in summary, retention_analysis, and detailed_description appears in subject_definitions.
+
+### summary
+
+Use one short English paragraph to summarize the target video and its reference relationships. Begin with a square-bracketed task-type prefix chosen by this decision matrix:
+
+- A reference IMAGE serves as a first frame, last frame, keyframe, or concrete frame anchor → [keyframe completion]
+- An existing reference VIDEO is edited, continued, or extended → [video editing] or [video continuation]
+- Reference images/videos/audio provide generation guidance (character, scene, style, action) without a concrete frame → [reference generation]
+- Audio is copied → [audio reuse]; audio is referenced for style/timbre only → [audio reference]
+
+Combine multiple types with " + " (e.g. [keyframe completion + reference generation]). IMPORTANT: "video continuation" / "video editing" apply ONLY when a reference <Video N> exists. Starting from a still image (<Picture N>) is keyframe completion, NOT video continuation. Do not introduce new reference labels in this section.
+
+### retention_analysis
+
+Use one line for each reference label, describing how it is preserved, transferred, copied, or referenced. Use the fixed relationship markers:
+
+- fully_preserved — the defined role is fully retained
+- partially_preserved — the subject is still used but some attributes change (e.g. a static object that begins to animate while keeping its identity/texture)
+- attribute_transfer — characteristics are transferred to a DIFFERENT, separate target subject
+- weak_reference — only broad similarity in style/category/atmosphere is retained
+- Audio: fully_copy, partially_copy, reference, weak_reference
+
+IMPORTANT: attribute_transfer is ONLY for transferring features to a DIFFERENT subject. If a subject stays itself but changes state (e.g. a wooden owl that starts moving while keeping its wood texture and size), use partially_preserved, NOT attribute_transfer. Do not write (Sx) in this section.
+
+Examples:
+<Subject 1> (appears in [Shot 1], [Shot 3]): fully_preserved - ...
+<Subject 2> (appears in [Shot 1]): partially_preserved - its carved wooden texture and size are preserved while it gains organic wing-flapping motion.
+<Audio 1>: reference - the target speaker follows <Audio 1>'s voice timbre and measured delivery without copying the original signal.
+
+### detailed_description
+
+The main body, written in target-video playback order. Establish the overall style in one or two English sentences before [Shot 1]. Insert reference labels at their first appearance and where their roles apply. Write camera movement as natural English within the shot (motion type + amplitude + speed when meaningful). Place any visibly displayed text in English double quotation marks.
+
+CONTINUOUS SHOT vs CUTS: [Shot 1], [Shot 2], etc. mark hard CAMERA CUTS or distinct camera setups. If the video is a SINGLE CONTINUOUS SHOT (a plan-sequence / one continuous camera move, no cuts), use ONLY ONE [Shot 1] block and express the timeline inside it with inline timestamps in the format "At MM:SS.mmm, ..." (e.g. "At 00:05.000, the camera continues..."). Do NOT split a continuous shot into multiple [Shot N] blocks. Use separate [Shot N] blocks only for actual hard cuts.
+
+- [Shot 1] has no leading timestamp. If there are multiple shots, later shots use "[Shot N] At MM:SS.mmm, ..." with strictly increasing cut times.
+- Give vocal sources stable IDs (S1), (S2), etc. Write dialogue inside <d> with a language tag: <d>[English] ...</d>. Preserve the exact words verbatim.
+- When a referenced subject speaks, retain both the visual reference label and the speaker ID: <Subject 2> (S1) turns toward the woman and says, <d>[English] Last summer, I went to my grandfather's house. He talked about you.</d>
+- If verbal content is only a cue within a directly reused BGM or complete soundtrack, use <Audio N> as the audible source; do not invent an (Sx).
+- For generation tasks, normally write 350–500 English words; dialogue-dense content prioritizes fitting the complete spoken timeline.
+
+### overall_soundscape
+
+Use 1–4 English sentences in one continuous paragraph to summarize ambient sound, physical action sounds, and non-verbal human sounds across the full video. Do not repeat dialogue, singing, or diegetic music here. Use "N/A" only for complete silence.
+
+### non_diegetic_music
+
+Use 1–3 English sentences to describe audience-only background music: instrumentation, tempo, rhythm, and dynamic changes. Do not use abstract mood words. Use "N/A" when there is no non-diegetic music.
+
+### Example Ref2VA Prompt
+
+This example is a single continuous shot starting from a still image (keyframe completion). The room is a <Subject N> (not a standalone <Picture N>), the girl is a <Subject N> (her image is only cited inside her definition), and the owl uses partially_preserved (it animates but stays itself).
+
+subject_definitions:
+<Picture 1> is the first frame of [Shot 1], showing a man holding a wooden owl.
+<Subject 1> is the man from <Picture 1>, with short brown hair, wearing glasses and a grey zip-up fleece over a light patterned sweater.
+<Subject 2> is the small wooden owl held by <Subject 1> in <Picture 1>; it has a carved texture and maintains its size and shape even when moving.
+<Subject 3> is the young woman from <Picture 3>, with long dark hair, wearing a colorful floral bomber jacket and patterned blue trousers.
+<Subject 4> is the room environment shown in <Picture 2>, featuring a doorway leading into a brightly lit room.
+
+summary:
+[keyframe completion + reference generation] The video is a single continuous shot starting from <Picture 1>, where the wooden owl (<Subject 2>) comes to life and flies through a doorway into the room (<Subject 4>) to land on the head of the girl (<Subject 3>), who is standing centrally in that room.
+
+retention_analysis:
+<Picture 1> ([Shot 1] first frame): fully_preserved - serves as the initial composition and starting frame.
+<Subject 1> (appears in [Shot 1]): fully_preserved - the man's likeness is maintained as he holds the owl.
+<Subject 2> (appears in [Shot 1]): partially_preserved - its carved wooden texture and size are preserved while it gains organic wing-flapping motion.
+<Subject 3> (appears in [Shot 1]): fully_preserved - the girl's identity, clothing, and smile are maintained throughout the shot.
+<Subject 4> (appears in [Shot 1]): fully_preserved - defines the environment of the destination room revealed during the camera pan.
+
+detailed_description:
+The video is a cinematic live-action single continuous take with natural indoor lighting.
+[Shot 1] The scene begins exactly as <Picture 1>, showing <Subject 1> looking surprised as the wooden owl (<Subject 2>) in his hands suddenly starts flapping its wings with organic motion while maintaining its hard, carved wooden texture and size. The camera pans right at a steady speed, following the owl's flight path toward the viewer's right side. As the pan reaches a 90-degree angle from the original view, it reveals the entrance to the room (<Subject 4>), with no other corridors or rooms visible during this transition. At 00:05.000, the camera continues its smooth tracking motion, following the flying wooden owl (<Subject 2>) as it glides through the doorway into the room (<Subject 4>). The girl (<Subject 3>), positioned centrally in this room, watches the owl approach her. At 00:08.000, the camera performs a smooth push-in to a close-up of <Subject 3>'s face and head. The wooden owl (<Subject 2>) gently lands on top of her hair. <Subject 3> reacts with a bright, joyful smile, clearly enjoying the magical moment as the shot holds for the final second.
+
+overall_soundscape:
+Subtle, rhythmic wood-on-wood clicking sounds from the owl's wings flapping, accompanied by a soft whoosh of air and quiet indoor room tone.
+
+non_diegetic_music:
+N/A

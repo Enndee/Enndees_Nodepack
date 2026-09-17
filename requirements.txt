@@ -3,6 +3,7 @@
 
 imageio-ffmpeg>=0.4.9   # ffmpeg for the Audio output of the frame extractor
 psutil>=5.9             # memory guard of the frame extractor
+requests>=2.28.0        # MiniMax H3 Direct Promptor (LLM providers)
 
 # Optional (RMBG background removal in the GLOMAP node - the node keeps
 # working without it, only 'use_rmbg' is disabled):
