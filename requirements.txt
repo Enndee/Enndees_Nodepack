@@ -1,0 +1,9 @@
+# Core optional runtime dependencies for Enndees Nodepack.
+# numpy / torch / opencv / Pillow are bundled with ComfyUI itself.
+
+imageio-ffmpeg>=0.4.9   # ffmpeg for the Audio output of the frame extractor
+psutil>=5.9             # memory guard of the frame extractor
+
+# Optional (RMBG background removal in the GLOMAP node - the node keeps
+# working without it, only 'use_rmbg' is disabled):
+# transparent_background>=1.2.16

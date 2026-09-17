@@ -1,0 +1,19 @@
+# ── Downloaded COLMAP / GLOMAP binaries (created by install.py on demand) ──
+bin/
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ── Editor / OS ──
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Logs ──
+*.log
