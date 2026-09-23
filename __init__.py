@@ -33,6 +33,12 @@ except Exception as _e:
     print(f"\033[31m[Enndee] H3_Multimodal_Promptor_Enndee unavailable: {_e}\033[0m")
     H3_Multimodal_Promptor_Enndee = None
 
+try:
+    from enndee_resolution_selector import ResolutionSelectorEnndee
+except Exception as _e:
+    print(f"\033[31m[Enndee] ResolutionSelectorEnndee unavailable: {_e}\033[0m")
+    ResolutionSelectorEnndee = None
+
 NODE_CLASS_MAPPINGS = {}
 NODE_DISPLAY_NAME_MAPPINGS = {}
 
@@ -49,6 +55,10 @@ if Enndee_VideoFrameExtractorWithAudio is not None:
 if H3_Multimodal_Promptor_Enndee is not None:
     NODE_CLASS_MAPPINGS["H3_Multimodal_Promptor_Enndee"] = H3_Multimodal_Promptor_Enndee
     NODE_DISPLAY_NAME_MAPPINGS["H3_Multimodal_Promptor_Enndee"] = "MiniMax H3 Direct Promptor (Enndee)"
+
+if ResolutionSelectorEnndee is not None:
+    NODE_CLASS_MAPPINGS["Enndee_ResolutionSelector"] = ResolutionSelectorEnndee
+    NODE_DISPLAY_NAME_MAPPINGS["Enndee_ResolutionSelector"] = "Resolution Selector (Enndee)"
 
 WEB_DIRECTORY = os.path.join(_pack_dir, "web")
 

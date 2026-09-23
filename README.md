@@ -31,6 +31,7 @@ Lichtfeld Studio dataset in a single step.
 | **GLOMAP Lichtfeld Tracker (Enndee)** | `Enndee_GLOMAPLichtfeldTracker` | Global SfM camera tracking + Lichtfeld dataset export |
 | **Video Frame Extractor + Audio (Enndee)** | `Enndee_VideoFrameExtractorWithAudio` | Frame/audio extraction with an in-node timeline widget |
 | **MiniMax H3 Direct Promptor (Enndee)** | `H3_Multimodal_Promptor_Enndee` | Official-format MiniMax H3 prompts from reference images (vision LLM) |
+| **Resolution Selector (Enndee)** | `Enndee_ResolutionSelector` | Model-aware resolution presets + "keep source aspect ratio" sizing |
 
 ---
 
@@ -193,6 +194,65 @@ Runs the complete pipeline and writes a Lichtfeld Studio dataset:
 
 ---
 
+## Node: Resolution Selector (Enndee)
+
+Copied from the MIT licensed
+[ComfyUI_ResolutionSelector](https://github.com/BRADSEC/ComfyUI_ResolutionSelector)
+by BRADSEC (MIT, Copyright (c) 2023 BRADSEC) and extended with a source-aware
+sizing mode.
+
+Pick a model + preset resolution (the JS widget filters the list per model) and
+get width, height and a matching empty latent. New in this pack:
+
+* **`image` input** - connect a source image to derive the output size from it.
+* **`keep_source_aspect_ratio`** - when enabled, the output size comes from the
+  **aspect ratio of the connected image** and is scaled up *or* down to the
+  requested megapixels instead of using the preset dropdown.
+* **`target_megapixels`** - the pixel budget for that mode (`0` = use the
+  megapixels of the selected preset resolution).
+
+The result is always aligned to the model's `divisible_by` (e.g. 8 px, required
+for a valid empty latent) and kept inside the model's min/max range; both axes
+are scaled by the same factor, so the aspect ratio is preserved. The console
+prints e.g. `source 1920x1080 -> 1328x744 (0.99 MP, target_megapixels=1.00 MP, aligned to 8px)`.
+While `keep_source_aspect_ratio` is active the preset dropdown is dimmed in the
+UI (it is not used in that mode).
+
+### Inputs
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `model` | COMBO | `SDXL` | Preset family: Flux, Qwen Image, Z-Image, SD 1.5, SDXL, All |
+| `resolution` | COMBO | `1024x1024` | preset resolution (list filtered by `model`) |
+| `resolution_multiplier` | COMBO | `1x` | `1x`-`4x`; scales the output (in aspect mode it scales the pixel budget) |
+| `batch_size` | INT | 1 | latent batch size |
+| `custom_width` / `custom_height` | INT | 0 | optional custom size (second output pair) |
+| `custom_multiplier` / `custom_batch` | COMBO / INT | `1x` / 1 | multiplier and batch for the custom size |
+| `image` | IMAGE | - | source image for the aspect-ratio mode |
+| `keep_source_aspect_ratio` | BOOLEAN | false | size from the source aspect ratio |
+| `target_megapixels` | FLOAT | 0.0 | pixel budget (0 = preset megapixels) |
+
+### Outputs
+
+| Name | Type |
+|------|------|
+| `width` / `height` | INT |
+| `latent` | LATENT |
+| `custom_width` / `custom_height` | INT |
+| `custom_latent` | LATENT |
+
+### Examples
+
+| Source | Mode | Result |
+|--------|------|--------|
+| 1920x1080 | `target_megapixels=1.0` | 1328x744 (0.99 MP) |
+| 640x480 | `target_megapixels=2.0` | 1632x1224 (2.00 MP) - upscaled |
+| 1080x1920 | `target_megapixels=1.0` | 744x1328 (0.99 MP) - portrait |
+| 3840x2160 | `target_megapixels=4.0`, model `All` | 2664x1496 (3.99 MP) |
+| 1920x1080 | `target_megapixels=16.0`, model `SDXL` | 2048x1152 - clamped to the model maximum |
+
+---
+
 ## Node: MiniMax H3 Direct Promptor (Enndee)
 
 Generates **official-format MiniMax H3 prompts** directly from up to 8 reference
@@ -243,6 +303,9 @@ call (OpenAI, Ollama, Gemini or Claude). Vendored here from the standalone
 ## License
 
 * This pack's own code: **MIT** (see `LICENSE`).
+* The copied `Enndee_ResolutionSelector` node is based on BRADSEC's MIT licensed
+  [ComfyUI_ResolutionSelector](https://github.com/BRADSEC/ComfyUI_ResolutionSelector)
+  (MIT, Copyright (c) 2023 BRADSEC) - MIT is compatible with this pack's license.
 * The vendored `minimax_h3_promptor/` component: **GPL-3.0** (see
   `minimax_h3_promptor/LICENSE`) - a fork of the
   [1038lab/ComfyUI-Minimax-H3-Promptor](https://github.com/1038lab/ComfyUI-Minimax-H3-Promptor)
