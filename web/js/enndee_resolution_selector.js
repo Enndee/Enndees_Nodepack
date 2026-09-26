@@ -1,294 +1,194 @@
+/**
+ * Resolution Selector (Enndee) - live preview widget
+ *
+ * Renders the same "2048 × 2048   4.00 MP" preview the built-in ComfyUI
+ * Resolution Selector shows. The calculation mirrors the python node, so the
+ * preview updates live while dragging the megapixels slider (no queue run
+ * needed). Resize types other than "scale dimensions" are reported with their
+ * own widget value, because the connected image size is unknown in the browser.
+ *
+ * When "keep_source_aspect_ratio" is enabled and an image is connected,
+ * the source dimensions are not available in the browser, so show the MP target.
+ */
 import { app } from "/scripts/app.js";
 
-// Model-specific resolution presets with constraints
-// Includes: model-optimized sizes + photo print (4x6, 5x7, 8x10) + digital/social + canvas art ratios
-const MODEL_RESOLUTIONS = {
-    "Flux": {
-        "square": [[512, 512], [768, 768], [1024, 1024], [1088, 1088], [1280, 1280], [1536, 1536], [1920, 1920], [2048, 2048]],
-        "portrait": [[688, 2048], [768, 1344], [832, 1216], [896, 1152], [928, 1664], [1024, 1536], [1024, 1792], [1024, 2048], [1088, 1920], [1152, 2048], [1200, 1792], [1360, 2048], [1456, 2048], [1536, 2048], [1616, 2048], [1632, 2048], [1712, 2048]],
-        "landscape": [[1280, 720], [1344, 768], [1216, 832], [1152, 896], [1536, 1024], [1664, 928], [1792, 1024], [1792, 1200], [1920, 1088], [2048, 688], [2048, 1024], [2048, 1152], [2048, 1360], [2048, 1456], [2048, 1536], [2048, 1616], [2048, 1632], [2048, 1712]],
-    },
-    "Qwen Image": {
-        "square": [[1024, 1024], [1080, 1080], [1280, 1280], [1328, 1328], [1536, 1536], [1920, 1920], [2048, 2048]],
-        "portrait": [[680, 2048], [928, 1664], [1024, 1536], [1024, 2048], [1080, 1920], [1140, 1472], [1152, 2048], [1200, 1800], [1368, 2048], [1464, 2048], [1536, 2048], [1608, 2048], [1640, 2048], [1704, 2048]],
-        "landscape": [[1280, 720], [1472, 1140], [1536, 1024], [1664, 928], [1800, 1200], [1920, 1080], [2048, 680], [2048, 1024], [2048, 1152], [2048, 1368], [2048, 1464], [2048, 1536], [2048, 1608], [2048, 1640], [2048, 1704]],
-    },
-    "Z-Image": {
-        "square": [[512, 512], [768, 768], [1024, 1024], [1080, 1080], [1280, 1280], [1536, 1536], [1920, 1920], [2048, 2048]],
-        "portrait": [[680, 2048], [720, 1280], [768, 1024], [1024, 2048], [1080, 1920], [1152, 2048], [1200, 1800], [1368, 2048], [1464, 2048], [1536, 2048], [1608, 2048], [1640, 2048], [1704, 2048]],
-        "landscape": [[1024, 768], [1280, 720], [1800, 1200], [1920, 1080], [2048, 680], [2048, 1024], [2048, 1152], [2048, 1368], [2048, 1464], [2048, 1536], [2048, 1608], [2048, 1640], [2048, 1704]],
-    },
-    "SD 1.5": {
-        "square": [[512, 512], [768, 768], [1024, 1024], [1080, 1080], [1280, 1280], [1536, 1536]],
-        "portrait": [[512, 768], [512, 682], [512, 1024], [680, 2048], [768, 1024], [768, 1344], [1024, 2048], [1080, 1920], [1200, 1800], [1368, 2048], [1464, 2048], [1536, 2048], [1608, 2048], [1640, 2048], [1704, 2048]],
-        "landscape": [[768, 512], [1024, 512], [1024, 768], [1280, 720], [1344, 768], [1536, 512], [1800, 1200], [1920, 1080], [2048, 680], [2048, 1024], [2048, 1368], [2048, 1464], [2048, 1536], [2048, 1608], [2048, 1640], [2048, 1704]],
-    },
-    "SDXL": {
-        "square": [[1024, 1024], [1080, 1080], [1280, 1280], [1536, 1536], [1920, 1920], [2048, 2048]],
-        "portrait": [[640, 1536], [680, 2048], [768, 1344], [832, 1216], [896, 1152], [1024, 1536], [1024, 2048], [1080, 1920], [1152, 2048], [1200, 1800], [1368, 2048], [1464, 2048], [1536, 2048], [1608, 2048], [1640, 2048], [1704, 2048]],
-        "landscape": [[1152, 896], [1216, 832], [1280, 720], [1344, 768], [1536, 640], [1536, 1024], [1800, 1200], [1920, 1080], [2048, 680], [2048, 1024], [2048, 1152], [2048, 1368], [2048, 1464], [2048, 1536], [2048, 1608], [2048, 1640], [2048, 1704]],
-    }
+// label -> [widthRatio, heightRatio]  (must match nodes/enndee_resolution_selector.py)
+const ASPECT_RATIOS = {
+  "1:1 (Square)": [1, 1],
+  "2:3 (Portrait Photo)": [2, 3],
+  "3:2 (Photo)": [3, 2],
+  "3:4 (Portrait Standard)": [3, 4],
+  "4:3 (Standard)": [4, 3],
+  "9:16 (Portrait Widescreen)": [9, 16],
+  "16:9 (Widescreen)": [16, 9],
+  "21:9 (Ultrawide)": [21, 9],
 };
 
-function gcd(a, b) {
-    while (b !== 0) {
-        const temp = b;
-        b = a % b;
-        a = temp;
-    }
-    return a;
+const MEGAPIXEL_BASE = 1024 * 1024;
+
+function snapToMultiple(value, multiple) {
+  const step = Math.max(1, Math.round(multiple) || 1);
+  return Math.max(step, Math.round(value / step) * step);
 }
 
-function calculateAspectRatio(width, height) {
-    // Calculate actual ratio as decimal
-    const actualRatio = width / height;
-
-    // Common aspect ratios [ratio_value, "width:height" string]
-    const commonRatios = [
-        [1.0, "1:1"],      // Square
-        [1.25, "5:4"],     // 1.25
-        [1.33, "4:3"],     // 1.333...
-        [1.5, "3:2"],      // 1.5
-        [1.6, "16:10"],    // 1.6
-        [1.78, "16:9"],    // 1.777...
-        [2.0, "2:1"],      // 2.0
-        [2.35, "21:9"],    // 2.333... (ultrawide)
-        [2.4, "12:5"],     // 2.4
-        [3.0, "3:1"],      // 3.0
-        // Portrait ratios
-        [0.75, "3:4"],     // 0.75
-        [0.67, "2:3"],     // 0.666...
-        [0.625, "5:8"],    // 0.625
-        [0.56, "9:16"],    // 0.5625
-        [0.5, "1:2"],      // 0.5
-        [0.42, "5:12"],    // 0.4166...
-        [0.33, "1:3"],     // 0.333... (panoramic)
-    ];
-
-    // Find closest common ratio by absolute difference
-    let closestRatio = commonRatios[0];
-    let minDiff = Math.abs(actualRatio - closestRatio[0]);
-
-    for (const ratio of commonRatios) {
-        const diff = Math.abs(actualRatio - ratio[0]);
-        if (diff < minDiff) {
-            minDiff = diff;
-            closestRatio = ratio;
-        }
-    }
-
-    return closestRatio[1];
+function dimensionsFromRatio(widthRatio, heightRatio, megapixels, multiple) {
+  const totalPixels = megapixels * MEGAPIXEL_BASE;
+  const scale = Math.sqrt(totalPixels / (widthRatio * heightRatio));
+  return [
+    snapToMultiple(widthRatio * scale, multiple),
+    snapToMultiple(heightRatio * scale, multiple),
+  ];
 }
 
-function formatResolution(width, height) {
-    const aspectRatio = calculateAspectRatio(width, height);
-    let orientation;
+// Human-readable hints for the resize types of ComfyUI's Resize Image/Mask node.
+const RESIZE_TYPE_LABELS = {
+  "scale by multiplier": (v) => `× ${v.toFixed(2)} of the source size`,
+  "scale longer dimension": (v) => `longer edge ${Math.round(v)} px`,
+  "scale shorter dimension": (v) => `shorter edge ${Math.round(v)} px`,
+  "scale width": () => "selected width, source aspect",
+  "scale height": () => "selected height, source aspect",
+  "scale total pixels": (v) => `${v.toFixed(2)} MP on the source aspect`,
+  "match size": () => "reference 'match' input size",
+  "scale to multiple": (v) => `multiple of ${Math.round(v)} px`,
+};
 
-    if (width === height) {
-        orientation = "Square";
-    } else if (width < height) {
-        orientation = "Portrait";
-    } else {
-        orientation = "Landscape";
-    }
-
-    // Format with fixed width for better alignment
-    const resolutionStr = `${width}x${height}`;
-    const paddedResolution = resolutionStr.padEnd(13, ' '); // Pad to 13 chars for alignment
-
-    return `${paddedResolution}(${aspectRatio} ${orientation})`;
-}
-
-function getAllResolutions() {
-    const uniqueResolutions = new Map();
-
-    // Collect all unique width×height pairs
-    for (const modelName in MODEL_RESOLUTIONS) {
-        const modelData = MODEL_RESOLUTIONS[modelName];
-        for (const category of ["square", "portrait", "landscape"]) {
-            if (modelData[category]) {
-                for (const [w, h] of modelData[category]) {
-                    const key = `${w}x${h}`;
-                    if (!uniqueResolutions.has(key)) {
-                        uniqueResolutions.set(key, { width: w, height: h, pixels: w * h });
-                    }
-                }
-            }
-        }
-    }
-
-    // Sort by total pixels, then by width
-    const sorted = Array.from(uniqueResolutions.values())
-        .sort((a, b) => {
-            if (a.pixels !== b.pixels) return a.pixels - b.pixels;
-            return a.width - b.width;
-        });
-
-    return sorted.map(({ width, height }) => formatResolution(width, height));
-}
-
-function getResolutionsForModel(model) {
-    if (model === "All") {
-        return getAllResolutions();
-    }
-
-    const modelData = MODEL_RESOLUTIONS[model];
-    if (!modelData) return [];
-
-    const resolutions = [];
-    for (const category of ["square", "portrait", "landscape"]) {
-        if (modelData[category]) {
-            for (const [w, h] of modelData[category]) {
-                resolutions.push(formatResolution(w, h));
-            }
-        }
-    }
-    return resolutions;
-}
-
-function getDefaultResolution(model) {
-    // Model-specific native/optimal resolutions
-    const defaultResolutions = {
-        "Flux": [1024, 1024],
-        "Qwen Image": [1328, 1328],
-        "Z-Image": [1024, 1024],
-        "SD 1.5": [512, 512],
-        "SDXL": [1024, 1024],
-        "All": [1024, 1024]
+function computePreview(ratioLabel, megapixels, multiple, keepSource, hasSourceImage, resizeType, values) {
+  if (resizeType && resizeType !== "scale dimensions") {
+    const describe = RESIZE_TYPE_LABELS[resizeType];
+    const value =
+      resizeType === "scale by multiplier" ? values.multiplier
+      : resizeType === "scale longer dimension" ? values.longerSize
+      : resizeType === "scale shorter dimension" ? values.shorterSize
+      : resizeType === "scale total pixels" ? values.megapixels
+      : resizeType === "scale to multiple" ? values.multiple
+      : null;
+    const detail = describe ? describe(Number(value) || 0) : "connected image";
+    return { text: resizeType, detail, dim: true };
+  }
+  if (keepSource && hasSourceImage) {
+    return {
+      text: "source aspect ratio",
+      detail: `${megapixels.toFixed(2)} MP target`,
+      dim: true,
     };
+  }
+  const ratio = ASPECT_RATIOS[ratioLabel] || ASPECT_RATIOS["1:1 (Square)"];
+  const [w, h] = dimensionsFromRatio(ratio[0], ratio[1], megapixels, multiple);
+  return {
+    text: `${w} × ${h}`,
+    detail: `${((w * h) / MEGAPIXEL_BASE).toFixed(2)} MP`,
+    dim: false,
+  };
+}
 
-    if (defaultResolutions[model]) {
-        const [w, h] = defaultResolutions[model];
-        return formatResolution(w, h);
-    }
+function buildPreviewElement() {
+  const wrapper = document.createElement("div");
+  wrapper.style.cssText = [
+    "box-sizing:border-box",
+    "width:100%",
+    "padding:8px 6px",
+    "margin:4px 0",
+    "border-radius:6px",
+    "background:rgba(0,0,0,0.25)",
+    "text-align:center",
+    "font-family:system-ui,sans-serif",
+    "font-size:14px",
+    "line-height:1.25",
+    "user-select:none",
+    "pointer-events:none",
+  ].join(";");
 
-    // Fallback
-    return formatResolution(1024, 1024);
+  const size = document.createElement("span");
+  size.style.cssText = "font-weight:600;color:#e5e7eb;";
+  const pixelCount = document.createElement("span");
+  pixelCount.style.cssText = "margin-left:10px;color:#8b8b96;";
+
+  wrapper.appendChild(size);
+  wrapper.appendChild(pixelCount);
+  return { wrapper, size, pixelCount };
 }
 
 app.registerExtension({
-    name: "EnndeeResolutionSelector.DynamicDropdown",
+  name: "EnndeeResolutionSelector.Preview",
 
-    async nodeCreated(node) {
-        if (node.comfyClass !== "Enndee_ResolutionSelector") return;
+  async beforeRegisterNodeDef(nodeType, nodeData) {
+    if (nodeData?.name !== "Enndee_ResolutionSelector") return;
 
-        // Set wider default node width to prevent text cutoff
-        node.setSize([400, node.size[1]]);
+    const onCreated = nodeType.prototype.onNodeCreated;
+    nodeType.prototype.onNodeCreated = function () {
+      onCreated?.apply(this, arguments);
 
-        const modelWidget = node.widgets.find(w => w.name === "model");
-        const resolutionWidget = node.widgets.find(w => w.name === "resolution");
+      const aspectWidget = this.widgets?.find((w) => w.name === "aspect_ratio");
+      const megaWidget = this.widgets?.find((w) => w.name === "megapixels");
+      const multipleWidget = this.widgets?.find((w) => w.name === "multiple");
+      const keepWidget = this.widgets?.find((w) => w.name === "keep_source_aspect_ratio");
+      const resizeTypeWidget = this.widgets?.find((w) => w.name === "resize_type");
+      const multiplierWidget = this.widgets?.find((w) => w.name === "multiplier");
+      const longerWidget = this.widgets?.find((w) => w.name === "longer_size");
+      const shorterWidget = this.widgets?.find((w) => w.name === "shorter_size");
+      if (!aspectWidget || !megaWidget || !multipleWidget) return;
 
-        if (!modelWidget || !resolutionWidget) {
-            console.error("Resolution Selector (Enndee): Required widgets not found");
-            return;
-        }
+      const { wrapper, size, pixelCount } = buildPreviewElement();
+      this.addDOMWidget("resolution_preview", "preview", wrapper, {
+        serialize: false,
+        hideOnZoom: false,
+        getValue: () => null,
+        setValue: () => {},
+      });
+      wrapper.style.pointerEvents = "none";
 
-        // ---------------------------------------------------------------
-        // NEW: while "keep_source_aspect_ratio" is enabled the preset
-        // resolution dropdown is not used - dim it so the state is obvious.
-        // ---------------------------------------------------------------
-        const keepWidget = node.widgets.find(w => w.name === "keep_source_aspect_ratio");
-        const megapixelWidget = node.widgets.find(w => w.name === "target_megapixels");
+      const refresh = () => {
+        const result = computePreview(
+          aspectWidget.value,
+          Number(megaWidget.value) || 0,
+          Number(multipleWidget.value) || 8,
+          !!keepWidget?.value,
+          !!this.inputs?.find((input) => input.name === "image")?.link,
+          resizeTypeWidget?.value,
+          {
+            multiplier: Number(multiplierWidget?.value) || 0,
+            longerSize: Number(longerWidget?.value) || 0,
+            shorterSize: Number(shorterWidget?.value) || 0,
+            megapixels: Number(megaWidget.value) || 0,
+            multiple: Number(multipleWidget.value) || 0,
+          },
+        );
+        size.textContent = result.text;
+        size.style.fontStyle = result.dim ? "italic" : "normal";
+        pixelCount.textContent = result.detail;
+      };
 
-        const updateAspectMode = () => {
-            const active = !!(keepWidget && keepWidget.value);
-            try {
-                resolutionWidget.disabled = active;
-            } catch (e) {
-                // older frontends do not support the disabled flag - ignore
-            }
-            if (megapixelWidget) {
-                try {
-                    megapixelWidget.disabled = !active;
-                } catch (e) {
-                    // ignore
-                }
-            }
-            node.setDirtyCanvas(true, true);
+      this.addEventListener?.("removed", () => {
+        wrapper.remove();
+      });
+
+      [aspectWidget, megaWidget, multipleWidget, keepWidget, resizeTypeWidget,
+       multiplierWidget, longerWidget, shorterWidget].forEach((widget) => {
+        if (!widget) return;
+        const original = widget.callback;
+        widget.callback = function (value) {
+          const res = original?.apply(this, arguments);
+          refresh();
+          return res;
         };
+      });
 
-        if (keepWidget) {
-            const origKeepCallback = keepWidget.callback;
-            keepWidget.callback = function (value) {
-                if (origKeepCallback) {
-                    origKeepCallback.apply(this, arguments);
-                }
-                updateAspectMode();
-            };
-        }
+      // Refresh the displayed preview when the source image is connected or removed.
+      const onConnectionsChange = this.onConnectionsChange;
+      this.onConnectionsChange = function () {
+        const result = onConnectionsChange?.apply(this, arguments);
+        setTimeout(refresh, 0);
+        return result;
+      };
 
-        const origCallback = modelWidget.callback;
+      // also refresh when the node was loaded from a workflow
+      const onConfigure = this.onConfigure;
+      this.onConfigure = function () {
+        onConfigure?.apply(this, arguments);
+        setTimeout(refresh, 0);
+      };
 
-        const updateResolutions = (modelValue) => {
-            const resolutions = getResolutionsForModel(modelValue);
-
-            if (resolutions.length === 0) {
-                console.warn(`ResolutionSelector: No resolutions found for model ${modelValue}`);
-                return;
-            }
-
-            resolutionWidget.options.values = resolutions;
-
-            // Set to model-specific default resolution
-            const defaultRes = getDefaultResolution(modelValue);
-            if (resolutions.includes(defaultRes)) {
-                resolutionWidget.value = defaultRes;
-            } else if (!resolutions.includes(resolutionWidget.value)) {
-                // Fallback to first resolution if default not found
-                resolutionWidget.value = resolutions[0];
-            }
-
-            node.setDirtyCanvas(true, true);
-        };
-
-        modelWidget.callback = function(value) {
-            if (origCallback) {
-                origCallback.apply(this, arguments);
-            }
-            updateResolutions(value);
-        };
-
-        setTimeout(() => {
-            updateResolutions(modelWidget.value);
-            updateAspectMode();
-        }, 10);
-    },
-
-    async loadedGraphNode(node) {
-        if (node.comfyClass !== "Enndee_ResolutionSelector") return;
-
-        const modelWidget = node.widgets.find(w => w.name === "model");
-        if (modelWidget) {
-            const resolutions = getResolutionsForModel(modelWidget.value);
-            const resolutionWidget = node.widgets.find(w => w.name === "resolution");
-
-            if (resolutionWidget && resolutions.length > 0) {
-                resolutionWidget.options.values = resolutions;
-
-                if (!resolutions.includes(resolutionWidget.value)) {
-                    resolutionWidget.value = resolutions[0];
-                }
-            }
-
-            // keep the aspect-ratio mode visuals in sync with the saved workflow
-            const keepWidget = node.widgets.find(w => w.name === "keep_source_aspect_ratio");
-            const megapixelWidget = node.widgets.find(w => w.name === "target_megapixels");
-            const active = !!(keepWidget && keepWidget.value);
-            if (resolutionWidget) {
-                try {
-                    resolutionWidget.disabled = active;
-                } catch (e) {
-                    // ignore
-                }
-            }
-            if (megapixelWidget) {
-                try {
-                    megapixelWidget.disabled = !active;
-                } catch (e) {
-                    // ignore
-                }
-            }
-            node.setDirtyCanvas(true, true);
-        }
-    }
+      setTimeout(refresh, 0);
+    };
+  },
 });

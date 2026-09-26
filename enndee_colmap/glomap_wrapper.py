@@ -18,10 +18,11 @@ Changes by Enndee (see NOTICE.md):
 
 import subprocess
 import shutil
+import time
 from pathlib import Path
 from typing import Optional, List, Tuple
 import numpy as np
-from .colmap_wrapper import COLMAPWrapper, subprocess_window_kwargs, _timeout_from_env
+from .colmap_wrapper import COLMAPWrapper, _timeout_from_env, run_streaming_command
 
 
 def fix_image_names_in_sparse(sparse_dir: Path, images_dir: Path, colmap_path: str = "") -> bool:
@@ -308,24 +309,30 @@ class GLOMAPWrapper(COLMAPWrapper):
         cmd = [str(self.glomap_path)] + args
         print(f"[GLOMAP] {desc}")
         try:
-            result = subprocess.run(
+            return_code, output = run_streaming_command(
                 cmd,
-                capture_output=True,
-                text=True,
-                errors="replace",
-                timeout=_timeout_from_env("ENNDEE_GLOMAP_TIMEOUT", 7200),
-                **subprocess_window_kwargs(),
+                desc or "GLOMAP",
+                _timeout_from_env("ENNDEE_GLOMAP_TIMEOUT", 7200),
+                progress_callback=self.progress_callback,
             )
-            if result.returncode != 0:
-                print(f"[GLOMAP] Error: {result.stderr}")
-                return False, result.stderr
-            return True, result.stdout
+            if return_code != 0:
+                print(f"[GLOMAP] {desc} failed (exit code {return_code})", flush=True)
+                return False, output
+            return True, output
         except subprocess.TimeoutExpired:
             print("[GLOMAP] Command timed out")
             return False, "Timeout"
         except Exception as e:
             print(f"[GLOMAP] Exception: {e}")
             return False, str(e)
+
+    def _log_progress(self, message: str) -> None:
+        """Send stage markers through the tracker's ComfyUI console logger."""
+        text = f"[SfM] {message}"
+        if self.progress_callback is not None:
+            self.progress_callback(text)
+        else:
+            print(text, flush=True)
 
     def mapper(self, backend: str = "glomap", **kwargs) -> bool:
         """
@@ -374,39 +381,54 @@ class GLOMAPWrapper(COLMAPWrapper):
         """Run complete global SfM pipeline (COLMAP features + global mapper)."""
         try:
             self.setup_workspace()
-            print(f"[GLOMAP] Processing {images.shape[0]} frames...")
+            pipeline_started = time.perf_counter()
+            self._log_progress(f"Preparing {images.shape[0]} frames for SfM")
+            stage_started = time.perf_counter()
             image_paths = self.export_frames(images)
+            self._log_progress(f"Frame staging finished in {time.perf_counter() - stage_started:.2f}s")
 
             mask_path = None
             if masks is not None and len(masks) > 0:
                 image_names = [Path(p).name for p in image_paths]
                 mask_path = self.export_masks(masks, image_names)
 
+            stage_started = time.perf_counter()
+            self._log_progress("Feature extraction started")
             if not self.feature_extractor(camera_model=camera_model,
                                           max_num_features=max_features,
                                           max_image_size=max_image_size,
                                           mask_path=mask_path, use_gpu=use_gpu,
                                           estimate_affine_shape=estimate_affine_shape,
                                           domain_size_pooling=domain_size_pooling):
-                print("[GLOMAP] Feature extraction failed")
+                self._log_progress("Feature extraction failed")
                 return None
+            self._log_progress(f"Feature extraction finished in {time.perf_counter() - stage_started:.2f}s")
 
+            stage_started = time.perf_counter()
             if matcher == "sequential":
+                self._log_progress(f"Sequential matching started (overlap={sequential_overlap})")
                 if not self.sequential_matcher(use_gpu=use_gpu, overlap=sequential_overlap):
-                    print("[GLOMAP] Sequential matching failed")
+                    self._log_progress("Sequential matching failed")
                     return None
             else:
+                self._log_progress("Exhaustive matching started")
                 if not self.exhaustive_matcher(use_gpu=use_gpu):
-                    print("[GLOMAP] Exhaustive matching failed")
+                    self._log_progress("Exhaustive matching failed")
                     return None
+            self._log_progress(f"Feature matching finished in {time.perf_counter() - stage_started:.2f}s")
 
+            stage_started = time.perf_counter()
+            self._log_progress(f"{mapper_backend} mapping started")
             if not self.mapper(backend=mapper_backend):
-                print("[GLOMAP] Global mapper failed")
+                self._log_progress("Global mapper failed")
                 return None
+            self._log_progress(f"Global mapping finished in {time.perf_counter() - stage_started:.2f}s")
 
+            stage_started = time.perf_counter()
             model_path = self.get_sparse_model_path()
             if model_path:
-                print(f"[GLOMAP] Reconstruction complete: {model_path}")
+                self._log_progress(f"Sparse model selection finished in {time.perf_counter() - stage_started:.2f}s: {model_path}")
+            self._log_progress(f"SfM pipeline wall time: {time.perf_counter() - pipeline_started:.2f}s")
             return model_path
 
         except Exception as e:

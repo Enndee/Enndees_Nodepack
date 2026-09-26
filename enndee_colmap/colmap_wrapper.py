@@ -15,9 +15,12 @@ Changes by Enndee (see NOTICE.md):
 """
 
 import os
+import queue
 import subprocess
 import tempfile
 import shutil
+import threading
+import time
 from pathlib import Path
 from typing import Optional, List, Tuple
 import numpy as np
@@ -37,6 +40,123 @@ def _timeout_from_env(name: str, default: int) -> int:
         return value if value > 0 else default
     except (TypeError, ValueError):
         return default
+
+
+def run_streaming_command(cmd, desc: str, timeout: int,
+                          progress_callback=None) -> Tuple[int, str]:
+    """Run a CLI process while forwarding its combined output as it arrives.
+
+    COLMAP/GLOMAP can run for a long time. Capturing output with
+    ``subprocess.run(capture_output=True)`` hides all native progress until a
+    phase finishes. This helper relays both newline- and carriage-return-
+    terminated progress records to the ComfyUI console while retaining the
+    complete output for the wrapper's existing return contract.
+    """
+    prefix = f"[{desc}]" if desc else "[SfM]"
+
+    def emit(text):
+        if not text:
+            return
+        message = f"{prefix} {text}"
+        if progress_callback is not None:
+            progress_callback(message)
+        else:
+            print(message, flush=True)
+
+    try:
+        process = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=0,
+            **subprocess_window_kwargs(),
+        )
+    except Exception:
+        raise
+
+    chunks = []
+    pending = bytearray()
+    output_queue = queue.Queue()
+
+    def read_output():
+        try:
+            pipe = process.stdout
+            while True:
+                # os.read returns bytes currently available instead of waiting
+                # for the full requested buffer (essential for live progress).
+                chunk = os.read(pipe.fileno(), 4096)
+                if not chunk:
+                    break
+                output_queue.put(chunk)
+        except Exception as exc:  # relay reader failures to the main thread
+            output_queue.put(exc)
+        finally:
+            output_queue.put(None)
+
+    reader = threading.Thread(target=read_output, name="enndee-cli-output", daemon=True)
+    reader.start()
+    started = time.monotonic()
+    next_heartbeat = started + 30.0
+    reader_finished = False
+
+    def consume_lines(final=False):
+        while pending:
+            boundary = next((i for i, byte in enumerate(pending) if byte in (10, 13)), None)
+            if boundary is None:
+                if final:
+                    record = bytes(pending)
+                    pending.clear()
+                    emit(record.decode("utf-8", errors="replace").strip())
+                return
+            record = bytes(pending[:boundary])
+            delimiter = pending[boundary]
+            del pending[:boundary + 1]
+            # Treat CRLF as one line break, not an additional empty record.
+            if delimiter == 13 and pending[:1] == b"\n":
+                del pending[:1]
+            emit(record.decode("utf-8", errors="replace").strip())
+
+    try:
+        while not reader_finished or process.poll() is None:
+            now = time.monotonic()
+            if timeout and now - started >= timeout and process.poll() is None:
+                process.kill()
+                process.wait()
+                reader.join(timeout=2.0)
+                consume_lines(final=True)
+                raise subprocess.TimeoutExpired(cmd, timeout, output=b"".join(chunks))
+
+            try:
+                item = output_queue.get(timeout=0.25)
+            except queue.Empty:
+                item = "__timeout__"
+
+            if item is None:
+                reader_finished = True
+                consume_lines(final=True)
+            elif isinstance(item, Exception):
+                emit(f"output reader warning: {item}")
+                reader_finished = True
+            elif item != "__timeout__":
+                chunks.append(item)
+                pending.extend(item)
+                next_heartbeat = time.monotonic() + 30.0
+                consume_lines()
+            elif process.poll() is None and now >= next_heartbeat:
+                emit(f"still running ({int(now - started)}s elapsed)")
+                next_heartbeat = now + 30.0
+
+        return_code = process.wait()
+        reader.join(timeout=2.0)
+        consume_lines(final=True)
+        return return_code, b"".join(chunks).decode("utf-8", errors="replace")
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        if process.stdout is not None:
+            process.stdout.close()
 
 
 class COLMAPWrapper:
@@ -64,6 +184,7 @@ class COLMAPWrapper:
         self.database_path = None
         self.sparse_dir = None
         self._commands_cache: Optional[set] = None
+        self.progress_callback = None
 
         if not self.colmap_path.exists():
             raise FileNotFoundError(f"COLMAP not found at {self.colmap_path}")
@@ -127,8 +248,11 @@ class COLMAPWrapper:
 
         # Determine number of digits needed for naming
         num_digits = len(str(num_frames))
+        report_every = max(1, num_frames // 10)
 
         for i in range(num_frames):
+            if i == 0 or (i + 1) % report_every == 0 or i + 1 == num_frames:
+                print(f"[COLMAP] Preparing SfM image {i + 1}/{num_frames}", flush=True)
             frame = images[i]
 
             # Convert to uint8 if needed
@@ -229,20 +353,17 @@ class COLMAPWrapper:
         print(f"[COLMAP] {desc}: {' '.join(args[:2])}")
 
         try:
-            result = subprocess.run(
+            return_code, output = run_streaming_command(
                 cmd,
-                capture_output=True,
-                text=True,
-                errors="replace",
-                timeout=_timeout_from_env("ENNDEE_COLMAP_TIMEOUT", 3600),
-                **subprocess_window_kwargs(),
+                desc or "COLMAP",
+                _timeout_from_env("ENNDEE_COLMAP_TIMEOUT", 3600),
+                progress_callback=self.progress_callback,
             )
+            if return_code != 0:
+                print(f"[COLMAP] {desc} failed (exit code {return_code})", flush=True)
+                return False, output
 
-            if result.returncode != 0:
-                print(f"[COLMAP] Error: {result.stderr}")
-                return False, result.stderr
-
-            return True, result.stdout
+            return True, output
 
         except subprocess.TimeoutExpired:
             print("[COLMAP] Command timed out")

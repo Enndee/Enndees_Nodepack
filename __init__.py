@@ -39,6 +39,36 @@ except Exception as _e:
     print(f"\033[31m[Enndee] ResolutionSelectorEnndee unavailable: {_e}\033[0m")
     ResolutionSelectorEnndee = None
 
+try:
+    from enndee_image_loader import ImageLoaderResizeEnndee
+except Exception as _e:
+    print(f"\033[31m[Enndee] ImageLoaderResizeEnndee unavailable: {_e}\033[0m")
+    ImageLoaderResizeEnndee = None
+
+try:
+    from enndee_meridian_parameter_picker import MeridianParameterPickerEnndee
+except Exception as _e:
+    print(f"\033[31m[Enndee] MeridianParameterPickerEnndee unavailable: {_e}\033[0m")
+    MeridianParameterPickerEnndee = None
+
+try:
+    from enndee_meridian_camera_path import MeridianCameraPathConfigurator
+except Exception as _e:
+    print(f"\033[31m[Enndee] MeridianCameraPathConfigurator unavailable: {_e}\033[0m")
+    MeridianCameraPathConfigurator = None
+
+try:
+    from enndee_meridian_geometry import EnndeeMeridianGeometry
+except Exception as _e:
+    print(f"\033[31m[Enndee] EnndeeMeridianGeometry unavailable: {_e}\033[0m")
+    EnndeeMeridianGeometry = None
+
+try:
+    from lichtfeld_training_node import LichtfeldHeadlessTrainer
+except Exception as _e:
+    print(f"\033[31m[Enndee] LichtfeldHeadlessTrainer unavailable: {_e}\033[0m")
+    LichtfeldHeadlessTrainer = None
+
 NODE_CLASS_MAPPINGS = {}
 NODE_DISPLAY_NAME_MAPPINGS = {}
 
@@ -59,6 +89,26 @@ if H3_Multimodal_Promptor_Enndee is not None:
 if ResolutionSelectorEnndee is not None:
     NODE_CLASS_MAPPINGS["Enndee_ResolutionSelector"] = ResolutionSelectorEnndee
     NODE_DISPLAY_NAME_MAPPINGS["Enndee_ResolutionSelector"] = "Resolution Selector (Enndee)"
+
+if ImageLoaderResizeEnndee is not None:
+    NODE_CLASS_MAPPINGS["Enndee_ImageLoaderResize"] = ImageLoaderResizeEnndee
+    NODE_DISPLAY_NAME_MAPPINGS["Enndee_ImageLoaderResize"] = "Load & Resize Image (Enndee)"
+
+if MeridianParameterPickerEnndee is not None:
+    NODE_CLASS_MAPPINGS["Enndee_MeridianParameterPicker"] = MeridianParameterPickerEnndee
+    NODE_DISPLAY_NAME_MAPPINGS["Enndee_MeridianParameterPicker"] = "Meridian Parameter Picker (Enndee)"
+
+if MeridianCameraPathConfigurator is not None:
+    NODE_CLASS_MAPPINGS["Enndee_MeridianCameraPath"] = MeridianCameraPathConfigurator
+    NODE_DISPLAY_NAME_MAPPINGS["Enndee_MeridianCameraPath"] = "Meridian Camera Path Configurator (Enndee)"
+
+if EnndeeMeridianGeometry is not None:
+    NODE_CLASS_MAPPINGS["Enndee_MeridianGeometry"] = EnndeeMeridianGeometry
+    NODE_DISPLAY_NAME_MAPPINGS["Enndee_MeridianGeometry"] = "Meridian Geometry (Enndee)"
+
+if LichtfeldHeadlessTrainer is not None:
+    NODE_CLASS_MAPPINGS["Enndee_LichtfeldHeadlessTrainer"] = LichtfeldHeadlessTrainer
+    NODE_DISPLAY_NAME_MAPPINGS["Enndee_LichtfeldHeadlessTrainer"] = "Lichtfeld Headless Trainer (Enndee)"
 
 WEB_DIRECTORY = os.path.join(_pack_dir, "web")
 

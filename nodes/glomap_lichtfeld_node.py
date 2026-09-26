@@ -8,7 +8,7 @@ optionally removes the background, runs COLMAP (SIFT) + GLOMAP (global mapper)
 and writes a complete, Lichtfeld-Studio ready dataset:
 
     <export>/
-    ├── images/         0001.png ...   (RGBA when masks/alpha are available)
+    ├── images/         0001.png ... or 0001.jpeg ...
     ├── masks/          Lichtfeld / splat masks (0001.png ...)
     ├── masks_GLOMAP/   masks used for feature extraction (0001.png ...)
     └── sparse/0/       cameras.txt, images.txt, points3D.txt
@@ -26,6 +26,10 @@ Key properties
   splatting.  RGBA input images contribute their alpha channel automatically.
 * **Optional COLMAP >= 3.12 global mapper** (``mapper_backend``) because
   upstream GLOMAP is deprecated and frozen at 1.2.0.
+* **Live console progress**: COLMAP/GLOMAP stdout and stderr are streamed to
+  ComfyUI's console as each stage runs instead of being buffered until exit.
+* **PNG/JPEG dataset export** with a user-selectable JPEG quality; masks stay
+  lossless PNG and preserve alpha when JPEG is selected.
 
 Widget order of the original node is preserved, all new options are appended at
 the end so existing workflows keep their settings.
@@ -372,11 +376,28 @@ class GLOMAPLichtfeldTracker:
                         "classic layout: RGB images + masks/."
                     ),
                 }),
+                "image_format": (["PNG", "JPEG"], {
+                    "default": "PNG",
+                    **tooltip(
+                        "File format for exported images/. PNG is lossless and "
+                        "preserves alpha. JPEG is smaller; alpha is kept in the "
+                        "separate masks/ folder instead."
+                    ),
+                }),
+                "jpeg_quality": ("INT", {
+                    "default": 90, "min": 1, "max": 100, "step": 1,
+                    **tooltip(
+                        "JPEG quality from 1 (smallest/most artifacts) to 100 "
+                        "(best/largest). Used only when Image Format is JPEG."
+                    ),
+                }),
             },
         }
 
-    RETURN_TYPES = ("CAMERA_TRAJECTORY", "POINTCLOUD", "FLOAT")
-    RETURN_NAMES = ("trajectory", "point_cloud", "confidence")
+    # Append outputs rather than reordering the established tracker sockets so
+    # existing saved workflows keep their original output connections.
+    RETURN_TYPES = ("CAMERA_TRAJECTORY", "POINTCLOUD", "FLOAT", "STRING")
+    RETURN_NAMES = ("trajectory", "point_cloud", "confidence", "dataset_path")
     FUNCTION = "track"
     CATEGORY = "Enndee/3D"
     OUTPUT_NODE = True
@@ -396,8 +417,9 @@ class GLOMAPLichtfeldTracker:
               use_gpu=True, keep_workspace=False, auto_align=True,
               sequential_overlap=15, max_image_size=5120, frame_step=2,
               downscale_factor=1.0, offset_glomap=4, offset_splat=12,
-              mapper_backend="glomap", auto_install_binaries=True,
-              binary_flavor="auto", embed_alpha_in_images=False):
+               mapper_backend="glomap", auto_install_binaries=True,
+               binary_flavor="auto", embed_alpha_in_images=False,
+               image_format="PNG", jpeg_quality=90):
         """Run the complete tracking + export pipeline for one frame batch."""
 
         # ---------- 1. Make sure COLMAP / GLOMAP are available ------------
@@ -410,6 +432,7 @@ class GLOMAPLichtfeldTracker:
                      "'python install.py' inside the Enndees-Nodepack folder "
                      "or set ENNDEE_COLMAP_PATH.")
             return self._empty(1)
+        log("Binary setup complete")
 
         # ---------- 2. Load the input images -----------------------------
         export_images, sf_images, images_from_path = self._load_input_images(
@@ -430,6 +453,7 @@ class GLOMAPLichtfeldTracker:
             log("RGBA input detected - alpha channel will be used as mask")
 
         if use_rmbg and alpha_images is None:
+            log("Starting background removal")
             alpha_images = self._run_rmbg(
                 export_images, use_gpu, rmbg_mode, rmbg_threshold, rmbg_resize,
             )
@@ -468,6 +492,8 @@ class GLOMAPLichtfeldTracker:
             self._export_dataset_images(
                 export_dir, export_images, alpha_images,
                 embed_alpha=bool(embed_alpha_in_images),
+                image_format=image_format,
+                jpeg_quality=jpeg_quality,
             )
             if masks_glomap is not None:
                 self._save_masks(masks_glomap, export_dir / MASK_GLOMAP_DIR,
@@ -487,12 +513,16 @@ class GLOMAPLichtfeldTracker:
                 colmap_path=str(colmap_exe),
                 glomap_path=str(glomap_exe) if glomap_exe else None,
             )
+            wrapper.progress_callback = log
             log(f"COLMAP : {colmap_exe}  [{source_of('colmap')}]")
             if mapper_backend == "glomap":
                 log(f"GLOMAP : {glomap_exe}  [{source_of('glomap')}]")
             else:
                 log("Mapper : COLMAP global_mapper")
 
+            log(f"Starting SfM: {int(sf_images.shape[0])} frames; "
+                f"feature extraction -> {matcher} matching -> "
+                f"{mapper_backend} mapping")
             sparse_path = wrapper.run_pipeline(
                 images=self._to_numpy_batch(sf_images),
                 camera_model=camera_model,
@@ -550,7 +580,8 @@ class GLOMAPLichtfeldTracker:
 
             log(f"Done: {len(poses)}/{frames_out} poses registered, "
                 f"{len(points)} 3D points, confidence={confidence:.2f}")
-            return (trajectory, point_cloud, confidence)
+            return (trajectory, point_cloud, confidence,
+                    str(export_dir) if export_dir is not None else "")
 
         except Exception as exc:  # noqa: BLE001
             log_warn(f"Pipeline error: {type(exc).__name__}: {exc}")
@@ -890,15 +921,22 @@ class GLOMAPLichtfeldTracker:
     # =======================================================================
 
     def _export_dataset_images(self, export_dir, export_images, alpha_images,
-                              embed_alpha=False):
+                              embed_alpha=False, image_format="PNG",
+                              jpeg_quality=90):
         """
-        Write the dataset images as 0001.png ... in full resolution.
+        Write dataset images as numbered PNG or JPEG files at full resolution.
 
-        Images stay RGBA when the input already carried an alpha channel.  With
-        ``embed_alpha`` the RMBG alpha (or whatever produced the mask) is added
-        to RGB images so ``images/`` is RGBA as well.
+        PNG preserves RGBA. JPEG is necessarily RGB; any available alpha remains
+        in the separate Lichtfeld masks export.
         """
         from PIL import Image
+
+        image_format = str(image_format).strip().upper()
+        if image_format not in ("PNG", "JPEG"):
+            raise ValueError(f"Unsupported dataset image format: {image_format!r}; choose PNG or JPEG")
+        jpeg_quality = int(jpeg_quality)
+        if not 1 <= jpeg_quality <= 100:
+            raise ValueError("JPEG quality must be between 1 and 100")
 
         if isinstance(export_images, torch.Tensor):
             batch = export_images.detach().to("cpu", dtype=torch.float32)
@@ -907,18 +945,46 @@ class GLOMAPLichtfeldTracker:
 
         if (embed_alpha and alpha_images is not None
                 and batch.shape[-1] == 3 and alpha_images.shape[-1] == 4):
-            batch = torch.cat([batch, alpha_images[..., 3:4]], dim=-1)
+            alpha = torch.as_tensor(alpha_images[..., 3:4], dtype=batch.dtype,
+                                    device=batch.device)
+            batch = torch.cat([batch, alpha], dim=-1)
 
         target = Path(export_dir) / "images"
         target.mkdir(parents=True, exist_ok=True)
+        extension = ".png" if image_format == "PNG" else ".jpeg"
 
+        # Re-running into an existing dataset folder with another format must
+        # not leave old numbered images beside the new ones: COLMAP would see
+        # both sets as separate views and the sparse TXT name mapping can drift.
+        for existing in target.iterdir():
+            if (existing.is_file()
+                    and existing.suffix.lower() in IMAGE_SUFFIXES
+                    and existing.stem.isdigit()):
+                existing.unlink()
+
+        if image_format == "JPEG" and batch.shape[-1] == 4:
+            log("JPEG does not support alpha; exporting RGB images and preserving alpha in masks/")
+
+        report_every = max(1, (len(batch) + 9) // 10)
         for index, frame in enumerate(batch):
+            if index == 0 or (index + 1) % report_every == 0 or index + 1 == len(batch):
+                log(f"Saving dataset image {index + 1}/{len(batch)} ({image_format})")
             frame_uint8 = (torch.clamp(frame, 0.0, 1.0) * 255.0).round() \
                 .to(torch.uint8).cpu().numpy()
             mode = "RGBA" if frame_uint8.shape[-1] == 4 else "RGB"
-            Image.fromarray(frame_uint8, mode).save(target / f"{index + 1:04d}.png")
+            image = Image.fromarray(frame_uint8, mode)
+            output_path = target / f"{index + 1:04d}{extension}"
+            if image_format == "JPEG":
+                if mode == "RGBA":
+                    image = image.convert("RGB")
+                image.save(output_path, format="JPEG", quality=jpeg_quality,
+                           subsampling=0, optimize=True)
+            else:
+                image.save(output_path, format="PNG")
 
-        log(f"{len(batch)} images -> {target} (0001.png, ...)")
+        detail = f", quality={jpeg_quality}" if image_format == "JPEG" else ""
+        log(f"{len(batch)} {image_format} images -> {target} "
+            f"(0001{extension}, ...){detail}")
 
     def _save_masks(self, masks, masks_dir, label):
         """Save masks as 0001.png ... (white = 255)."""
@@ -999,7 +1065,7 @@ class GLOMAPLichtfeldTracker:
             "num_points": 0,
             "source": "glomap",
         }
-        return trajectory, point_cloud, 0.0
+        return trajectory, point_cloud, 0.0, ""
 
     # =======================================================================
     # Helpers: mask offsets
