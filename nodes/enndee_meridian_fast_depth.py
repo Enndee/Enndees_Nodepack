@@ -1,11 +1,11 @@
-"""Meridian Fast Depth Splat (Enndee): a VGGT-free geometry condition renderer for MiniMax-H3.
+"""Meridian Fast Depth Estimator (Enndee): a VGGT-free geometry condition renderer for MiniMax-H3.
 
 Builds the Meridian / MiniMax-H3 reference pair in-process, with no external conda
 environment and no VGGT checkpoint:
 
     starting frame --Depth-Anything-V2--> relative depth --metric rescale--> depth map
     depth map + RGB --unproject--> 3D point cloud (the "depth-aligned texture")
-    camera path (custom_camera signal, or yaw/truck/boom/dolly) --splat--> render frames
+    camera path (custom_camera signal, or yaw/truck/boom/dolly) --render--> flight frames
 
 The outputs mirror ``Enndee_MeridianGeometry`` (source, render, width, height, length)
 at the 480-class Meridian canvas, so this node is a drop-in, much faster stand-in for the
@@ -50,7 +50,7 @@ def _get_depth_model(model_name: str, device: torch.device):
     repo_id = model_name if "/" in model_name else f"depth-anything/{model_name}"
     if _GLOBAL_DEPTH_MODEL is None or _GLOBAL_MODEL_ID != repo_id:
         from transformers.models.depth_anything.modeling_depth_anything import DepthAnythingForDepthEstimation
-        print(f"[Enndee] FastDepthSplat: loading {repo_id} (fp16)...", flush=True)
+        print(f"[Enndee] Meridian Fast Depth: loading {repo_id} (fp16)...", flush=True)
         _GLOBAL_DEPTH_MODEL = DepthAnythingForDepthEstimation.from_pretrained(repo_id).to(device).half().eval()
         _GLOBAL_MODEL_ID = repo_id
     return _GLOBAL_DEPTH_MODEL
@@ -204,8 +204,8 @@ def _build_parametric_c2w(frames: int, piv: torch.Tensor, zm: float, yaw: float,
     return c2w, focals
 
 
-class EnndeeMeridianPseudoRender:
-    """Depth-aligned camera-flight condition renderer (Depth-Anything-V2 + GPU point splat).
+class EnndeeMeridianFastDepth:
+    """Depth-aligned camera-flight condition renderer (Depth-Anything-V2 + GPU point-cloud renderer).
 
     A VGGT-free, in-process replacement for the Enndee_MeridianGeometry preview pass that
     works from a single starting frame: predict its relative depth, unproject frame + depth
@@ -225,7 +225,7 @@ class EnndeeMeridianPseudoRender:
                 "image": ("IMAGE", {"tooltip": "Starting frame to unproject (image-to-video); the first frame of a batch is used."}),
                 "model_size": (["Depth-Anything-V2-Small-hf", "Depth-Anything-V2-Base-hf", "Depth-Anything-V2-Large-hf"],
                                {"default": "Depth-Anything-V2-Small-hf",
-                                "tooltip": "Depth-Anything-V2 variant. Small is ~7 ms per frame and plenty for a splat cloud; Base/Large are finer but slower and need a download."}),
+                                "tooltip": "Depth-Anything-V2 variant. Small is ~7 ms per frame and plenty for a point cloud; Base/Large are finer but slower and need a download."}),
                 "frames": (CAMERA_FRAME_OPTIONS, {"default": "73",
                                                   "tooltip": "Camera-flight length (MiniMax-H3 17k+5 grid). Ignored (the path's own count wins) when custom_camera is connected."}),
                 "canvas_mode": (["auto_meridian480", "custom"], {"default": "auto_meridian480",
@@ -236,7 +236,7 @@ class EnndeeMeridianPseudoRender:
                                           "tooltip": "'custom' canvas height."}),
                 "cloud_scale": ("INT", {"default": 2, "min": 1, "max": 4, "step": 1,
                                         "tooltip": "Unprojection-grid upscale over the input frame: 2 doubles the point count (denser silhouette fill), 1 keeps the frame's own resolution."}),
-                "splat_size": ("INT", {"default": 1, "min": 0, "max": 3, "step": 1,
+                "point_size": ("INT", {"default": 1, "min": 0, "max": 3, "step": 1,
                                        "tooltip": "Point footprint: 0=1x1, 1=3x3, 2=5x5, 3=7x7. Larger fills holes where the cloud is sparse after a big camera move."}),
                 "edge_cull": ("BOOLEAN", {"default": True,
                                           "tooltip": "Drop points on steep depth edges so silhouette borders cannot smear into flying spikes."}),
@@ -272,13 +272,14 @@ class EnndeeMeridianPseudoRender:
     FUNCTION = "generate"
     CATEGORY = "Enndee/Meridian"
     DESCRIPTION = (
-        "Fast VGGT-free geometry preview for MiniMax-H3: Depth-Anything-V2 + GPU point splat render "
-        "the authored camera flight from one starting frame. Returns (source, render, width, height, length) "
+        "Fast VGGT-free geometry condition renderer for MiniMax-H3: Depth-Anything-V2 estimates the "
+        "starting frame's relative depth, the frame+depth is lifted into a 3D point cloud, and the "
+        "authored camera flight is rendered from it. Returns (source, render, width, height, length) "
         "at the Meridian 480-class canvas, ready for MeridianRefConditioning."
     )
 
     def generate(self, image: torch.Tensor, model_size: str, frames: str, canvas_mode: str,
-                 custom_width: int, custom_height: int, cloud_scale: int, splat_size: int,
+                 custom_width: int, custom_height: int, cloud_scale: int, point_size: int,
                  edge_cull: bool, edge_threshold: float, custom_camera: Optional[str] = None,
                  yaw: float = 10.0, truck: float = 0.0, boom: float = 0.0, dolly: float = 1.0,
                  sweep: bool = True, ease: bool = True, aim: bool = False,
@@ -371,10 +372,10 @@ class EnndeeMeridianPseudoRender:
         f_canvas = 0.5 * out_h / math.tan(math.radians(VFOV_DEGREES) / 2.0)
         focal_px = f_canvas * focal.to(device)      # [F]
 
-        # --- render: z-buffered point splat along the flight (recam/geometry.py render_hw) -----------
+        # --- render: z-buffered point-cloud flight along the camera path (recam/geometry.py render_hw) ----
         cxc_out, cyc_out = out_w / 2.0, out_h / 2.0
-        splat = max(0, int(splat_size))
-        offs = [(dx, dy) for dy in range(-splat, splat + 1) for dx in range(-splat, splat + 1)]
+        radius = max(0, int(point_size))
+        offs = [(dx, dy) for dy in range(-radius, radius + 1) for dx in range(-radius, radius + 1)]
         hole = torch.full((out_h * out_w, 3), HOLE_COLOR, dtype=torch.uint8, device=device)
         rendered = []
         with torch.no_grad():
@@ -405,13 +406,13 @@ class EnndeeMeridianPseudoRender:
         source = F.interpolate(first.permute(0, 3, 1, 2), size=(out_h, out_w),
                                mode="bilinear", align_corners=False).permute(0, 2, 3, 1)
         source = source.repeat(num_frames, 1, 1, 1).clamp(0.0, 1.0).cpu()
-        print(f"[Enndee] FastDepthSplat: {pts.shape[0]} points -> {out_w}x{out_h}, {num_frames} frames "
+        print(f"[Enndee] Meridian Fast Depth: {pts.shape[0]} points -> {out_w}x{out_h}, {num_frames} frames "
               f"(zm {zm:.3f}, cloud {cloud_w}x{cloud_h}, {model_size})", flush=True)
         return source, render, out_w, out_h, num_frames
 
 
-NODE_CLASS_MAPPINGS = {"Enndee_MeridianPseudoRender": EnndeeMeridianPseudoRender}
-NODE_DISPLAY_NAME_MAPPINGS = {"Enndee_MeridianPseudoRender": "Meridian Fast Depth Splat (Enndee)"}
+NODE_CLASS_MAPPINGS = {"Enndee_MeridianFastDepthEstimator": EnndeeMeridianFastDepth}
+NODE_DISPLAY_NAME_MAPPINGS = {"Enndee_MeridianFastDepthEstimator": "Meridian Fast Depth Estimator (Enndee)"}
 
 
 
