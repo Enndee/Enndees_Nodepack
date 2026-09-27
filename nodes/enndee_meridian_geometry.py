@@ -1,4 +1,18 @@
-"""Meridian Geometry runner with custom-camera-path and repeated-first-frame support."""
+"""Meridian Geometry (Enndee): one node over both geometry-condition backends.
+
+    mode = "VGGT preview (subprocess)"          shells out to Meridian's inference/sample.py
+                                                (VGGT-Omega reconstruction, --preview-only)
+    mode = "Fast depth (Depth-Anything-V2)"     runs the in-process Depth-Anything-V2 point-cloud
+                                                flight (enndee_meridian_fast_depth.py)
+
+Both backends consume the same widgets - `image`/`video`, the `args` string (or the Meridian
+Parameter Picker's `args_override`) and the optional `custom_camera` signal - and both return
+(source, render, width, height, length) at the Meridian condition canvas, so the mode is a
+drop-in swap. The fast-depth widgets (model size, canvas override, cloud/point density and the
+two cull rules) only apply to the fast mode and are shown for it alone; the VGGT widgets (repo,
+python, cache) hide while the fast mode is active. web/js/enndee_meridian_geometry.js drives
+that visibility, the same way the parameter picker's extension does.
+"""
 
 import hashlib
 import json
@@ -15,6 +29,12 @@ import numpy as np
 import torch
 
 from enndee_meridian_camera_path import CAMERA_FRAME_OPTIONS, CAMERA_SIGNAL_TYPE
+from enndee_meridian_fast_depth import parse_camera_settings, render_depth_aligned
+
+VGGT_MODE = "VGGT preview (subprocess)"
+FAST_DEPTH_MODE = "Fast depth (Depth-Anything-V2)"
+MODE_OPTIONS = (VGGT_MODE, FAST_DEPTH_MODE)
+
 
 
 def _add_default_vggt_paths(args, repo):
@@ -289,6 +309,27 @@ class EnndeeMeridianGeometry:
                 "python": ("STRING", {"default": "python", "tooltip": "Python interpreter with Meridian/VGGT installed."}),
                 "cache": ("BOOLEAN", {"default": True, "tooltip": "Reuse a previous geometry pass when the picture, camera path and options are unchanged - skips the whole VGGT subprocess, the repeated-frame encode and the render."}),
                 "cache_dir": ("STRING", {"default": "", "tooltip": "Cache folder; empty = %TEMP%\\enndee_meridian_geometry. Delete it any time to force fresh renders."}),
+                "mode": (list(MODE_OPTIONS), {"default": VGGT_MODE,
+                                              "tooltip": "Geometry backend. 'VGGT preview' runs Meridian's own subprocess reconstruction (repo/python/cache below). 'Fast depth' runs the in-process Depth-Anything-V2 point-cloud flight for a single still - no VGGT, no subprocess - and uses the widgets below it."}),
+                "model_size": (["Depth-Anything-V2-Small-hf", "Depth-Anything-V2-Base-hf", "Depth-Anything-V2-Large-hf"],
+                               {"default": "Depth-Anything-V2-Small-hf",
+                                "tooltip": "Fast depth only: Depth-Anything-V2 variant. Small is ~7 ms per frame and plenty for a point cloud; Base/Large are finer but slower and need a download."}),
+                "canvas_mode": (["auto_meridian480", "custom"], {"default": "auto_meridian480",
+                                                                 "tooltip": "Fast depth only: 'auto_meridian480' picks the Meridian 480-class ladder entry nearest the frame's aspect (the trained condition canvas); 'custom' uses the two fields below."}),
+                "custom_width": ("INT", {"default": 832, "min": 64, "max": 2048, "step": 32,
+                                         "tooltip": "Fast depth only: 'custom' canvas width."}),
+                "custom_height": ("INT", {"default": 480, "min": 64, "max": 2048, "step": 32,
+                                          "tooltip": "Fast depth only: 'custom' canvas height."}),
+                "cloud_scale": ("INT", {"default": 2, "min": 1, "max": 4, "step": 1,
+                                        "tooltip": "Fast depth only: unprojection-grid upscale over the input frame: 2 doubles the point count (denser silhouette fill), 1 keeps the frame's own resolution."}),
+                "point_size": ("INT", {"default": 1, "min": 0, "max": 3, "step": 1,
+                                       "tooltip": "Fast depth only: point footprint 0=1x1, 1=3x3, 2=5x5, 3=7x7. Larger fills holes where the cloud is sparse after a big camera move."}),
+                "edge_cull": ("BOOLEAN", {"default": True,
+                                          "tooltip": "Fast depth only: drop points on steep depth edges (Meridian's 3x3 EDGE_RTOL rule, applied on the model's own depth grid) so silhouette borders cannot smear into flying spikes."}),
+                "edge_threshold": ("FLOAT", {"default": 0.30, "min": 0.05, "max": 2.0, "step": 0.01,
+                                             "tooltip": "Fast depth only: cull points whose 3x3 relative depth spread exceeds this ratio (Meridian's EDGE_RTOL = 0.30)."}),
+                "back_face_cull": ("BOOLEAN", {"default": False,
+                                               "tooltip": "Fast depth only: mirror Meridian's --cull - drop the splats the target camera sees from behind, so a 180-degree view is a hole, not the mirrored front. The parameter picker's Cull option turns this on through the args string."}),
             },
             "optional": {
                 "image": ("IMAGE",),
@@ -302,15 +343,68 @@ class EnndeeMeridianGeometry:
     FUNCTION = "build"
     CATEGORY = "Enndee/Meridian"
     DESCRIPTION = (
-        "Run Meridian VGGT geometry preview. Connect a generated custom_camera signal to automatically "
-        "repeat the source's first frame to the exact camera-path length and apply its path."
+        "Meridian geometry condition pass with two interchangeable backends, selected by `mode`. "
+        "VGGT preview runs Meridian's VGGT-Omega subprocess; Fast depth runs the in-process "
+        "Depth-Anything-V2 point-cloud flight for a single still (no VGGT, no external environment). "
+        "Both accept the same args string and custom_camera signal - the Meridian Parameter Picker "
+        "configures either - and both return (source, render, width, height, length) at the 480-class "
+        "condition canvas."
     )
 
-    def build(self, video, args, repo, python, cache=True, cache_dir="", image=None, args_override=None, custom_camera=None):
+    def _build_fast_depth(self, video, effective_args, image, custom_camera, model_size, canvas_mode,
+                          custom_width, custom_height, cloud_scale, point_size, edge_cull,
+                          edge_threshold, back_face_cull):
+        """In-process Depth-Anything-V2 pass with the same contract as the VGGT preview.
+
+        The `args` string is parsed for the sample.py camera flags the fast backend honours
+        (`parse_camera_settings`), so one Meridian Parameter Picker output configures either
+        mode. `--follow` cannot be replayed without VGGT poses and is reported instead of
+        silently ignored; `--freeze`, `--start` and `--canvas` do not affect a single still.
+        """
+        settings = parse_camera_settings(_parse_cli_tokens(effective_args))
+        if image is not None:
+            if image.ndim != 4 or image.shape[0] < 1:
+                raise ValueError("The connected image input must contain at least one frame.")
+            if image.shape[0] > 1:
+                print("Meridian geometry (Enndee): fast depth uses the first frame of the image batch "
+                      "(single-still image-to-video mode).", flush=True)
+            first_frame = image[0:1]
+        else:
+            if not video or not os.path.isfile(video):
+                raise ValueError("Connect a still/image batch or provide an existing video path for the fast depth mode.")
+            first_frame = _read_first_video_frame(video).unsqueeze(0)
+        if custom_camera is not None:
+            _camera_data, frame_count = _parse_custom_camera(custom_camera)
+        else:
+            if settings["follow"]:
+                raise ValueError("Fast depth mode cannot replay a source video's own camera path (--follow); "
+                                 "use the VGGT preview mode or turn Follow off in the parameter picker.")
+            frame_count = 73 if settings["frames"] is None else int(settings["frames"])
+            if frame_count not in {int(value) for value in CAMERA_FRAME_OPTIONS}:
+                raise ValueError("Fast depth mode needs a Meridian output length "
+                                 f"({', '.join(CAMERA_FRAME_OPTIONS)}), got {frame_count}.")
+        source, render, width, height, length = render_depth_aligned(
+            first_frame, torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+            model_size=model_size, frames=frame_count, canvas_mode=canvas_mode,
+            custom_width=custom_width, custom_height=custom_height, cloud_scale=cloud_scale,
+            point_size=point_size, edge_cull=edge_cull, edge_threshold=edge_threshold,
+            back_face_cull=back_face_cull, camera=settings, custom_camera=custom_camera,
+        )
+        print(f"Meridian geometry (Enndee): fast depth -> {width}x{height}, {length} frames.", flush=True)
+        return source, render, width, height, length
+
+    def build(self, video, args, repo, python, cache=True, cache_dir="", image=None, args_override=None,
+              custom_camera=None, mode=VGGT_MODE, model_size="Depth-Anything-V2-Small-hf",
+              canvas_mode="auto_meridian480", custom_width=832, custom_height=480, cloud_scale=2,
+              point_size=1, edge_cull=True, edge_threshold=0.30, back_face_cull=False):
+        effective_args = args_override if args_override is not None else args
+        if mode == FAST_DEPTH_MODE:
+            return self._build_fast_depth(video, effective_args, image, custom_camera, model_size,
+                                          canvas_mode, custom_width, custom_height, cloud_scale,
+                                          point_size, edge_cull, edge_threshold, back_face_cull)
         out = tempfile.mkdtemp(prefix="enndee_meridian_")
         image_input_path = None
         try:
-            effective_args = args_override if args_override is not None else args
             camera_data, frame_count = None, None
             if custom_camera is not None:
                 camera_data, frame_count = _parse_custom_camera(custom_camera)

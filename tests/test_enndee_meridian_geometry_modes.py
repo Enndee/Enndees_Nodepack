@@ -1,0 +1,138 @@
+"""Tests for the unified Meridian Geometry (Enndee) node: mode dispatch and fast-depth routing.
+
+The Depth-Anything-V2 backend is patched at the geometry module's `render_depth_aligned` symbol,
+so these tests assert the routing contract - which mode runs which backend, what the fast mode
+passes through, and which argument combinations it rejects - without loading a model or a
+subprocess. The backend's own behaviour lives in test_enndee_meridian_fast_depth.py.
+"""
+
+import json
+import sys
+import unittest
+from pathlib import Path
+from unittest import mock
+
+import torch
+
+
+PACK_DIR = Path(__file__).resolve().parents[1]
+NODES_DIR = PACK_DIR / "nodes"
+sys.path.insert(0, str(NODES_DIR))
+
+import enndee_meridian_geometry as geometry  # noqa: E402
+
+
+def _two_key_path(frames=90):
+    return {"frames": frames, "path": [
+        {"t": 0, "src": 0, "pos": [0.0, 0.0, 0.0], "look": [0.0, 0.0, 1.0]},
+        {"t": frames - 1, "src": frames - 1, "pos": [0.6, 0.1, 0.6], "look": [0.0, 0.0, 1.0]},
+    ]}
+
+
+class _FastCapture:
+    """Records the fast-backend call and returns a fixed condition pair."""
+
+    def __init__(self):
+        self.kwargs = None
+        self.first = None
+
+    def __call__(self, first, device, **kwargs):
+        self.first = first
+        self.kwargs = kwargs
+        length = kwargs.get("frames", 73)
+        return (torch.zeros(length, 64, 112, 3), torch.zeros(length, 64, 112, 3), 112, 64, length)
+
+
+class CompletedProcess:
+    stdout = "canvas (64, 64)"
+
+    @staticmethod
+    def check_returncode():
+        return None
+
+
+class MeridianGeometryModeTests(unittest.TestCase):
+    def test_input_types_expose_the_mode_and_the_fast_widgets(self):
+        inputs = geometry.EnndeeMeridianGeometry.INPUT_TYPES()
+        self.assertEqual(tuple(inputs["required"]["mode"][0]), geometry.MODE_OPTIONS)
+        for name in ("video", "args", "repo", "python", "cache", "cache_dir", "mode", "model_size",
+                     "canvas_mode", "custom_width", "custom_height", "cloud_scale", "point_size",
+                     "edge_cull", "edge_threshold", "back_face_cull"):
+            self.assertIn(name, inputs["required"])
+            self.assertIn("tooltip", inputs["required"][name][1], f"{name} needs a tooltip")
+
+    def test_fast_mode_routes_to_the_engine_with_parsed_arguments(self):
+        capture = _FastCapture()
+        images = torch.zeros(3, 64, 112, 3)
+        with mock.patch.object(geometry, "render_depth_aligned", capture), \
+             mock.patch.object(geometry.subprocess, "run",
+                               side_effect=AssertionError("no subprocess in fast mode")):
+            result = geometry.EnndeeMeridianGeometry().build(
+                video="unused.mp4", args="--frames 90 --yaw-from -15 --yaw 15 --sweep --ease --cull",
+                repo="meridian", python="python", image=images, mode=geometry.FAST_DEPTH_MODE)
+        self.assertEqual(capture.first.shape, (1, 64, 112, 3))     # first frame of the batch only
+        self.assertEqual(capture.kwargs["frames"], 90)
+        self.assertEqual(capture.kwargs["camera"]["yaw"], 15.0)
+        self.assertEqual(capture.kwargs["camera"]["yaw_from"], -15.0)
+        self.assertTrue(capture.kwargs["camera"]["sweep"] and capture.kwargs["camera"]["cull"])
+        self.assertIsNone(capture.kwargs["custom_camera"])
+        self.assertEqual(result[2:], (112, 64, 90))
+
+    def test_fast_mode_frame_count_defaults_to_meridian_73(self):
+        capture = _FastCapture()
+        with mock.patch.object(geometry, "render_depth_aligned", capture):
+            geometry.EnndeeMeridianGeometry().build(
+                video="unused.mp4", args="--yaw 10", repo="meridian", python="python",
+                image=torch.zeros(1, 64, 112, 3), mode=geometry.FAST_DEPTH_MODE)
+        self.assertEqual(capture.kwargs["frames"], 73)
+
+    def test_fast_mode_rejects_unsupported_lengths_and_follow(self):
+        node = geometry.EnndeeMeridianGeometry()
+        with self.assertRaisesRegex(ValueError, "Meridian output length"):
+            node.build(video="unused.mp4", args="--frames 71", repo="meridian", python="python",
+                       image=torch.zeros(1, 64, 112, 3), mode=geometry.FAST_DEPTH_MODE)
+        with self.assertRaisesRegex(ValueError, "--follow"):
+            node.build(video="unused.mp4", args="--follow --frames 73", repo="meridian",
+                       python="python", image=torch.zeros(1, 64, 112, 3),
+                       mode=geometry.FAST_DEPTH_MODE)
+
+    def test_fast_mode_takes_the_frame_count_and_path_from_custom_camera(self):
+        capture = _FastCapture()
+        signal = json.dumps(_two_key_path(frames=90))
+        with mock.patch.object(geometry, "render_depth_aligned", capture):
+            geometry.EnndeeMeridianGeometry().build(
+                video="unused.mp4", args="--follow --frames 73", repo="meridian", python="python",
+                image=torch.zeros(1, 64, 112, 3), custom_camera=signal, mode=geometry.FAST_DEPTH_MODE)
+        self.assertEqual(capture.kwargs["frames"], 90)        # the path wins over --frames
+        self.assertEqual(capture.kwargs["custom_camera"], signal)
+
+    def test_fast_mode_reads_the_first_video_frame_without_an_image(self):
+        capture = _FastCapture()
+        frame = torch.full((64, 112, 3), 0.5)
+        with mock.patch.object(geometry, "render_depth_aligned", capture), \
+             mock.patch.object(geometry, "_read_first_video_frame", return_value=frame), \
+             mock.patch.object(geometry.os.path, "isfile", return_value=True):
+            geometry.EnndeeMeridianGeometry().build(
+                video="clip.mp4", args="--frames 73", repo="meridian", python="python",
+                mode=geometry.FAST_DEPTH_MODE)
+        self.assertEqual(capture.first.shape, (1, 64, 112, 3))
+        with self.assertRaisesRegex(ValueError, "video path"):
+            geometry.EnndeeMeridianGeometry().build(
+                video="missing.mp4", args="--frames 73", repo="meridian", python="python",
+                mode=geometry.FAST_DEPTH_MODE)
+
+    def test_vggt_mode_still_runs_the_subprocess_and_never_the_engine(self):
+        capture = _FastCapture()
+        with mock.patch.object(geometry, "render_depth_aligned", capture), \
+             mock.patch.object(geometry.subprocess, "run", return_value=CompletedProcess()) as run, \
+             mock.patch.object(geometry, "_frames", side_effect=[torch.zeros(3, 64, 64, 3)] * 2):
+            result = geometry.EnndeeMeridianGeometry().build(
+                video="unused.mp4", args="--freeze 0:73", repo="meridian", python="python",
+                image=torch.zeros(1, 64, 64, 3))
+        run.assert_called_once()
+        self.assertIsNone(capture.kwargs)
+        self.assertEqual(result[2:], (64, 64, 3))
+
+
+if __name__ == "__main__":
+    unittest.main()
