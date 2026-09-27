@@ -3,16 +3,33 @@
 Builds the Meridian / MiniMax-H3 reference pair in-process, with no external conda
 environment and no VGGT checkpoint:
 
-    starting frame --Depth-Anything-V2--> inverse depth --invert--> relative depth
+    starting frame --Depth model--> relative depth (larger = farther)
     relative depth --3x3 edge keep + all-parents upsample--> kept depth
     depth + RGB --unproject--> 3D point cloud (the "depth-aligned texture")
     camera path (custom_camera signal, or the sample.py motion flags) --render--> flight frames
 
-Depth-Anything-V2 predicts *inverse* depth (disparity-like: larger = closer - the near pier
-post reads 4.4 while the far sky reads 0.3), so the engine inverts it into relative depth
-before the percentile rescale. Feeding the raw output as z flips the scene front-to-back:
-the subject lands behind the background and a moving camera sees the mirrored "back" of a
-shell whose front side was never reconstructed.
+Two depth families are available, picked by Meridian Geometry's `model_size`:
+
+    Depth-Anything-V2-*  predicts *inverse* depth (disparity-like: larger = closer - the near
+                         pier post reads 4.4 while the far sky reads 0.3), so the engine
+                         inverts it (1/x) before the percentile rescale. Feeding the raw
+                         output as z flips the scene front-to-back: the subject lands behind
+                         the background and a moving camera sees the mirrored "back" of a
+                         shell whose front side was never reconstructed.
+    Depth-Anything-3-*   predicts depth directly, and the raw output already is true relative
+                         depth (measured on beach.jpg: the near pillar reads ~0.72 while the
+                         far sea/sky reads ~5.2, verified against a turbo-mapped depth strip),
+                         so the v3 path skips the inversion. Small/Base/Large are the any-view
+                         models (camera poses, unused here); Mono-Large is the monocular
+                         series tuned for single stills.
+
+Depth-Anything-3 comes from the `depth-anything-3` pip package, installed with `--no-deps`
+(its numpy<2 pin plus xformers/open3d/pycolmap/moviepy/gsplat would fight ComfyUI's embedded
+python). The api module eagerly imports its export dispatcher and its `evo`-based pose
+alignment, so `_load_da3_api` swaps in raise-on-use stubs for
+`depth_anything_3.utils.export` and `depth_anything_3.utils.pose_align` before importing:
+the model code itself then needs only torch, einops, addict and omegaconf. Import takes
+~1.7 s and a still costs ~0.4 s on a Blackwell GPU.
 
 Two render guards mirror Meridian's own pipeline (recam/geometry.py, inference/sample.py):
 
@@ -25,13 +42,16 @@ Two render guards mirror Meridian's own pipeline (recam/geometry.py, inference/s
                     a hole, not the mirrored front.
 
 This module is a library, not a node: Meridian Geometry (Enndee) drives it with
-`mode = "Fast depth (Depth-Anything-V2)"`, and the unittests call `render_depth_aligned`
-directly with a fake depth model. Depth-Anything-V2-Small runs at ~7 ms per frame in FP16
-on a Blackwell GPU; a 73-frame pass typically completes in well under a second.
+`mode = "Fast depth (Depth-Anything-V2)"` (the mode label predates v3 and stays for saved
+workflows), and the unittests call `render_depth_aligned` directly with a fake depth model.
+Depth-Anything-V2-Small runs at ~7 ms per frame in FP16 on a Blackwell GPU; a 73-frame pass
+typically completes in well under a second.
 """
 
 import json
 import math
+import sys
+import types
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -52,8 +72,22 @@ DEPTH_PCT_LO, DEPTH_PCT_HI = 0.01, 0.99   # percentile clip so one speck cannot 
 PIVOT_WINDOW = 0.05                   # Meridian's +-5 % window around a picked pivot point
 MAX_CLOUD_PIXELS = 16_777_216         # unprojection-grid safety cap (16 M points)
 DEPTH_RES = 518                       # Depth-Anything-V2's native square input side
+DA3_RES = 504                         # Depth-Anything-3 `process_res`: aspect-preserving, longest side
 DISPARITY_EPS = 0.001                 # floor before the 1/x inversion, so the far plane stays finite
 KEEP_PARENT_RATIO = 0.999             # recam/geometry.py `upsample`: a hi-res pixel needs every parent kept
+
+# Depth-Anything-3 variants the fast backend can load, as Hugging Face repo ids (all
+# Apache-2.0). Small/Base/Large are the any-view series (relative depth + camera poses, the
+# poses unused here); Mono-Large is the monocular series tuned for high-quality single-still
+# depth. Metric-Large is left out because the percentile rescale below re-gauges every
+# prediction anyway, and the Giant/Nested models are much heavier (and CC BY-NC licensed).
+DA3_PREFIX = "Depth-Anything-3"
+DA3_MODEL_REPOS = {
+    "Depth-Anything-3-Small": "depth-anything/DA3-SMALL",
+    "Depth-Anything-3-Base": "depth-anything/DA3-BASE",
+    "Depth-Anything-3-Large": "depth-anything/DA3-LARGE",
+    "Depth-Anything-3-Mono-Large": "depth-anything/DA3MONO-LARGE",
+}
 
 # sample.py camera flags the fast backend honours, so one Meridian Parameter Picker args
 # string drives both backends: value flags carry a following token, boolean flags do not.
@@ -94,6 +128,94 @@ def _get_depth_model(model_name: str, device: torch.device):
         _GLOBAL_DEPTH_MODEL = DepthAnythingForDepthEstimation.from_pretrained(repo_id).to(device).half().eval()
         _GLOBAL_MODEL_ID = repo_id
     return _GLOBAL_DEPTH_MODEL
+
+
+_GLOBAL_DA3_MODEL = None
+_GLOBAL_DA3_ID = None
+
+
+def _load_da3_api():
+    """Import ``depth_anything_3.api`` with its optional heavy sub-packages stubbed out.
+
+    The pip package declares a dependency set meant for a dedicated environment
+    (``numpy<2``, xformers, open3d, pycolmap, moviepy, gsplat, evo) and is therefore installed
+    here with ``python -m pip install --no-deps depth-anything-3``, keeping ComfyUI's own
+    numpy/torch. Two eager imports then stay unsatisfied, and both are dead ends for the
+    fast-depth backend:
+
+    * ``depth_anything_3.utils.export`` - the export dispatcher pulls the glb (trimesh),
+      colmap (pycolmap), gs (gsplat) and vis (moviepy) exporters; this backend only runs
+      in-memory inference, so a raise-on-use stub replaces the package's ``export``.
+    * ``depth_anything_3.utils.pose_align`` - needs ``evo`` and is only reached when input
+      extrinsics are handed to ``inference()``; this backend passes none.
+
+    The model code itself needs torch, einops, addict and omegaconf (all present in ComfyUI's
+    embedded python, transformers' DA2 stack aside). The api module also flips
+    ``torch.backends.cudnn.benchmark`` to False at import time - the previous value is
+    restored so other ComfyUI models keep their setting.
+    """
+    cached = sys.modules.get("depth_anything_3.api")
+    if cached is not None:
+        return cached.DepthAnything3
+    benchmark = torch.backends.cudnn.benchmark
+    try:
+        import depth_anything_3.utils  # noqa: F401  (namespace parent for the two stubs)
+
+        export_stub = types.ModuleType("depth_anything_3.utils.export")
+
+        def _export_unavailable(*args, **kwargs):
+            raise ImportError("Depth-Anything-3 export formats are not installed; "
+                              "the fast-depth backend only runs in-memory inference.")
+
+        export_stub.export = _export_unavailable
+        export_stub.SUPPORTED_EXPORT_FORMATS = frozenset()
+        sys.modules["depth_anything_3.utils.export"] = export_stub
+
+        pose_stub = types.ModuleType("depth_anything_3.utils.pose_align")
+
+        def _pose_align_unavailable(*args, **kwargs):
+            raise ImportError("Depth-Anything-3 pose alignment needs the 'evo' package and "
+                              "input extrinsics; the fast-depth backend passes neither.")
+
+        pose_stub.align_poses_umeyama = _pose_align_unavailable
+        pose_stub.batch_align_poses_umeyama = _pose_align_unavailable
+        sys.modules["depth_anything_3.utils.pose_align"] = pose_stub
+
+        from depth_anything_3.api import DepthAnything3
+    except ImportError as exc:
+        raise RuntimeError(
+            "Depth-Anything-3 is not installed for this interpreter. In the ComfyUI "
+            "python_embeded run: python -m pip install --no-deps depth-anything-3 "
+            "(addict and omegaconf must be importable too)."
+        ) from exc
+    finally:
+        torch.backends.cudnn.benchmark = benchmark
+    return DepthAnything3
+
+
+def _predict_da3_depth(model_name: str, first: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Depth-Anything-3 relative depth for one still: (H, W) float tensor, larger = farther.
+
+    Unlike Depth-Anything-V2 there is no 1/x conversion - DA3 predicts depth directly and the
+    raw output already is true relative depth (beach.jpg: the near pillar ~0.72, the far
+    sea/sky ~5.2). The grid is aspect-preserving (`process_res` caps the longest side), so it
+    can be non-square. The model is cached in VRAM across runs; only the variant reloads it.
+    """
+    global _GLOBAL_DA3_MODEL, _GLOBAL_DA3_ID
+    repo_id = DA3_MODEL_REPOS.get(model_name)
+    if repo_id is None:
+        raise ValueError(f"Unknown Depth-Anything-3 variant {model_name!r}; "
+                         f"expected one of {', '.join(DA3_MODEL_REPOS)}.")
+    if _GLOBAL_DA3_MODEL is None or _GLOBAL_DA3_ID != repo_id:
+        DepthAnything3 = _load_da3_api()
+        print(f"[Enndee] Meridian fast depth: loading {repo_id}...", flush=True)
+        _GLOBAL_DA3_MODEL = DepthAnything3.from_pretrained(repo_id).to(device).eval()
+        _GLOBAL_DA3_ID = repo_id
+    frame = first[0].detach().clamp(0.0, 1.0).mul(255.0).round().to(torch.uint8).cpu().numpy()
+    with torch.no_grad():
+        prediction = _GLOBAL_DA3_MODEL.inference([frame], process_res=DA3_RES)
+    depth = np.asarray(prediction.depth[0], dtype=np.float32)
+    return torch.from_numpy(depth).to(device)
 
 
 def _bucket_480(width: int, height: int) -> Tuple[int, int]:
@@ -378,7 +500,7 @@ def render_depth_aligned(first, device, model_size="Depth-Anything-V2-Small-hf",
                          canvas_mode="auto_meridian480", custom_width=832, custom_height=480,
                          cloud_scale=2, point_size=1, edge_cull=True, edge_threshold=0.30,
                          back_face_cull=False, camera=None, custom_camera=None):
-    """Depth-aligned camera-flight condition renderer (Depth-Anything-V2 + GPU point-cloud renderer).
+    """Depth-aligned camera-flight condition renderer (Depth-Anything-V2/V3 + GPU point-cloud renderer).
 
     `first`          [1,H,W,3] float tensor in [0,1]: the still the flight starts from.
     `camera`         settings dict from `parse_camera_settings` (None = every default).
@@ -406,18 +528,21 @@ def render_depth_aligned(first, device, model_size="Depth-Anything-V2-Small-hf",
     else:
         out_w, out_h = _bucket_480(src_w, src_h)
 
-    # --- depth: Depth-Anything-V2 at its native 518 px input, inverted to relative depth ---------
-    depth_model = _get_depth_model(model_size, device)
-    mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
-    std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
-    x518 = F.interpolate(first.permute(0, 3, 1, 2), size=(DEPTH_RES, DEPTH_RES),
-                         mode="bilinear", align_corners=False)
-    with torch.no_grad():
-        pred = depth_model(pixel_values=((x518 - mean) / std).half()).predicted_depth[0].float()
-    depth_low = _invert_disparity(pred)
+    # --- depth: Depth-Anything-V2 (disparity -> invert) or Depth-Anything-3 (already depth) -------
+    if model_size.startswith(DA3_PREFIX):
+        depth_low = _predict_da3_depth(model_size, first, device)
+    else:
+        depth_model = _get_depth_model(model_size, device)
+        mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+        x518 = F.interpolate(first.permute(0, 3, 1, 2), size=(DEPTH_RES, DEPTH_RES),
+                             mode="bilinear", align_corners=False)
+        with torch.no_grad():
+            pred = depth_model(pixel_values=((x518 - mean) / std).half()).predicted_depth[0].float()
+        depth_low = _invert_disparity(pred)
 
-    # keep (model grid): Meridian's 3x3 depth-edge rule; no confidence head exists here, so the
-    # 2 % confidence pruning of recam/geometry.py has no equivalent and nothing else is culled
+    # keep (model grid): Meridian's 3x3 depth-edge rule; the 2 % confidence pruning of
+    # recam/geometry.py is not ported for either family, so nothing else is culled
     keep_low = _edge_keep(depth_low, edge_threshold) if edge_cull else torch.ones_like(depth_low, dtype=torch.bool)
 
     # cloud grid: the frame (and the depth under it) upscaled so silhouettes get finer points;
@@ -439,7 +564,9 @@ def render_depth_aligned(first, device, model_size="Depth-Anything-V2-Small-hf",
                  * (depth_cloud - d_lo) / span).clamp(min=0.05)
 
     # --- pivot: median depth in the +-5 % window of the picked point, on the model's own grid ----
-    res = depth_low.shape[-1]
+    # Depth-Anything-3 returns an aspect-preserving grid (the longest side is `process_res`), so
+    # crop fractions map onto its own width/height instead of a single square side.
+    low_h, low_w = depth_low.shape[-2:]
     f_cloud = 0.5 * cloud_h / math.tan(math.radians(VFOV_DEGREES) / 2.0)
     cxc, cyc = cloud_w / 2.0, cloud_h / 2.0
 
@@ -453,10 +580,10 @@ def render_depth_aligned(first, device, model_size="Depth-Anything-V2-Small-hf",
         except ValueError as exc:
             raise ValueError(f"{label} must be 'x,y' in 0..1 crop coordinates, 'none', or empty.") from exc
         fx, fy = min(max(fx, 0.0), 1.0), min(max(fy, 0.0), 1.0)
-        px, py = fx * res, fy * res
-        rw, rh = PIVOT_WINDOW * res, PIVOT_WINDOW * res
-        window = (slice(max(0, int(py - rh)), min(res, int(py + rh) + 1)),
-                  slice(max(0, int(px - rw)), min(res, int(px + rw) + 1)))
+        px, py = fx * low_w, fy * low_h
+        rw, rh = PIVOT_WINDOW * low_w, PIVOT_WINDOW * low_h
+        window = (slice(max(0, int(py - rh)), min(low_h, int(py + rh) + 1)),
+                  slice(max(0, int(px - rw)), min(low_w, int(px + rw) + 1)))
         sample = depth_low[window][keep_low[window]]
         if not sample.numel():
             sample = depth_low[keep_low] if keep_low.any() else depth_low.flatten()

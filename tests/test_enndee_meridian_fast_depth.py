@@ -1,15 +1,18 @@
 """Tests for the Meridian fast-depth backend (`enndee_meridian_fast_depth`).
 
-The depth model is faked by patching the module's `_get_depth_model`, so the suite covers
-signal parsing, the arguments parser, canvas bucketing, the ported camera math, depth
-inversion, the Meridian-style edge keep / all-parents upsample, the `--cull` normals and the
-full unproject + point-render contract without downloading or loading Depth-Anything-V2.
+The depth model is faked by patching the module's `_get_depth_model` (Depth-Anything-V2) and
+`_predict_da3_depth` (Depth-Anything-3) hooks, so the suite covers signal parsing, the arguments
+parser, canvas bucketing, the ported camera math, depth inversion, the Meridian-style edge keep /
+all-parents upsample, the `--cull` normals and the full unproject + point-render contract without
+downloading or loading any depth model.
 
-The fake model returns *inverse* depth like the real Depth-Anything-V2 (larger = closer):
-a near pier post reads 4.4 while the far sky reads 0.3.
+The V2 fake returns *inverse* depth like the real Depth-Anything-V2 (larger = closer): a near
+pier post reads 4.4 while the far sky reads 0.3. The V3 fakes return true relative depth (larger
+= farther), which is what the real Depth-Anything-3 models emit.
 """
 
 import contextlib
+import importlib.util
 import io
 import json
 import sys
@@ -234,7 +237,7 @@ class MeridianFastDepthHelperTests(unittest.TestCase):
         self.assertAlmostEqual(float(swing[1, 2, 3]), float(swing[3, 2, 3]), places=4)
 
 class MeridianFastDepthEngineTests(unittest.TestCase):
-    def _generate(self, image=None, model=None, camera=None, custom_camera=None, **overrides):
+    def _generate(self, image=None, model=None, da3_depth=None, camera=None, custom_camera=None, **overrides):
         options = dict(
             model_size="Depth-Anything-V2-Small-hf", frames=73, canvas_mode="custom",
             custom_width=112, custom_height=64, cloud_scale=1, point_size=0,
@@ -242,7 +245,9 @@ class MeridianFastDepthEngineTests(unittest.TestCase):
         )
         options.update(overrides)
         with mock.patch.object(fast_depth, "_get_depth_model",
-                               lambda *args, **kwargs_: model or _FakeDepthModel()):
+                               lambda *args, **kwargs_: model or _FakeDepthModel()), \
+             mock.patch.object(fast_depth, "_predict_da3_depth",
+                               lambda *args, **kwargs_: da3_depth):
             return fast_depth.render_depth_aligned(
                 image if image is not None else _gradient_image(), torch.device("cpu"),
                 camera=camera, custom_camera=custom_camera, **options)
@@ -309,6 +314,57 @@ class MeridianFastDepthEngineTests(unittest.TestCase):
         _, args_cull, _, _, _ = self._generate(model=flat, camera=_camera("--yaw", "170", "--cull"),
                                                point_size=1)
         torch.testing.assert_close(widget_cull, args_cull)
+
+    def test_da3_models_use_true_depth_without_the_disparity_inversion(self):
+        # Depth-Anything-3 predicts depth directly: left half near (0.25), right half far (4.0).
+        columns = torch.linspace(0.0, 1.0, 21).view(1, 21).expand(7, 21)
+        da3_depth = torch.where(columns < 0.5, torch.tensor(0.25), torch.tensor(4.0))
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            source, render, width, height, length = self._generate(
+                model_size="Depth-Anything-3-Small", da3_depth=da3_depth,
+                camera=_camera("--pivot", "0.25,0.5"))
+        text = buffer.getvalue()
+        self.assertIn("zm 0.250", text)     # the near half is the pivot depth, unconverted
+        self.assertNotIn("zm 4", text)      # an inversion would report 4.000
+        self.assertEqual((width, height, length), (112, 64, 73))
+        self.assertEqual(tuple(source.shape), (73, 64, 112, 3))
+        self.assertEqual(tuple(render.shape), (73, 64, 112, 3))
+
+    def test_da3_pivot_window_maps_onto_the_grid_height(self):
+        # A 7x21 grid whose value is the row index + 1. The +-5 % window around fy=0.75 covers
+        # rows 4..5; torch.median takes the lower middle value, so the raw pivot depth prints as
+        # 5.000. A square-grid mapping (the old `res = shape[-1]`) would read rows past the end,
+        # fall back to the global median and print 4.000 instead. The 3x3 edge rule is off
+        # because a 2-step row jump exceeds EDGE_RTOL and would cull every non-last row.
+        rows = torch.arange(1.0, 8.0).view(7, 1).expand(7, 21).contiguous()
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            self._generate(model_size="Depth-Anything-3-Small", da3_depth=rows, edge_cull=False,
+                           camera=_camera("--pivot", "0.5,0.75"))
+        self.assertIn("zm 5.000", buffer.getvalue())
+
+    def test_da3_variants_map_to_hugging_face_repos_and_unknown_ones_fail_loudly(self):
+        self.assertEqual(fast_depth.DA3_MODEL_REPOS["Depth-Anything-3-Small"],
+                         "depth-anything/DA3-SMALL")
+        self.assertIn("Depth-Anything-3-Mono-Large", fast_depth.DA3_MODEL_REPOS)
+        self.assertTrue(all(repo.startswith("depth-anything/")
+                            for repo in fast_depth.DA3_MODEL_REPOS.values()))
+        with self.assertRaisesRegex(ValueError, "Unknown Depth-Anything-3 variant"):
+            fast_depth._predict_da3_depth("Depth-Anything-3-Giant", torch.zeros(1, 4, 4, 3),
+                                          torch.device("cpu"))
+
+    def test_da3_api_loads_with_the_lightweight_stubs(self):
+        if importlib.util.find_spec("depth_anything_3") is None:
+            self.skipTest("depth-anything-3 is not installed in this interpreter")
+        DepthAnything3 = fast_depth._load_da3_api()
+        self.assertTrue(callable(DepthAnything3.from_pretrained))
+        # The export dispatcher and pose alignment stay stubbed out (their deps are absent);
+        # both are unreachable from the fast-depth inference path.
+        with self.assertRaises(ImportError):
+            sys.modules["depth_anything_3.utils.export"].export(None, "glb", "out")
+        with self.assertRaises(ImportError):
+            sys.modules["depth_anything_3.utils.pose_align"].align_poses_umeyama(None, None)
 
 
 if __name__ == "__main__":

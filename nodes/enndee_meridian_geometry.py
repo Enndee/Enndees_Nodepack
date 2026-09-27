@@ -2,16 +2,19 @@
 
     mode = "VGGT preview (subprocess)"          shells out to Meridian's inference/sample.py
                                                 (VGGT-Omega reconstruction, --preview-only)
-    mode = "Fast depth (Depth-Anything-V2)"     runs the in-process Depth-Anything-V2 point-cloud
-                                                flight (enndee_meridian_fast_depth.py)
+    mode = "Fast depth (Depth-Anything-V2)"     runs the in-process Depth-Anything point-cloud
+                                                flight (enndee_meridian_fast_depth.py), V2 or V3
 
 Both backends consume the same widgets - `image`/`video`, the `args` string (or the Meridian
 Parameter Picker's `args_override`) and the optional `custom_camera` signal - and both return
 (source, render, width, height, length) at the Meridian condition canvas, so the mode is a
 drop-in swap. The fast-depth widgets (model size, canvas override, cloud/point density and the
-two cull rules) only apply to the fast mode and are shown for it alone; the VGGT widgets (repo,
-python, cache) hide while the fast mode is active. web/js/enndee_meridian_geometry.js drives
-that visibility, the same way the parameter picker's extension does.
+two cull rules) only apply to the fast mode and are shown for it alone; the VGGT settings
+(repo, python, cache, cache_dir plus the canvas, source-size and VGGT-path overrides the
+picker also knows) hide while the fast mode is active. The node's own VGGT overrides only fill
+flags the args string did not set, so a connected picker always wins.
+web/js/enndee_meridian_geometry.js drives that visibility, the same way the parameter picker's
+extension does.
 """
 
 import hashlib
@@ -65,6 +68,39 @@ def _add_default_vggt_paths(args, repo):
                 args.extend(["--vggt", checkpoint])
             break
     return args
+
+
+def _apply_vggt_source_settings(cmd, canvas_enabled, canvas_width, canvas_height,
+                                full_enabled, full_size, vggt_repo, vggt_checkpoint):
+    """Append the node's VGGT-panel options, but never over an args string that set them.
+
+    The Meridian Parameter Picker owns the same flags (`--canvas`, `--full`, `--vggt-repo`,
+    `--vggt`); its args win whenever they are present, so these widgets only matter for
+    picker-free graphs - the rule `_add_default_vggt_paths` already uses for the detected
+    installation. Sizes are validated exactly like the picker validates them.
+    """
+    present = {token.split("=", 1)[0] for token in cmd}
+
+    def add(flag, value):
+        if flag not in present:
+            cmd.extend([flag, value])
+            present.add(flag)
+
+    if canvas_enabled:
+        width, height = int(canvas_width), int(canvas_height)
+        if width < 32 or height < 32 or width % 32 or height % 32:
+            raise ValueError("Geometry canvas width and height must be positive multiples of 32.")
+        add("--canvas", f"{width}x{height}")
+    if full_enabled:
+        size = int(full_size)
+        if size < 128 or size % 32:
+            raise ValueError("VGGT source square size must be at least 128 and a multiple of 32.")
+        add("--full", str(size))
+    if str(vggt_repo).strip():
+        add("--vggt-repo", str(vggt_repo).strip())
+    if str(vggt_checkpoint).strip():
+        add("--vggt", str(vggt_checkpoint).strip())
+    return cmd
 
 
 def _frames(path):
@@ -310,10 +346,12 @@ class EnndeeMeridianGeometry:
                 "cache": ("BOOLEAN", {"default": True, "tooltip": "Reuse a previous geometry pass when the picture, camera path and options are unchanged - skips the whole VGGT subprocess, the repeated-frame encode and the render."}),
                 "cache_dir": ("STRING", {"default": "", "tooltip": "Cache folder; empty = %TEMP%\\enndee_meridian_geometry. Delete it any time to force fresh renders."}),
                 "mode": (list(MODE_OPTIONS), {"default": VGGT_MODE,
-                                              "tooltip": "Geometry backend. 'VGGT preview' runs Meridian's own subprocess reconstruction (repo/python/cache below). 'Fast depth' runs the in-process Depth-Anything-V2 point-cloud flight for a single still - no VGGT, no subprocess - and uses the widgets below it."}),
-                "model_size": (["Depth-Anything-V2-Small-hf", "Depth-Anything-V2-Base-hf", "Depth-Anything-V2-Large-hf"],
+                                              "tooltip": "Geometry backend. 'VGGT preview' runs Meridian's own subprocess reconstruction (repo/python/cache plus the VGGT canvas/source settings). 'Fast depth' runs the in-process Depth-Anything point-cloud flight for a single still - pick V2 or V3 in `model_size`, no VGGT, no subprocess."}),
+                "model_size": (["Depth-Anything-V2-Small-hf", "Depth-Anything-V2-Base-hf", "Depth-Anything-V2-Large-hf",
+                                "Depth-Anything-3-Small", "Depth-Anything-3-Base", "Depth-Anything-3-Large",
+                                "Depth-Anything-3-Mono-Large"],
                                {"default": "Depth-Anything-V2-Small-hf",
-                                "tooltip": "Fast depth only: Depth-Anything-V2 variant. Small is ~7 ms per frame and plenty for a point cloud; Base/Large are finer but slower and need a download."}),
+                                "tooltip": "Fast depth only: the depth model. The V2 trio predicts inverted disparity at ~7 ms per frame (needs `transformers`); the V3 series predicts depth directly and is markedly more accurate (needs `python -m pip install --no-deps depth-anything-3` in the ComfyUI python_embeded) - Mono-Large is tuned for single stills, Small is the fast one. Downloads land in the Hugging Face cache; all variants are Apache-2.0."}),
                 "canvas_mode": (["auto_meridian480", "custom"], {"default": "auto_meridian480",
                                                                  "tooltip": "Fast depth only: 'auto_meridian480' picks the Meridian 480-class ladder entry nearest the frame's aspect (the trained condition canvas); 'custom' uses the two fields below."}),
                 "custom_width": ("INT", {"default": 832, "min": 64, "max": 2048, "step": 32,
@@ -330,6 +368,18 @@ class EnndeeMeridianGeometry:
                                              "tooltip": "Fast depth only: cull points whose 3x3 relative depth spread exceeds this ratio (Meridian's EDGE_RTOL = 0.30)."}),
                 "back_face_cull": ("BOOLEAN", {"default": False,
                                                "tooltip": "Fast depth only: mirror Meridian's --cull - drop the splats the target camera sees from behind, so a 180-degree view is a hole, not the mirrored front. The parameter picker's Cull option turns this on through the args string."}),
+                "canvas_enabled": ("BOOLEAN", {"default": False,
+                                               "tooltip": "VGGT preview only: override Meridian's automatic 768-class geometry canvas with the two sizes below. Ignored whenever the args string already carries a --canvas flag (a connected parameter picker owns one)."}),
+                "canvas_width": ("INT", {"default": 864, "min": 32, "max": 4096, "step": 32,
+                                         "tooltip": "VGGT preview only: custom geometry render width; used while Custom Canvas is enabled. Multiples of 32."}),
+                "canvas_height": ("INT", {"default": 1184, "min": 32, "max": 4096, "step": 32,
+                                          "tooltip": "VGGT preview only: custom geometry render height; used while Custom Canvas is enabled. Multiples of 32."}),
+                "full_enabled": ("BOOLEAN", {"default": False,
+                                             "tooltip": "VGGT preview only: override VGGT's 1280-pixel square source reconstruction size with the value below. Ignored whenever the args string already carries a --full flag."}),
+                "full_size": ("INT", {"default": 1280, "min": 128, "max": 4096, "step": 32,
+                                      "tooltip": "VGGT preview only: VGGT square source reconstruction side, in pixels; used while Custom VGGT Source Size is enabled."}),
+                "vggt_repo": ("STRING", {"default": "", "tooltip": "VGGT preview only: VGGT-Omega source folder. Empty = the installation auto-detected next to `repo`, or the picker's --vggt-repo when its args string carries one."}),
+                "vggt_checkpoint": ("STRING", {"default": "", "tooltip": "VGGT preview only: VGGT-Omega checkpoint (.pt). Empty = the checkpoint auto-detected next to `repo`, or the picker's --vggt when its args string carries one."}),
             },
             "optional": {
                 "image": ("IMAGE",),
@@ -344,17 +394,18 @@ class EnndeeMeridianGeometry:
     CATEGORY = "Enndee/Meridian"
     DESCRIPTION = (
         "Meridian geometry condition pass with two interchangeable backends, selected by `mode`. "
-        "VGGT preview runs Meridian's VGGT-Omega subprocess; Fast depth runs the in-process "
-        "Depth-Anything-V2 point-cloud flight for a single still (no VGGT, no external environment). "
-        "Both accept the same args string and custom_camera signal - the Meridian Parameter Picker "
-        "configures either - and both return (source, render, width, height, length) at the 480-class "
-        "condition canvas."
+        "VGGT preview runs Meridian's VGGT-Omega subprocess (repo/python/cache and the canvas, "
+        "source-size and VGGT-path overrides live on this node as well); Fast depth runs the "
+        "in-process Depth-Anything point-cloud flight for a single still (V2 or V3 via "
+        "`model_size`, no VGGT, no external environment). Both accept the same args string and "
+        "custom_camera signal - the Meridian Parameter Picker configures either - and both return "
+        "(source, render, width, height, length) at the 480-class condition canvas."
     )
 
     def _build_fast_depth(self, video, effective_args, image, custom_camera, model_size, canvas_mode,
                           custom_width, custom_height, cloud_scale, point_size, edge_cull,
                           edge_threshold, back_face_cull):
-        """In-process Depth-Anything-V2 pass with the same contract as the VGGT preview.
+        """In-process Depth-Anything pass (V2 or V3 by `model_size`) with the same contract as the VGGT preview.
 
         The `args` string is parsed for the sample.py camera flags the fast backend honours
         (`parse_camera_settings`), so one Meridian Parameter Picker output configures either
@@ -396,7 +447,9 @@ class EnndeeMeridianGeometry:
     def build(self, video, args, repo, python, cache=True, cache_dir="", image=None, args_override=None,
               custom_camera=None, mode=VGGT_MODE, model_size="Depth-Anything-V2-Small-hf",
               canvas_mode="auto_meridian480", custom_width=832, custom_height=480, cloud_scale=2,
-              point_size=1, edge_cull=True, edge_threshold=0.30, back_face_cull=False):
+              point_size=1, edge_cull=True, edge_threshold=0.30, back_face_cull=False,
+              canvas_enabled=False, canvas_width=864, canvas_height=1184, full_enabled=False,
+              full_size=1280, vggt_repo="", vggt_checkpoint=""):
         effective_args = args_override if args_override is not None else args
         if mode == FAST_DEPTH_MODE:
             return self._build_fast_depth(video, effective_args, image, custom_camera, model_size,
@@ -459,6 +512,8 @@ class EnndeeMeridianGeometry:
                 cmd = [python, f"{repo}/inference/sample.py", "--video", video, "--out", out, "--preview-only"]
                 cmd += _parse_cli_tokens(effective_args)
 
+            cmd = _apply_vggt_source_settings(cmd, canvas_enabled, canvas_width, canvas_height,
+                                              full_enabled, full_size, vggt_repo, vggt_checkpoint)
             cmd = _add_default_vggt_paths(cmd, repo)
             print("Meridian geometry (Enndee):", " ".join(cmd), flush=True)
             result = subprocess.run(cmd, cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)

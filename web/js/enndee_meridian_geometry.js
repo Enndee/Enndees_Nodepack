@@ -6,13 +6,15 @@
  * extension:
  *
  * - "VGGT preview (subprocess)": the VGGT controls (repo, python, cache,
- *   cache_dir) are visible and every fast-depth control is hidden - the fast
- *   widgets have no effect on the subprocess pass.
+ *   cache_dir plus the canvas / VGGT source-size / VGGT-path overrides) are
+ *   visible and every fast-depth control is hidden - the fast widgets have no
+ *   effect on the subprocess pass.
  * - "Fast depth (Depth-Anything-V2)": the VGGT controls disappear and the
  *   fast-depth group appears (model size, canvas, cloud/point density, the two
  *   cull rules).
- * - The custom canvas size fields follow `canvas_mode` inside the fast group,
- *   the same master/detail rule the picker uses for its canvas override.
+ * - Master/detail rules mirror the picker's: the custom canvas numbers follow
+ *   `canvas_mode` inside the fast group, `canvas_width`/`canvas_height` follow
+ *   `canvas_enabled` and `full_size` follows `full_enabled` in the VGGT group.
  *
  * Hidden widgets keep their values, so saved workflows and the python node
  * still receive every parameter.
@@ -23,15 +25,24 @@ import { app } from "/scripts/app.js";
 const VGGT_MODE = "VGGT preview (subprocess)";
 const FAST_DEPTH_MODE = "Fast depth (Depth-Anything-V2)";
 
-// Controls that only matter to the in-process Depth-Anything-V2 backend.
+// Controls that only matter to the in-process Depth-Anything backend (V2 or V3).
 const FAST_DEPTH_PANEL = [
   "model_size", "canvas_mode", "custom_width", "custom_height", "cloud_scale",
   "point_size", "edge_cull", "edge_threshold", "back_face_cull",
 ];
-// Subprocess-only controls: no effect while the fast backend renders.
-const VGGT_PANEL = ["repo", "python", "cache", "cache_dir"];
+// Subprocess-only controls: no effect while the fast backend renders. The canvas,
+// source-size and VGGT-path overrides mirror the parameter picker's widgets; they only
+// fill flags the args string did not set, so a connected picker keeps authority.
+const VGGT_PANEL = [
+  "repo", "python", "cache", "cache_dir",
+  "canvas_enabled", "canvas_width", "canvas_height", "full_enabled", "full_size",
+  "vggt_repo", "vggt_checkpoint",
+];
 // Master/detail: the explicit canvas numbers only while `canvas_mode` is "custom".
 const CUSTOM_CANVAS_DETAILS = ["custom_width", "custom_height"];
+// Master/detail in the VGGT group, the same pairs the picker hides behind its toggles.
+const VGGT_CANVAS_DETAILS = ["canvas_width", "canvas_height"];
+const VGGT_FULL_DETAILS = ["full_size"];
 
 const ALL_HIDEABLE = [...new Set([...FAST_DEPTH_PANEL, ...VGGT_PANEL])];
 
@@ -100,6 +111,12 @@ function applyGeometryVisibility(node) {
     VGGT_PANEL.forEach((name) => visible.delete(name));
   } else {
     FAST_DEPTH_PANEL.forEach((name) => visible.delete(name));
+    if (!Boolean(find("canvas_enabled")?.value)) {
+      VGGT_CANVAS_DETAILS.forEach((name) => visible.delete(name));
+    }
+    if (!Boolean(find("full_enabled")?.value)) {
+      VGGT_FULL_DETAILS.forEach((name) => visible.delete(name));
+    }
   }
   if (!fast || (find("canvas_mode")?.value ?? "auto_meridian480") !== "custom") {
     CUSTOM_CANVAS_DETAILS.forEach((name) => visible.delete(name));
@@ -119,7 +136,7 @@ function applyGeometryVisibility(node) {
 }
 
 // Widgets that change the visible set when their value changes.
-const WATCHED_WIDGETS = new Set(["mode", "canvas_mode"]);
+const WATCHED_WIDGETS = new Set(["mode", "canvas_mode", "canvas_enabled", "full_enabled"]);
 
 app.registerExtension({
   name: "EnndeeMeridianGeometry.DependentVisibility",
