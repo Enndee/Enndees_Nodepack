@@ -1,5 +1,6 @@
 """Meridian Geometry runner with custom-camera-path and repeated-first-frame support."""
 
+import hashlib
 import json
 import os
 import re
@@ -122,6 +123,67 @@ def _read_first_video_frame(video_path):
     return torch.from_numpy(pixels.copy()).float().div_(255.0)
 
 
+_CACHE_VERSION = "v1"
+
+
+def _cache_root(override=""):
+    return override.strip() or os.path.join(tempfile.gettempdir(), "enndee_meridian_geometry")
+
+
+def _hash_frames(image):
+    """Cheap content fingerprint: first/middle/last frame as uint8, plus shape."""
+    sample = (torch.stack([image[0], image[len(image) // 2], image[-1]])
+              .detach().clamp(0, 1).mul(255).round().to(torch.uint8).cpu())
+    digest = hashlib.sha256()
+    digest.update(str(tuple(image.shape)).encode())
+    digest.update(sample.numpy().tobytes())
+    return digest.hexdigest()
+
+
+def _cache_key_for(cache, image, video, effective_args, camera_data, frame_count):
+    """Stable key for a geometry pass: source content, options, camera path, frame count."""
+    if not cache:
+        return None
+    tokens = _parse_cli_tokens(effective_args)
+    if camera_data is not None:
+        tokens = tokens + ["--camera-path",
+                           json.dumps(camera_data, sort_keys=True, ensure_ascii=False)]
+    digest = hashlib.sha256()
+    digest.update(_CACHE_VERSION.encode())
+    digest.update(str(frame_count).encode())
+    digest.update("\x00".join(tokens).encode("utf-8", "replace"))
+    if image is not None:
+        digest.update(_hash_frames(image).encode())
+    elif video and os.path.isfile(video):
+        stat = os.stat(video)
+        digest.update(f"{os.path.abspath(video)}|{stat.st_size}|{int(stat.st_mtime)}".encode())
+    else:
+        return None
+    return digest.hexdigest()[:24]
+
+
+def _cache_load(directory):
+    """Return (source, render, width, height, length) for a complete cache entry, else None."""
+    meta_path = os.path.join(directory, "meta.json")
+    source_path = os.path.join(directory, "cond_source.mp4")
+    render_path = os.path.join(directory, "cond_render.mp4")
+    if not (os.path.isfile(meta_path) and os.path.isfile(source_path) and os.path.isfile(render_path)):
+        return None
+    with open(meta_path, encoding="utf-8") as handle:
+        meta = json.load(handle)
+    source = _frames(source_path)
+    render = _frames(render_path)
+    return source, render, int(meta["width"]), int(meta["height"]), int(meta["length"])
+
+
+def _cache_store(directory, source_path, render_path, width, height, length):
+    os.makedirs(directory, exist_ok=True)
+    shutil.copy2(source_path, os.path.join(directory, "cond_source.mp4"))
+    shutil.copy2(render_path, os.path.join(directory, "cond_render.mp4"))
+    with open(os.path.join(directory, "meta.json"), "w", encoding="utf-8") as handle:
+        json.dump({"width": int(width), "height": int(height), "length": int(length)}, handle)
+
+
 _CAMERA_OPTION_WITH_VALUE = {
     "--camera-path",
     "--frames",
@@ -225,6 +287,8 @@ class EnndeeMeridianGeometry:
                 "args": ("STRING", {"default": "--boom 0.35 --pivot 0.5,0.55 --ease --sweep", "multiline": True, "tooltip": "Additional Meridian options. When custom_camera is connected, its path and frame count take precedence over camera-motion, freeze, follow, start, and frame-count flags."}),
                 "repo": ("STRING", {"default": "/path/to/release_recam", "tooltip": "Meridian checkout containing inference/sample.py."}),
                 "python": ("STRING", {"default": "python", "tooltip": "Python interpreter with Meridian/VGGT installed."}),
+                "cache": ("BOOLEAN", {"default": True, "tooltip": "Reuse a previous geometry pass when the picture, camera path and options are unchanged - skips the whole VGGT subprocess, the repeated-frame encode and the render."}),
+                "cache_dir": ("STRING", {"default": "", "tooltip": "Cache folder; empty = %TEMP%\\enndee_meridian_geometry. Delete it any time to force fresh renders."}),
             },
             "optional": {
                 "image": ("IMAGE",),
@@ -242,14 +306,30 @@ class EnndeeMeridianGeometry:
         "repeat the source's first frame to the exact camera-path length and apply its path."
     )
 
-    def build(self, video, args, repo, python, image=None, args_override=None, custom_camera=None):
+    def build(self, video, args, repo, python, cache=True, cache_dir="", image=None, args_override=None, custom_camera=None):
         out = tempfile.mkdtemp(prefix="enndee_meridian_")
         image_input_path = None
         try:
             effective_args = args_override if args_override is not None else args
-
+            camera_data, frame_count = None, None
             if custom_camera is not None:
                 camera_data, frame_count = _parse_custom_camera(custom_camera)
+            else:
+                tokens = _parse_cli_tokens(effective_args)
+                if "--frames" in tokens and tokens.index("--frames") + 1 < len(tokens):
+                    frame_count = int(tokens[tokens.index("--frames") + 1])
+
+            entry = None
+            cache_key = _cache_key_for(cache, image, video, effective_args, camera_data, frame_count)
+            if cache_key:
+                entry = os.path.join(_cache_root(cache_dir), cache_key)
+                hit = _cache_load(entry)
+                if hit is not None:
+                    print(f"Meridian geometry (Enndee): cache hit -> {entry}", flush=True)
+                    return hit
+                print(f"Meridian geometry (Enndee): cache miss -> {entry}", flush=True)
+
+            if custom_camera is not None:
                 path_file = os.path.join(out, "custom_camera_path.json")
                 with open(path_file, "w", encoding="utf-8") as handle:
                     json.dump(camera_data, handle, ensure_ascii=False)
@@ -297,6 +377,13 @@ class EnndeeMeridianGeometry:
             width, height = map(int, match.groups())
             source = _frames(os.path.join(out, "cond_source.mp4"))
             render = _frames(os.path.join(out, "cond_render.mp4"))
+            if entry:
+                try:
+                    _cache_store(entry, os.path.join(out, "cond_source.mp4"),
+                                 os.path.join(out, "cond_render.mp4"), width, height, source.shape[0])
+                    print(f"Meridian geometry (Enndee): cached -> {entry}", flush=True)
+                except OSError as exc:
+                    print(f"Meridian geometry (Enndee): cache store failed: {exc}", flush=True)
             return source, render, width, height, source.shape[0]
         finally:
             shutil.rmtree(out, ignore_errors=True)
