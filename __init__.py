@@ -64,6 +64,12 @@ except Exception as _e:
     EnndeeMeridianGeometry = None
 
 try:
+    from enndee_meridian_pseudo_render import EnndeeMeridianPseudoRender
+except Exception as _e:
+    print(f"\033[31m[Enndee] EnndeeMeridianPseudoRender unavailable: {_e}\033[0m")
+    EnndeeMeridianPseudoRender = None
+
+try:
     from lichtfeld_training_node import LichtfeldHeadlessTrainer
 except Exception as _e:
     print(f"\033[31m[Enndee] LichtfeldHeadlessTrainer unavailable: {_e}\033[0m")
@@ -105,6 +111,10 @@ if MeridianCameraPathConfigurator is not None:
 if EnndeeMeridianGeometry is not None:
     NODE_CLASS_MAPPINGS["Enndee_MeridianGeometry"] = EnndeeMeridianGeometry
     NODE_DISPLAY_NAME_MAPPINGS["Enndee_MeridianGeometry"] = "Meridian Geometry (Enndee)"
+
+if EnndeeMeridianPseudoRender is not None:
+    NODE_CLASS_MAPPINGS["Enndee_MeridianPseudoRender"] = EnndeeMeridianPseudoRender
+    NODE_DISPLAY_NAME_MAPPINGS["Enndee_MeridianPseudoRender"] = "Meridian Fast Depth Splat (Enndee)"
 
 if LichtfeldHeadlessTrainer is not None:
     NODE_CLASS_MAPPINGS["Enndee_LichtfeldHeadlessTrainer"] = LichtfeldHeadlessTrainer
