@@ -31,6 +31,12 @@ alignment, so `_load_da3_api` swaps in raise-on-use stubs for
 the model code itself then needs only torch, einops, addict and omegaconf. Import takes
 ~1.7 s and a still costs ~0.4 s on a Blackwell GPU.
 
+Both families resize before inference. Depth-Anything-3 caps the *longest* side at `process_res`
+(default `DA3_RES` = 504, aspect preserved, then rounded to multiples of 14), so `depth_res=0`
+means "run the still at its own resolution": the finer grid keeps smaller depth steps alive
+through the edge mask and the cloud rebuild, at a cost that grows with the square of the pixel
+count. Depth-Anything-V2 always runs at its native 518 square (`DEPTH_RES`).
+
 Two render guards mirror Meridian's own pipeline (recam/geometry.py, inference/sample.py):
 
     edge keep       the 3x3 local depth-spread rule (EDGE_RTOL = 0.30) is applied on the
@@ -72,7 +78,7 @@ DEPTH_PCT_LO, DEPTH_PCT_HI = 0.01, 0.99   # percentile clip so one speck cannot 
 PIVOT_WINDOW = 0.05                   # Meridian's +-5 % window around a picked pivot point
 MAX_CLOUD_PIXELS = 16_777_216         # unprojection-grid safety cap (16 M points)
 DEPTH_RES = 518                       # Depth-Anything-V2's native square input side
-DA3_RES = 504                         # Depth-Anything-3 `process_res`: aspect-preserving, longest side
+DA3_RES = 504                         # Depth-Anything-3 default `process_res` (longest-side cap; depth_res 0 = source)
 DISPARITY_EPS = 0.001                 # floor before the 1/x inversion, so the far plane stays finite
 KEEP_PARENT_RATIO = 0.999             # recam/geometry.py `upsample`: a hi-res pixel needs every parent kept
 
@@ -193,13 +199,31 @@ def _load_da3_api():
     return DepthAnything3
 
 
-def _predict_da3_depth(model_name: str, first: torch.Tensor, device: torch.device) -> torch.Tensor:
+def _da3_process_res(depth_res, width: int, height: int) -> int:
+    """Depth-Anything-3 `process_res` for one still: `depth_res` px, 0 = the still's own side.
+
+    The Depth-Anything-3 input processor (`upper_bound_resize`) scales the image so its *longest*
+    side equals `process_res` - upscaling as happily as downscaling, which is why the default is
+    passed through unchanged - and then rounds each dimension to the nearest multiple of 14 (the
+    ViT patch size). `max(width, height)` therefore means "as captured": the depth grid keeps the
+    source's own detail budget, and since the attention cost grows with the square of the pixel
+    count this is the knob that trades time for depth detail.
+    """
+    longest = max(int(width), int(height))
+    cap = int(depth_res or 0)
+    return cap if cap > 0 else longest
+
+
+def _predict_da3_depth(model_name: str, first: torch.Tensor, device: torch.device,
+                       process_res: int = DA3_RES) -> torch.Tensor:
     """Depth-Anything-3 relative depth for one still: (H, W) float tensor, larger = farther.
 
     Unlike Depth-Anything-V2 there is no 1/x conversion - DA3 predicts depth directly and the
     raw output already is true relative depth (beach.jpg: the near pillar ~0.72, the far
     sea/sky ~5.2). The grid is aspect-preserving (`process_res` caps the longest side), so it
-    can be non-square. The model is cached in VRAM across runs; only the variant reloads it.
+    can be non-square. `process_res=DA3_RES` (504) is the fast default; the caller passes the
+    still's own longest side when its `depth_res` is 0. The model is cached in VRAM across
+    runs; only the variant reloads it.
     """
     global _GLOBAL_DA3_MODEL, _GLOBAL_DA3_ID
     repo_id = DA3_MODEL_REPOS.get(model_name)
@@ -212,8 +236,10 @@ def _predict_da3_depth(model_name: str, first: torch.Tensor, device: torch.devic
         _GLOBAL_DA3_MODEL = DepthAnything3.from_pretrained(repo_id).to(device).eval()
         _GLOBAL_DA3_ID = repo_id
     frame = first[0].detach().clamp(0.0, 1.0).mul(255.0).round().to(torch.uint8).cpu().numpy()
+    print(f"[Enndee] Meridian fast depth: {model_name} still {frame.shape[1]}x{frame.shape[0]} "
+          f"-> process_res {int(process_res)}...", flush=True)
     with torch.no_grad():
-        prediction = _GLOBAL_DA3_MODEL.inference([frame], process_res=DA3_RES)
+        prediction = _GLOBAL_DA3_MODEL.inference([frame], process_res=int(process_res))
     depth = np.asarray(prediction.depth[0], dtype=np.float32)
     return torch.from_numpy(depth).to(device)
 
@@ -499,13 +525,16 @@ def _build_parametric_c2w(frames: int, piv: torch.Tensor, zm: float, yaw: float,
 def render_depth_aligned(first, device, model_size="Depth-Anything-V2-Small-hf", frames=73,
                          canvas_mode="auto_meridian480", custom_width=832, custom_height=480,
                          cloud_scale=2, point_size=1, edge_cull=True, edge_threshold=0.30,
-                         back_face_cull=False, camera=None, custom_camera=None):
+                         back_face_cull=False, camera=None, custom_camera=None, depth_res=DA3_RES):
     """Depth-aligned camera-flight condition renderer (Depth-Anything-V2/V3 + GPU point-cloud renderer).
 
     `first`          [1,H,W,3] float tensor in [0,1]: the still the flight starts from.
     `camera`         settings dict from `parse_camera_settings` (None = every default).
     `custom_camera`  Meridian Camera Path Configurator signal; its path and frame count win.
     `back_face_cull` mirrors Meridian's `--cull`; a `--cull` token in `camera` also turns it on.
+    `depth_res`      Depth-Anything-3 longest-side cap: the default `DA3_RES` (504) is the fast
+                     setting and the `0` the node passes turns it into "the still's own
+                     resolution" (maximum depth detail); the V2 models keep their 518 square.
 
     Returns exactly what the VGGT geometry pass returns - (source, render, width, height, length) -
     so the pair drops straight into MeridianRefConditioning as `<Video 1>` / `<Video 2>`.
@@ -530,7 +559,8 @@ def render_depth_aligned(first, device, model_size="Depth-Anything-V2-Small-hf",
 
     # --- depth: Depth-Anything-V2 (disparity -> invert) or Depth-Anything-3 (already depth) -------
     if model_size.startswith(DA3_PREFIX):
-        depth_low = _predict_da3_depth(model_size, first, device)
+        depth_low = _predict_da3_depth(model_size, first, device,
+                                       _da3_process_res(depth_res, src_w, src_h))
     else:
         depth_model = _get_depth_model(model_size, device)
         mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
@@ -684,6 +714,6 @@ def render_depth_aligned(first, device, model_size="Depth-Anything-V2-Small-hf",
     source = source.repeat(num_frames, 1, 1, 1).clamp(0.0, 1.0).cpu()
     culled = ", back-face culled" if normals is not None else ""
     print(f"[Enndee] Meridian fast depth: {pts.shape[0]} points -> {out_w}x{out_h}, {num_frames} frames "
-          f"(zm {zm:.3f}, cloud {cloud_w}x{cloud_h}, {model_size}{culled})", flush=True)
+          f"(zm {zm:.3f}, cloud {cloud_w}x{cloud_h}, depth {low_w}x{low_h}, {model_size}{culled})", flush=True)
     return source, render, out_w, out_h, num_frames
 

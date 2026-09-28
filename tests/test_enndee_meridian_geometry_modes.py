@@ -59,7 +59,7 @@ class MeridianGeometryModeTests(unittest.TestCase):
         self.assertEqual(tuple(inputs["required"]["mode"][0]), geometry.MODE_OPTIONS)
         for name in ("video", "args", "repo", "python", "cache", "cache_dir", "mode", "model_size",
                      "canvas_mode", "custom_width", "custom_height", "cloud_scale", "point_size",
-                     "edge_cull", "edge_threshold", "back_face_cull", "canvas_enabled",
+                     "edge_cull", "edge_threshold", "back_face_cull", "depth_res", "canvas_enabled",
                      "canvas_width", "canvas_height", "full_enabled", "full_size", "vggt_repo",
                      "vggt_checkpoint"):
             self.assertIn(name, inputs["required"])
@@ -89,6 +89,26 @@ class MeridianGeometryModeTests(unittest.TestCase):
                 video="unused.mp4", args="--yaw 10", repo="meridian", python="python",
                 image=torch.zeros(1, 64, 112, 3), mode=geometry.FAST_DEPTH_MODE)
         self.assertEqual(capture.kwargs["frames"], 73)
+
+    def test_fast_mode_forwards_the_da3_depth_resolution(self):
+        spec = geometry.EnndeeMeridianGeometry.INPUT_TYPES()["required"]["depth_res"]
+        self.assertEqual(spec[1]["default"], fast_depth.DA3_RES)   # the fast default
+        self.assertEqual(spec[1]["min"], 0)                        # 0 = the still's own resolution
+        capture = _FastCapture()
+        images = torch.zeros(1, 64, 112, 3)
+        with mock.patch.object(geometry, "render_depth_aligned", capture):
+            geometry.EnndeeMeridianGeometry().build(
+                video="unused.mp4", args="--frames 73", repo="meridian", python="python",
+                image=images, mode=geometry.FAST_DEPTH_MODE)
+            self.assertEqual(capture.kwargs["depth_res"], fast_depth.DA3_RES)
+            geometry.EnndeeMeridianGeometry().build(
+                video="unused.mp4", args="--frames 73", repo="meridian", python="python",
+                image=images, mode=geometry.FAST_DEPTH_MODE, depth_res=0)
+            self.assertEqual(capture.kwargs["depth_res"], 0)
+            geometry.EnndeeMeridianGeometry().build(
+                video="unused.mp4", args="--frames 73", repo="meridian", python="python",
+                image=images, mode=geometry.FAST_DEPTH_MODE, depth_res=1008)
+            self.assertEqual(capture.kwargs["depth_res"], 1008)
 
     def test_fast_mode_rejects_unsupported_lengths_and_follow(self):
         node = geometry.EnndeeMeridianGeometry()

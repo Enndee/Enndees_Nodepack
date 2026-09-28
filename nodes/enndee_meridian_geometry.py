@@ -8,8 +8,9 @@
 Both backends consume the same widgets - `image`/`video`, the `args` string (or the Meridian
 Parameter Picker's `args_override`) and the optional `custom_camera` signal - and both return
 (source, render, width, height, length) at the Meridian condition canvas, so the mode is a
-drop-in swap. The fast-depth widgets (model size, canvas override, cloud/point density and the
-two cull rules) only apply to the fast mode and are shown for it alone; the VGGT settings
+drop-in swap. The fast-depth widgets (model size, the Depth-Anything-3 resolution cap, canvas
+override, cloud/point density and the two cull rules) only apply to the fast mode and are shown
+for it alone; the VGGT settings
 (repo, python, cache, cache_dir plus the canvas, source-size and VGGT-path overrides the
 picker also knows) hide while the fast mode is active. The node's own VGGT overrides only fill
 flags the args string did not set, so a connected picker always wins.
@@ -32,7 +33,7 @@ import numpy as np
 import torch
 
 from enndee_meridian_camera_path import CAMERA_FRAME_OPTIONS, CAMERA_SIGNAL_TYPE
-from enndee_meridian_fast_depth import parse_camera_settings, render_depth_aligned
+from enndee_meridian_fast_depth import DA3_RES, parse_camera_settings, render_depth_aligned
 
 VGGT_MODE = "VGGT preview (subprocess)"
 FAST_DEPTH_MODE = "Fast depth (Depth-Anything-V2)"
@@ -380,6 +381,8 @@ class EnndeeMeridianGeometry:
                                       "tooltip": "VGGT preview only: VGGT square source reconstruction side, in pixels; used while Custom VGGT Source Size is enabled."}),
                 "vggt_repo": ("STRING", {"default": "", "tooltip": "VGGT preview only: VGGT-Omega source folder. Empty = the installation auto-detected next to `repo`, or the picker's --vggt-repo when its args string carries one."}),
                 "vggt_checkpoint": ("STRING", {"default": "", "tooltip": "VGGT preview only: VGGT-Omega checkpoint (.pt). Empty = the checkpoint auto-detected next to `repo`, or the picker's --vggt when its args string carries one."}),
+                "depth_res": ("INT", {"default": DA3_RES, "min": 0, "max": 4096, "step": 1,
+                                      "tooltip": "Fast depth only, Depth-Anything-3 models only: the depth model's longest-side cap in pixels (aspect preserved, then rounded to multiples of 14). 0 = run the still at its own resolution for maximum depth detail - the attention cost grows with the square of the pixel count, so a full-resolution still takes seconds instead of tenths. Values above the still's own side make DA3 upscale. The V2 models ignore it and keep their native 518 square."}),
             },
             "optional": {
                 "image": ("IMAGE",),
@@ -397,14 +400,15 @@ class EnndeeMeridianGeometry:
         "VGGT preview runs Meridian's VGGT-Omega subprocess (repo/python/cache and the canvas, "
         "source-size and VGGT-path overrides live on this node as well); Fast depth runs the "
         "in-process Depth-Anything point-cloud flight for a single still (V2 or V3 via "
-        "`model_size`, no VGGT, no external environment). Both accept the same args string and "
+        "`model_size`, no VGGT, no external environment; `depth_res` trades time for depth "
+        "detail, 0 = the still's own resolution). Both accept the same args string and "
         "custom_camera signal - the Meridian Parameter Picker configures either - and both return "
         "(source, render, width, height, length) at the 480-class condition canvas."
     )
 
     def _build_fast_depth(self, video, effective_args, image, custom_camera, model_size, canvas_mode,
                           custom_width, custom_height, cloud_scale, point_size, edge_cull,
-                          edge_threshold, back_face_cull):
+                          edge_threshold, back_face_cull, depth_res=DA3_RES):
         """In-process Depth-Anything pass (V2 or V3 by `model_size`) with the same contract as the VGGT preview.
 
         The `args` string is parsed for the sample.py camera flags the fast backend honours
@@ -440,6 +444,7 @@ class EnndeeMeridianGeometry:
             custom_width=custom_width, custom_height=custom_height, cloud_scale=cloud_scale,
             point_size=point_size, edge_cull=edge_cull, edge_threshold=edge_threshold,
             back_face_cull=back_face_cull, camera=settings, custom_camera=custom_camera,
+            depth_res=depth_res,
         )
         print(f"Meridian geometry (Enndee): fast depth -> {width}x{height}, {length} frames.", flush=True)
         return source, render, width, height, length
@@ -449,12 +454,13 @@ class EnndeeMeridianGeometry:
               canvas_mode="auto_meridian480", custom_width=832, custom_height=480, cloud_scale=2,
               point_size=1, edge_cull=True, edge_threshold=0.30, back_face_cull=False,
               canvas_enabled=False, canvas_width=864, canvas_height=1184, full_enabled=False,
-              full_size=1280, vggt_repo="", vggt_checkpoint=""):
+              full_size=1280, vggt_repo="", vggt_checkpoint="", depth_res=DA3_RES):
         effective_args = args_override if args_override is not None else args
         if mode == FAST_DEPTH_MODE:
             return self._build_fast_depth(video, effective_args, image, custom_camera, model_size,
                                           canvas_mode, custom_width, custom_height, cloud_scale,
-                                          point_size, edge_cull, edge_threshold, back_face_cull)
+                                          point_size, edge_cull, edge_threshold, back_face_cull,
+                                          depth_res)
         out = tempfile.mkdtemp(prefix="enndee_meridian_")
         image_input_path = None
         try:

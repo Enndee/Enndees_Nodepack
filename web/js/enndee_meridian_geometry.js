@@ -10,8 +10,8 @@
  *   visible and every fast-depth control is hidden - the fast widgets have no
  *   effect on the subprocess pass.
  * - "Fast depth (Depth-Anything-V2)": the VGGT controls disappear and the
- *   fast-depth group appears (model size, canvas, cloud/point density, the two
- *   cull rules).
+ *   fast-depth group appears (model size, Depth-Anything-3 resolution cap,
+ *   canvas, cloud/point density, the two cull rules).
  * - Master/detail rules mirror the picker's: the custom canvas numbers follow
  *   `canvas_mode` inside the fast group, `canvas_width`/`canvas_height` follow
  *   `canvas_enabled` and `full_size` follows `full_enabled` in the VGGT group.
@@ -28,7 +28,7 @@ const FAST_DEPTH_MODE = "Fast depth (Depth-Anything-V2)";
 // Controls that only matter to the in-process Depth-Anything backend (V2 or V3).
 const FAST_DEPTH_PANEL = [
   "model_size", "canvas_mode", "custom_width", "custom_height", "cloud_scale",
-  "point_size", "edge_cull", "edge_threshold", "back_face_cull",
+  "point_size", "edge_cull", "edge_threshold", "back_face_cull", "depth_res",
 ];
 // Subprocess-only controls: no effect while the fast backend renders. The canvas,
 // source-size and VGGT-path overrides mirror the parameter picker's widgets; they only

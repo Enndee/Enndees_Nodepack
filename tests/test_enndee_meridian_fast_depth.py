@@ -140,6 +140,12 @@ class MeridianFastDepthHelperTests(unittest.TestCase):
         self.assertGreater(float(depth[1]), float(depth[2]))     # the post ends up near
         self.assertLess(float(depth[2]), 0.25)
 
+    def test_da3_process_res_zero_means_the_stills_own_resolution(self):
+        self.assertEqual(fast_depth._da3_process_res(0, 1024, 1536), 1536)
+        self.assertEqual(fast_depth._da3_process_res(-4, 800, 600), 800)     # defended at the backend
+        self.assertEqual(fast_depth._da3_process_res(504, 1024, 1536), 504)  # the fast default
+        self.assertEqual(fast_depth._da3_process_res(1008, 64, 112), 1008)   # explicit, even upscaling
+
     def test_edge_keep_culls_only_the_depth_step(self):
         depth = torch.ones(9, 9)
         depth[:, 5:] = 3.0
@@ -343,6 +349,25 @@ class MeridianFastDepthEngineTests(unittest.TestCase):
             self._generate(model_size="Depth-Anything-3-Small", da3_depth=rows, edge_cull=False,
                            camera=_camera("--pivot", "0.5,0.75"))
         self.assertIn("zm 5.000", buffer.getvalue())
+
+    def test_da3_depth_resolution_reaches_the_model_with_the_stills_own_side(self):
+        # render_depth_aligned forwards `depth_res` as the exact DA3 `process_res`, except for 0,
+        # which turns into the still's own longest side (the default 64x112 fake -> 112).
+        seen = []
+
+        def fake(model_name, first, device, process_res=fast_depth.DA3_RES):
+            seen.append(process_res)
+            return torch.ones(7, 21)
+
+        options = dict(model_size="Depth-Anything-3-Small", frames=73, canvas_mode="custom",
+                       custom_width=112, custom_height=64, cloud_scale=1, point_size=0,
+                       edge_cull=True, edge_threshold=0.30, back_face_cull=False)
+        with mock.patch.object(fast_depth, "_predict_da3_depth", fake):
+            for overrides in (dict(), dict(depth_res=0), dict(depth_res=1008)):
+                fast_depth.render_depth_aligned(_gradient_image(), torch.device("cpu"),
+                                                camera=None, custom_camera=None,
+                                                **options, **overrides)
+        self.assertEqual(seen, [fast_depth.DA3_RES, 112, 1008])
 
     def test_da3_variants_map_to_hugging_face_repos_and_unknown_ones_fail_loudly(self):
         self.assertEqual(fast_depth.DA3_MODEL_REPOS["Depth-Anything-3-Small"],
