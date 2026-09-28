@@ -20,9 +20,11 @@ configurator. `camera_mode` decides where the path on `custom_camera` comes from
                 scene geometry.
 
 VGGT is gone from this pack: the Meridian Geometry node runs its fast-depth backend only, so the
-args string carries nothing but the output length and culling. The freeze/source-start/follow
-and authored camera-move options went with it - every run now uses exactly one of the two camera
-modes above, and the Geometry node always repeats the first still to the frame count.
+args string carries nothing but the output length. Back-face culling is *not* part of it either -
+the Geometry node owns that switch (its Back-Face Cull widget), and a second copy in the args
+would only make the two disagree. The freeze/source-start/follow and authored camera-move options
+went with VGGT - every run now uses exactly one of the two camera modes above, and the Geometry
+node always repeats the first still to the frame count.
 """
 
 import json
@@ -96,12 +98,15 @@ AUTO_WIDGET_NAMES = ("auto_target", "auto_max_speed", "auto_path_mode",
                      "auto_pivot_x", "auto_pivot_y", "auto_pivot_z")
 
 
-def build_meridian_arguments(output_frames, cull=False):
+def build_meridian_arguments(output_frames):
     """Build the argument string consumed by ``MeridianGeometry.args_override``.
 
-    The fast-depth backend reads `--frames` (the path always carries the same count) and
-    `--cull`; the VGGT-era flags (`--freeze`, `--start`, `--canvas`, `--full`, `--vggt*`, the
-    authored camera move and `--seed`) are gone - Meridian Geometry ignores or strips them now.
+    The fast-depth backend needs `--frames` (the camera path always carries the same count) and
+    nothing else from this node: back-face culling lives on the Geometry node's own Back-Face
+    Cull widget, so emitting `--cull` here as well would be a second, invisible copy of one
+    switch. The VGGT-era flags (`--freeze`, `--start`, `--canvas`, `--full`, `--vggt*`, the
+    authored camera move, `--cull` and `--seed`) are gone or unused - Meridian Geometry ignores
+    or strips them now.
     """
     frames = int(output_frames)
     if frames not in {int(value) for value in OUTPUT_FRAME_OPTIONS}:
@@ -109,11 +114,8 @@ def build_meridian_arguments(output_frames, cull=False):
             f"Unsupported Meridian output length {frames}; "
             f"choose one of {', '.join(OUTPUT_FRAME_OPTIONS)}."
         )
-    args = ["--frames", str(frames)]
-    if cull:
-        args.append("--cull")
     # MeridianGeometry uses shlex.split() to pass this text to the fast-depth backend.
-    return shlex.join(args)
+    return shlex.join(["--frames", str(frames)])
 
 
 class MeridianParametersAndCamera:
@@ -154,10 +156,6 @@ class MeridianParametersAndCamera:
                 "auto_pivot_z": ("FLOAT", {
                     "default": 0.0, "min": -1.0, "max": 1.0, "step": 0.05,
                     "tooltip": "Automatic camera: pivot offset Z in content radii along the view axis (positive is farther away). Negative pulls the look target toward the source camera, positive pushes it into the subject - useful when the depth profile's middle sits inside a hollow subject.",
-                }),
-                "cull": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Remove surfaces viewed from behind. Unseen areas become holes rather than mirrored surfaces.",
                 }),
                 "path_orbit_front": ("BOOLEAN", {
                     "default": True,
@@ -303,7 +301,7 @@ class MeridianParametersAndCamera:
             signal = self._build_manual_path(kwargs)
         else:
             raise ValueError(f"Unknown Meridian camera mode {camera_mode!r}.")
-        return (build_meridian_arguments(frames, kwargs["cull"]), signal)
+        return (build_meridian_arguments(frames), signal)
 
     @classmethod
     def _build_automatic_path(cls, reference_image, subject_mask, kwargs):

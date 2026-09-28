@@ -85,7 +85,7 @@ function finishVisibilityUpdate(node) {
 }
 
 function applyVisibility(node) {
-  const visible = new Set(["output_frames", "camera_mode", "cull"]);
+  const visible = new Set(["output_frames", "camera_mode"]);
   const cameraMode = String(findWidget(node, "camera_mode")?.value);
   const automatic = cameraMode === AUTOMATIC_MODE;
   const pathMode = String(findWidget(node, "auto_path_mode")?.value ?? AUTOMATIC_PATH);

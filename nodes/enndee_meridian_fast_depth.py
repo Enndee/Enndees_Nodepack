@@ -580,8 +580,11 @@ def render_depth_aligned(first, device, model_size="Depth-Anything-V2-Small-hf",
 
     `first`          [1,H,W,3] float tensor in [0,1]: the still the flight starts from.
     `camera`         settings dict from `parse_camera_settings` (None = every default).
-    `custom_camera`  Meridian Camera Path Configurator signal; its path and frame count win.
-    `back_face_cull` mirrors Meridian's `--cull`; a `--cull` token in `camera` also turns it on.
+    `custom_camera`  Meridian Parameters and Camera signal; its path and frame count win.
+    `back_face_cull` mirrors Meridian's `--cull` and is the switch the Enndee nodes use (the
+                     Geometry node's widget); a `--cull` token in `camera` - hand-written args
+                     or the original CLI - is OR-ed onto it, since the widget cannot express
+                     "leave it alone".
     `depth_res`      working-resolution cap in pixels: the still's longest side is resized down
                      to it (`_fit_working_still`, never up) before the depth model, the frame
                      colours and the cloud grid are built, and Depth-Anything-3 additionally

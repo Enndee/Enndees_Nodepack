@@ -84,7 +84,7 @@ class MeridianParametersWidgetTests(unittest.TestCase):
             list(required)[:5],
             ["output_frames", "camera_mode", "auto_target", "auto_max_speed", "auto_path_mode"],
         )
-        self.assertIn("cull", required)
+        self.assertNotIn("cull", required)          # the Geometry node owns that switch
         for name in parameters.PATH_WIDGET_NAMES:
             self.assertIn(name, required)
         self.assertTrue(all("tooltip" in metadata for _options, metadata in required.values()))
@@ -101,8 +101,17 @@ class MeridianParametersWidgetTests(unittest.TestCase):
             "pivot_enabled", "pivot_x", "pivot_y", "pivot_lock", "aim",
             "pivot_to_enabled", "pivot_to_x", "pivot_to_y",
             "path_mode", "ease", "live_speed", "fast_back", "follow", "smooth",
+            "cull",
         ):
             self.assertNotIn(removed, required)
+
+    def test_the_args_string_never_carries_cull(self):
+        """Back-face culling is the Geometry node's Back-Face Cull widget - one switch, one place."""
+        for frames in parameters.OUTPUT_FRAME_OPTIONS:
+            self.assertEqual(parameters.build_meridian_arguments(frames), f"--frames {frames}")
+        self.assertNotIn("--cull", parameters.build_meridian_arguments("73"))
+        args, _signal = NODE().build(**manual_defaults())
+        self.assertNotIn("--cull", shlex.split(args))
 
     def test_camera_mode_and_auto_defaults(self):
         required = NODE.INPUT_TYPES()["required"]
@@ -116,7 +125,7 @@ class MeridianParametersWidgetTests(unittest.TestCase):
             metadata = required[f"auto_pivot_{axis}"][1]
             self.assertEqual(metadata["default"], 0.0)
             self.assertEqual((metadata["min"], metadata["max"]), (-1.0, 1.0))
-        self.assertFalse(all_defaults()["cull"])
+        self.assertEqual(all_defaults()["path_camera_mode"], "O Orbits")
 
     def test_javascript_mirrors_the_widget_names_and_mode_labels(self):
         source = JS_PATH.read_text(encoding="utf-8")
@@ -129,9 +138,9 @@ class MeridianParametersWidgetTests(unittest.TestCase):
 
 
 class MeridianArgumentTests(unittest.TestCase):
-    def test_args_carry_only_frames_and_cull(self):
+    def test_args_carry_only_frames(self):
         self.assertEqual(parameters.build_meridian_arguments("124"), "--frames 124")
-        self.assertEqual(parameters.build_meridian_arguments(73, True), "--frames 73 --cull")
+        self.assertEqual(parameters.build_meridian_arguments(73), "--frames 73")
         with self.assertRaisesRegex(ValueError, "Unsupported Meridian output length"):
             parameters.build_meridian_arguments("150")
 
@@ -208,7 +217,7 @@ class MeridianAutomaticCameraTests(unittest.TestCase):
         fake, calls, _report = estimate_stub(document='{"frames": 73, "path": []}')
         values = all_defaults()
         values.update(camera_mode=parameters.AUTOMATIC_MODE, auto_target="scene",
-                      auto_max_speed=20.0, auto_pivot_x=0.25, output_frames="73", cull=True)
+                      auto_max_speed=20.0, auto_pivot_x=0.25, output_frames="73")
         reference = torch.zeros(1, 8, 8, 3)
         mask = torch.ones(8, 8)
         buffer = io.StringIO()
@@ -216,7 +225,7 @@ class MeridianAutomaticCameraTests(unittest.TestCase):
                 contextlib.redirect_stdout(buffer):
             args, signal = NODE().build(reference_image=reference, subject_mask=mask, **values)
         self.assertEqual(signal, '{"frames": 73, "path": []}')
-        self.assertEqual(shlex.split(args), ["--frames", "73", "--cull"])
+        self.assertEqual(shlex.split(args), ["--frames", "73"])
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["frames"], 73)
         self.assertEqual(calls[0]["target"], "scene")
