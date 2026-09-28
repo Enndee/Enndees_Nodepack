@@ -15,12 +15,15 @@ sys.path.insert(0, str(PACK_DIR / "nodes"))
 
 from lichtfeld_training_node import (  # noqa: E402
     LichtfeldHeadlessTrainer,
+    build_conversion_command,
     build_lfs_settings_script,
     build_training_command,
     parse_iteration_steps,
     run_streaming_command,
     resolve_studio_executable,
+    resolve_trained_splat,
     resolve_training_output,
+    validate_export_format,
     validate_refinement_steps,
     validate_dataset,
 )
@@ -148,6 +151,32 @@ class LichtfeldDatasetTests(unittest.TestCase):
                 resolve_training_output(dataset, "training/experiment"),
                 dataset.resolve() / "training" / "experiment",
             )
+
+    def test_validates_splat_export_formats(self):
+        self.assertEqual(validate_export_format("SOG"), "sog")
+        self.assertEqual(validate_export_format(".Spz"), "spz")
+        self.assertEqual(validate_export_format(""), "ply")
+        with self.assertRaisesRegex(ValueError, "Unsupported splat export format"):
+            validate_export_format("glb")
+
+    def test_resolve_trained_splat_prefers_the_named_stem_then_the_last_iteration(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            folder = Path(temp_dir)
+            (folder / "splat_5000.ply").write_bytes(b"checkpoint")
+            (folder / "splat_30000.ply").write_bytes(b"final")
+            (folder / "final_splat.ply").write_bytes(b"named")
+
+            self.assertEqual(resolve_trained_splat(folder).name, "splat_30000.ply")
+            self.assertEqual(
+                resolve_trained_splat(folder, "final_splat").name, "final_splat.ply"
+            )
+            self.assertIsNone(resolve_trained_splat(folder / "missing"))
+
+    def test_builds_the_studio_convert_command(self):
+        command = build_conversion_command(Path("Studio.exe"), Path("in.ply"), Path("out.sog"))
+        self.assertEqual(
+            command, ["Studio.exe", "convert", "in.ply", "out.sog", "--overwrite"]
+        )
 
     def test_mask_training_requires_a_lichtfeld_masks_folder(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -397,6 +426,140 @@ class LichtfeldCommandTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "protected data folders"):
                 LichtfeldHeadlessTrainer().train(**inputs)
+
+
+    def test_train_converts_the_finished_splat_to_the_chosen_format(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dataset = make_dataset(Path(temp_dir) / "dataset")
+            output = Path(temp_dir) / "trained output"
+            calls = []
+
+            def fake_run(command, cwd, progress_callback=None):
+                calls.append(list(command))
+                if len(calls) == 1:              # simulate Studio's splat_ITER.ply export
+                    (output / "splat_20000.ply").write_bytes(b"synthetic splat")
+                else:                            # simulate Studio's convert writing the target
+                    Path(command[3]).write_bytes(b"synthetic sog")
+                return 0, "mock training output"
+
+            inputs = {
+                name: metadata.get("default", choices[0] if isinstance(choices, list) else None)
+                for name, (choices, metadata)
+                in LichtfeldHeadlessTrainer.INPUT_TYPES()["required"].items()
+            }
+            inputs.update(
+                studio_executable=sys.executable,
+                dataset_path=str(dataset),
+                output_path=str(output),
+                iterations=20000,
+                export_format="sog",
+            )
+            with mock.patch(
+                "lichtfeld_training_node._check_running_studio_processes",
+                return_value=[],
+            ), mock.patch(
+                "lichtfeld_training_node.run_streaming_command",
+                side_effect=fake_run,
+            ):
+                result = LichtfeldHeadlessTrainer().train(**inputs)
+
+            self.assertEqual(len(calls), 2)
+            self.assertIn("--train", calls[0])
+            self.assertEqual(calls[1][1], "convert")
+            self.assertEqual(calls[1][2], str(output / "splat_20000.ply"))
+            self.assertEqual(calls[1][3], str(output / "splat_20000.sog"))
+            self.assertIn("--overwrite", calls[1])
+            self.assertEqual(result["result"][0], str(output))
+            self.assertIn("splat_20000.sog", result["result"][3])
+
+    def test_train_keeps_the_plain_ply_export_by_default(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dataset = make_dataset(Path(temp_dir) / "dataset")
+            output = Path(temp_dir) / "trained output"
+            calls = []
+
+            def fake_run(command, cwd, progress_callback=None):
+                calls.append(list(command))
+                return 0, "mock training output"
+
+            inputs = {
+                name: metadata.get("default", choices[0] if isinstance(choices, list) else None)
+                for name, (choices, metadata)
+                in LichtfeldHeadlessTrainer.INPUT_TYPES()["required"].items()
+            }
+            inputs.update(
+                studio_executable=sys.executable,
+                dataset_path=str(dataset),
+                output_path=str(output),
+                iterations=20000,
+            )
+            with mock.patch(
+                "lichtfeld_training_node._check_running_studio_processes",
+                return_value=[],
+            ), mock.patch(
+                "lichtfeld_training_node.run_streaming_command",
+                side_effect=fake_run,
+            ):
+                result = LichtfeldHeadlessTrainer().train(**inputs)
+
+            self.assertEqual(len(calls), 1)
+            self.assertNotIn("convert", calls[0])
+            self.assertNotIn("Splat:", result["result"][3])
+
+    def test_train_reports_a_failed_splat_conversion(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dataset = make_dataset(Path(temp_dir) / "dataset")
+            output = Path(temp_dir) / "trained output"
+            calls = []
+
+            def fake_run(command, cwd, progress_callback=None):
+                calls.append(list(command))
+                if len(calls) == 1:
+                    (output / "splat_20000.ply").write_bytes(b"synthetic splat")
+                    return 0, "mock training output"
+                return 3, "convert exploded"
+
+            inputs = {
+                name: metadata.get("default", choices[0] if isinstance(choices, list) else None)
+                for name, (choices, metadata)
+                in LichtfeldHeadlessTrainer.INPUT_TYPES()["required"].items()
+            }
+            inputs.update(
+                studio_executable=sys.executable,
+                dataset_path=str(dataset),
+                output_path=str(output),
+                iterations=20000,
+                export_format="spz",
+            )
+            with mock.patch(
+                "lichtfeld_training_node._check_running_studio_processes",
+                return_value=[],
+            ), mock.patch(
+                "lichtfeld_training_node.run_streaming_command",
+                side_effect=fake_run,
+            ):
+                with self.assertRaisesRegex(RuntimeError, r"\.spz conversion exited with code 3"):
+                    LichtfeldHeadlessTrainer().train(**inputs)
+
+    def test_preview_mentions_the_requested_export(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dataset = make_dataset(Path(temp_dir) / "dataset")
+            output = Path(temp_dir) / "preview output"
+            inputs = {
+                name: metadata.get("default", choices[0] if isinstance(choices, list) else None)
+                for name, (choices, metadata)
+                in LichtfeldHeadlessTrainer.INPUT_TYPES()["required"].items()
+            }
+            inputs.update(
+                studio_executable=sys.executable,
+                dataset_path=str(dataset),
+                output_path=str(output),
+                export_format="spz",
+                preview_only=True,
+            )
+            result = LichtfeldHeadlessTrainer().train(**inputs)
+            self.assertIn(".spz export would follow", result["result"][3])
+            self.assertFalse(output.exists())
 
 
 class LichtfeldStreamingTests(unittest.TestCase):

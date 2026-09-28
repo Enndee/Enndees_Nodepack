@@ -36,7 +36,7 @@ Lichtfeld Studio dataset in a single step.
 | **Meridian Parameter Picker (Enndee)** | `Enndee_MeridianParameterPicker` | Unified: Meridian geometry arguments plus the optional custom camera path (vertical O orbits or an alternating-height sweep), with widgets that adapt to the configuration |
 | **Meridian Camera Path Configurator (Enndee)** | `Enndee_MeridianCameraPath` | Standalone path-only variant: a 1–8 station vertical O-orbit camera path with selectable start and 120° rear stations |
 | **Meridian Geometry (Enndee)** | `Enndee_MeridianGeometry` | Run VGGT geometry preview; optionally repeat the first frame to a connected custom path's required length |
-| **Lichtfeld Headless Trainer (Enndee)** | `Enndee_LichtfeldHeadlessTrainer` | Start configurable Lichtfeld Studio Gaussian-splat training from a tracker dataset |
+| **Lichtfeld Headless Trainer (Enndee)** | `Enndee_LichtfeldHeadlessTrainer` | Start configurable Lichtfeld Studio Gaussian-splat training from a tracker dataset and export the result as .ply, .sog or .spz |
 
 ---
 
@@ -311,6 +311,12 @@ retain their output connections. You may also enter a dataset path manually.
   Steps automatically enable evaluation; if evaluation is enabled but Eval Steps
   are empty, evaluations mirror Save Steps.
 - **Output Name:** optionally overrides Studio's default `splat_ITER` filename.
+- **Export Format:** the splat file left in the output folder. `ply` (default) is Studio's
+  own training result. `sog` (SuperSplat) and `spz` (Niantic) additionally run Studio's
+  own `convert` subcommand on the finished `.ply` right after training, so the compressed
+  file appears next to it (the `.ply` stays in the folder and can be re-exported any time).
+  The node picks the finished splat itself: an explicit Output Name wins, otherwise the
+  highest iteration number - checkpoint saves never win over the final model.
 - **Config File:** optionally supplies a Lichtfeld Studio JSON config for
   additional settings supported by your installed Studio build. The selected
   file must exist and contain valid JSON.
@@ -342,7 +348,9 @@ retain their output connections. You may also enter a dataset path manually.
   Studio instances.
 
 Training is a synchronous Comfy job: the queue item runs until Lichtfeld Studio
-finishes. The node outputs `output_path`, `command`, `log_file`, and `summary`.
+finishes. The node outputs `output_path`, `command`, `log_file`, and `summary`;
+a `.sog`/`.spz` export adds its converted path to the summary as a `Splat:` line
+and streams the converter's own progress to the console.
 
 ### Tracker features vs. trained splats
 

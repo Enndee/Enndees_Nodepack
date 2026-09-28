@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import re
 import shutil
 import subprocess
 import tempfile
@@ -20,6 +21,8 @@ _DEFAULT_STUDIO = (
     / "LichtFeld-Studio.exe"
 )
 _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
+_EXPORT_SUFFIXES = {"ply": ".ply", "sog": ".sog", "spz": ".spz"}
+_EXPORT_FORMATS = tuple(_EXPORT_SUFFIXES)
 _TAIL_LINES = 80
 
 
@@ -93,6 +96,47 @@ def resolve_training_output(dataset, output_path=""):
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     return dataset / "output" / f"ComfyUI_Training_{stamp}"
+
+
+def validate_export_format(value):
+    """Normalize the splat export choice: Studio trains to .ply and converts to sog/spz."""
+    export_format = str(value or "ply").strip().lower().lstrip(".")
+    if export_format not in _EXPORT_SUFFIXES:
+        raise ValueError(
+            f"Unsupported splat export format {value!r}; expected one of "
+            f"{', '.join(_EXPORT_FORMATS)}."
+        )
+    return export_format
+
+
+def resolve_trained_splat(output, output_name=""):
+    """Pick the trained splat .ply inside `output` for the optional format conversion.
+
+    Studio's headless trainer always writes `splat_ITER.ply` (or the `--output-name`
+    stem); with checkpoint saves the highest iteration is the finished model, so it wins
+    over the earlier ones. Returns None when the folder holds no splat at all.
+    """
+    folder = Path(output)
+    candidates = [path for path in folder.glob("*.ply") if path.is_file()]
+    preferred = str(output_name or "").strip()
+    if preferred:
+        stem = Path(preferred).stem.lower()
+        named = [path for path in candidates if path.stem.lower().startswith(stem)]
+        if named:
+            candidates = named
+    if not candidates:
+        return None
+
+    def rank(path):
+        digits = re.findall(r"\d+", path.stem)
+        return (int(digits[-1]) if digits else -1, path.stat().st_mtime)
+
+    return max(candidates, key=rank)
+
+
+def build_conversion_command(executable, source, target):
+    """Build Studio's `convert` argv; --overwrite keeps the headless run from prompting."""
+    return [str(executable), "convert", str(source), str(target), "--overwrite"]
 
 
 def _check_running_studio_processes():
@@ -644,6 +688,16 @@ class LichtfeldHeadlessTrainer:
                         "Empty mirrors save steps when evaluation is enabled."
                     ),
                 }),
+                "export_format": (list(_EXPORT_FORMATS), {
+                    "default": "ply",
+                    "tooltip": (
+                        "Splat format to leave in the training output folder. 'ply' is "
+                        "Studio's own training export. 'sog' (SuperSplat) and 'spz' "
+                        "(Niantic) additionally run Studio's `convert` subcommand on "
+                        "the finished splat right after training, so the compressed "
+                        "file appears next to the .ply (which is kept for re-export)."
+                    ),
+                }),
             }
         }
 
@@ -654,7 +708,8 @@ class LichtfeldHeadlessTrainer:
     OUTPUT_NODE = True
     DESCRIPTION = (
         "Trains a GLOMAP-exported dataset with Lichtfeld Studio's official "
-        "headless CLI. Progress is streamed to the ComfyUI console."
+        "headless CLI and can leave the splat as .ply, .sog or .spz. Progress is "
+        "streamed to the ComfyUI console."
     )
 
     @classmethod
@@ -694,6 +749,7 @@ class LichtfeldHeadlessTrainer:
         overwrite_output=False,
         allow_concurrent_studio=False,
         preview_only=False,
+        export_format="ply",
     ):
         iterations = int(iterations)
         if iterations < 1:
@@ -704,6 +760,7 @@ class LichtfeldHeadlessTrainer:
         parsed_save_steps = parse_iteration_steps(save_steps, "Save Steps", iterations)
         parsed_eval_steps = parse_iteration_steps(eval_steps, "Eval Steps", iterations)
         effective_enable_eval = bool(enable_eval or parsed_eval_steps is not None)
+        export_format = validate_export_format(export_format)
 
         dataset = validate_dataset(dataset_path)
         if mask_mode != "none":
@@ -791,9 +848,17 @@ class LichtfeldHeadlessTrainer:
         print(f"[Enndee Lichtfeld] Dataset: {dataset}", flush=True)
         print(f"[Enndee Lichtfeld] Output: {output}", flush=True)
         print(f"[Enndee Lichtfeld] Command: {preview_command}", flush=True)
+        if export_format != "ply":
+            print(
+                f"[Enndee Lichtfeld] Splat export: .{export_format} "
+                "(Studio's convert subcommand runs on the trained .ply afterwards)",
+                flush=True,
+            )
 
         if preview_only:
             summary = "Preview only: dataset validated; training was not started."
+            if export_format != "ply":
+                summary += f" A .{export_format} export would follow the training run."
             return {"ui": {"text": [summary, preview_command]},
                     "result": (str(output), preview_command, "", summary)}
 
@@ -840,9 +905,42 @@ class LichtfeldHeadlessTrainer:
                 f"Full log: {log_file}\nLast output:\n{tail or '(no console output)'}"
             )
 
+        export_path = None
+        export_tail = ""
+        if export_format != "ply":
+            trained_splat = resolve_trained_splat(output, output_name)
+            if trained_splat is None:
+                raise RuntimeError(
+                    "Lichtfeld training finished but no splat .ply was found in "
+                    f"{output}; cannot export .{export_format}. Check the training "
+                    f"log: {log_file}"
+                )
+            export_path = trained_splat.with_suffix(_EXPORT_SUFFIXES[export_format])
+            conversion_command = build_conversion_command(executable, trained_splat, export_path)
+            print(
+                f"[Enndee Lichtfeld] Export: {subprocess.list2cmdline(conversion_command)}",
+                flush=True,
+            )
+            export_return_code, export_tail = run_streaming_command(
+                conversion_command, cwd=executable.parent
+            )
+            if export_return_code:
+                raise RuntimeError(
+                    f"Lichtfeld .{export_format} conversion exited with code "
+                    f"{export_return_code}. Source: {trained_splat}\nLast output:\n"
+                    f"{export_tail or '(no console output)'}"
+                )
+            if not export_path.is_file():
+                raise RuntimeError(
+                    "Lichtfeld reported a successful conversion but wrote no "
+                    f"{export_path.name} next to {trained_splat}."
+                )
+
+        exported = f"\nSplat: {export_path}" if export_path is not None else ""
         summary = (
             f"Lichtfeld training completed successfully ({int(iterations):,} configured "
-            f"iterations). Output: {output}\nLog: {log_file}"
+            f"iterations). Output: {output}{exported}\nLog: {log_file}"
         )
-        return {"ui": {"text": [summary, tail]},
+        ui_text = [summary, tail] if export_path is None else [summary, export_tail, tail]
+        return {"ui": {"text": ui_text},
                 "result": (str(output), preview_command, log_file, summary)}
