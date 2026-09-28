@@ -23,6 +23,14 @@ _DEFAULT_STUDIO = (
 _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
 _EXPORT_SUFFIXES = {"ply": ".ply", "sog": ".sog", "spz": ".spz"}
 _EXPORT_FORMATS = tuple(_EXPORT_SUFFIXES)
+# Flags the node emits that consume the *next* token as their value: when an unsupported flag is
+# filtered out, its value has to go as well (inline `--flag=value` forms are single tokens).
+_LFS_VALUE_FLAGS = frozenset({
+    "--data-path", "--output-path", "--iter", "--strategy", "--sh-degree", "--max-cap",
+    "--steps-scaler", "--mask-mode", "--bg-mode", "--bg-color", "--log-level", "--log-file",
+    "--output-name", "--config", "--python-script",
+})
+_STUDIO_PROBE_CACHE = {}
 _TAIL_LINES = 80
 
 
@@ -137,6 +145,207 @@ def resolve_trained_splat(output, output_name=""):
 def build_conversion_command(executable, source, target):
     """Build Studio's `convert` argv; --overwrite keeps the headless run from prompting."""
     return [str(executable), "convert", str(source), str(target), "--overwrite"]
+
+
+def parse_studio_capabilities(help_text, convert_text=""):
+    """Read a LichtFeld Studio CLI surface out of its own `--help` output.
+
+    Older free builds predate flags the node sends (`--bg-mode`, `--bg-color`,
+    `--centralize`, `--output-name`, ...) and reject unknown ones with
+    "Error: Parse error: Flag could not be matched", so the node has to know what the
+    installed binary accepts before building the command. `convert_text` is the output of
+    `<studio> convert --help` when the build has that subcommand. Anything the text does not
+    answer stays None and is then passed through unchecked.
+
+    Returns a dict: flags, value_flags, convert, formats, strategies, mask_modes, log_levels.
+    """
+    def option_flags(text, with_value):
+        found = set()
+        for line in text.splitlines():
+            if not line.lstrip().startswith("-"):
+                continue          # option definition lines, not prose or examples
+            for flag, inline in re.findall(r"(--[a-z0-9][a-z0-9_-]*)(=\S+)?", line):
+                # `re.findall` reports a non-participating group as "", not None
+                if (inline != "") == with_value:
+                    found.add(flag)
+        return found
+
+    def choices(pattern, text):
+        match = re.search(pattern, text)
+        if not match:
+            return None
+        items = {item.strip().lower() for item in match.group(1).split(",") if item.strip()}
+        return frozenset(items) or None
+
+    value_flags = option_flags(help_text, with_value=True)
+    flags = value_flags | option_flags(help_text, with_value=False)
+
+    # A `convert --help` dump may arrive as `help_text` (callers only have one text); its
+    # "Output: .ply, .sog, ..." block is then the authoritative format list.
+    if not convert_text and re.search(r"(?m)^\s*Output:\s*\.", help_text):
+        convert_text = help_text
+
+    listing = ""
+    if convert_text:
+        match = re.search(r"(?m)^\s*Output:\s*([^\n]+)", convert_text)
+        listing = match.group(1) if match else convert_text
+    else:
+        match = re.search(r"(?m)^\s*convert\s--\s[^\n]*?(\.ply[^\n]*)", help_text)
+        listing = match.group(1) if match else ""
+    formats = {"ply"} | {
+        token.strip().lstrip(".").lower()
+        for token in re.split(r"[,\s/]+", listing)
+        if token.strip().startswith(".")
+    }
+    convert_available = bool(convert_text) or bool(
+        re.search(r"(?m)^\s*convert\s--\s", help_text)
+    )
+
+    return {
+        "flags": frozenset(flags) or None,
+        "value_flags": frozenset(value_flags) or None,
+        "convert": convert_available,
+        "formats": frozenset(formats),
+        "strategies": choices(r"Optimization strategy:\s*([^\n(]+)", help_text),
+        "mask_modes": choices(r"Mask mode:\s*([^\n(]+)", help_text),
+        "log_levels": choices(r"Log level:\s*([^\n(]+)", help_text),
+    }
+
+
+def _run_studio_console(command, timeout=20):
+    """Run `<studio> --version` / `--help` and return the text ("" on any failure).
+
+    `--help` and `--version` print and exit instead of opening the GUI, and the timeout kills
+    a build that answers neither. Never raises: a probe that fails just means the node works
+    with "unknown" capabilities, in which case nothing gets filtered or promised.
+    """
+    options = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+        "stdin": subprocess.DEVNULL,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "cwd": str(Path(command[0]).parent),
+    }
+    if os.name == "nt":
+        options["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        completed = subprocess.run(command, timeout=timeout, check=False, **options)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if completed.returncode != 0:
+        return ""
+    return completed.stdout or ""
+
+
+def probe_studio_support(executable):
+    """Ask the installed Studio what it supports; cached per executable (path, size, mtime).
+
+    Older free builds answer `--version` with "unknown" and may not ship the `convert`
+    subcommand at all, so capabilities - not version numbers - drive every fallback here. A
+    binary that does not identify itself as LichtFeld Studio (wrong widget value) yields
+    "unknown" capabilities: the command is left untouched and a requested SOG/SPZ export
+    falls back to PLY with a warning.
+    """
+    path = Path(executable)
+    try:
+        stat = path.stat()
+        key = (str(path), stat.st_size, stat.st_mtime_ns)
+    except OSError:
+        key = (str(path), 0, 0)
+    cached = _STUDIO_PROBE_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    version_text = _run_studio_console([str(path), "--version"])
+    help_text = _run_studio_console([str(path), "--help"])
+    if version_text and "lichtfeld" not in version_text.lower():
+        version_text = ""
+    if help_text and "lichtfeld" not in help_text.lower():
+        help_text = ""
+
+    capabilities = parse_studio_capabilities(help_text)
+    if capabilities["convert"]:
+        convert_text = _run_studio_console([str(path), "convert", "--help"])
+        if convert_text and "convert" in convert_text.lower():
+            convert_formats = parse_studio_capabilities(convert_text)["formats"]
+            capabilities["formats"] = capabilities["formats"] | convert_formats
+    version = ""
+    for line in version_text.splitlines():
+        line = line.strip()
+        if line:
+            match = re.match(r"LichtFeld Studio\s*(.+)", line)
+            version = match.group(1).strip() if match else line
+            break
+    capabilities["version"] = version
+    _STUDIO_PROBE_CACHE[key] = capabilities
+    return capabilities
+
+
+def resolve_export_support(support, requested):
+    """(format, note): fall back to the plain .ply export when the build cannot convert.
+
+    SOG/SPZ output needs a build with the `convert` subcommand (LichtFeld Studio 0.5+); the
+    `.ply` that every build writes stays the result then and the note explains why.
+    """
+    if requested == "ply":
+        return "ply", ""
+    if support.get("convert") and requested in support.get("formats", frozenset()):
+        return requested, ""
+    version = support.get("version") or "unknown version"
+    if support.get("convert"):
+        reason = (f"cannot write .{requested} (its `convert` supports "
+                  f"{', '.join(sorted(support.get('formats', ())))})")
+    else:
+        reason = "has no `convert` subcommand"
+    note = (f"this LichtFeld Studio build ({version}) {reason}; exporting .ply instead - "
+            "SOG/SPZ output needs a build with the convert subcommand (LichtFeld Studio 0.5+).")
+    return "ply", note
+
+
+def check_studio_choice(value, supported, label, fallback=None):
+    """Validate a widget value against the build's own choice list (None = unchecked).
+
+    Training-shaping options (strategy, mask mode) raise, so the user picks a value the build
+    knows instead of silently training differently. `fallback` turns the check into a warning
+    for options a build merely labels otherwise (log level).
+    """
+    if not supported or str(value).lower() in supported:
+        return value, ""
+    if fallback is None:
+        raise ValueError(
+            f"This LichtFeld Studio build does not support {label} {value!r}; "
+            f"it lists: {', '.join(sorted(supported))}."
+        )
+    note = (f"{label} {value!r} is not available in this build "
+            f"({', '.join(sorted(supported))}); using {fallback!r}.")
+    return fallback, note
+
+
+def filter_supported_flags(command, supported_flags, value_flags=None):
+    """Drop flags the installed build does not know; returns (command, dropped flag names).
+
+    Old free builds reject unknown flags outright ("Flag could not be matched: bg-mode"), which
+    would abort the whole run, so the probed flag list prunes the command instead. `None` (no
+    parsed help) leaves the command untouched.
+    """
+    if not supported_flags:
+        return list(command), []
+    value_flags = _LFS_VALUE_FLAGS if value_flags is None else value_flags
+    filtered, dropped, index = [], [], 0
+    while index < len(command):
+        token = command[index]
+        name = token.partition("=")[0] if token.startswith("--") else ""
+        if name and name not in supported_flags:
+            dropped.append(name)
+            if "=" not in token and name in value_flags:
+                index += 1                       # the value goes with its flag
+            index += 1
+            continue
+        filtered.append(token)
+        index += 1
+    return filtered, dropped
 
 
 def _check_running_studio_processes():
@@ -695,7 +904,9 @@ class LichtfeldHeadlessTrainer:
                         "Studio's own training export. 'sog' (SuperSplat) and 'spz' "
                         "(Niantic) additionally run Studio's `convert` subcommand on "
                         "the finished splat right after training, so the compressed "
-                        "file appears next to the .ply (which is kept for re-export)."
+                        "file appears next to the .ply (which is kept for re-export). "
+                        "Older Studio builds without `convert` keep the .ply and log a "
+                        "warning instead of failing."
                     ),
                 }),
             }
@@ -760,7 +971,7 @@ class LichtfeldHeadlessTrainer:
         parsed_save_steps = parse_iteration_steps(save_steps, "Save Steps", iterations)
         parsed_eval_steps = parse_iteration_steps(eval_steps, "Eval Steps", iterations)
         effective_enable_eval = bool(enable_eval or parsed_eval_steps is not None)
-        export_format = validate_export_format(export_format)
+        requested_export = validate_export_format(export_format)
 
         dataset = validate_dataset(dataset_path)
         if mask_mode != "none":
@@ -774,6 +985,18 @@ class LichtfeldHeadlessTrainer:
                     f"{mask_dir}. Use mask_mode='none' for datasets without masks."
                 )
         executable = resolve_studio_executable(studio_executable)
+        # Older/free builds differ: probe what this binary actually accepts before promising
+        # anything (its `--version` may literally print "unknown") and fall back where needed.
+        studio = probe_studio_support(executable)
+        export_format, export_note = resolve_export_support(studio, requested_export)
+        strategy, strategy_note = check_studio_choice(strategy, studio["strategies"], "strategy")
+        mask_mode, mask_note = check_studio_choice(mask_mode, studio["mask_modes"], "mask mode")
+        log_level, log_note = check_studio_choice(log_level, studio["log_levels"], "log level",
+                                                  fallback="info")
+        compatibility_notes = [note for note in (export_note, strategy_note, mask_note, log_note)
+                               if note]
+        for note in compatibility_notes:
+            print(f"[Enndee Lichtfeld] {note}", flush=True)
         config_path = str(config_file or "").strip()
         if config_path:
             config = Path(config_path).expanduser().resolve()
@@ -844,6 +1067,19 @@ class LichtfeldHeadlessTrainer:
             disable_downscaling=disable_downscaling,
             python_script="<temporary Lichtfeld settings script>" if settings_script else "",
         )
+        command, dropped_flags = filter_supported_flags(command, studio["flags"])
+        if dropped_flags:
+            note = ("this Studio build does not support "
+                    + ", ".join(sorted(set(dropped_flags)))
+                    + " - the option(s) were left out (the build's own defaults apply).")
+            compatibility_notes.append(note)
+            print(f"[Enndee Lichtfeld] Note: {note}", flush=True)
+        if settings_script and "--python-script" not in command:
+            note = ("this Studio build has no --python-script; the Grow Until / Stop Refine / "
+                    "Save Steps / Eval Steps settings are ignored.")
+            compatibility_notes.append(note)
+            print(f"[Enndee Lichtfeld] Note: {note}", flush=True)
+            settings_script = ""
         preview_command = subprocess.list2cmdline(command)
         print(f"[Enndee Lichtfeld] Dataset: {dataset}", flush=True)
         print(f"[Enndee Lichtfeld] Output: {output}", flush=True)
@@ -857,6 +1093,8 @@ class LichtfeldHeadlessTrainer:
 
         if preview_only:
             summary = "Preview only: dataset validated; training was not started."
+            if compatibility_notes:
+                summary += " " + " ".join(compatibility_notes)
             if export_format != "ply":
                 summary += f" A .{export_format} export would follow the training run."
             return {"ui": {"text": [summary, preview_command]},
@@ -937,9 +1175,10 @@ class LichtfeldHeadlessTrainer:
                 )
 
         exported = f"\nSplat: {export_path}" if export_path is not None else ""
+        noted = ("\nNotes: " + " ".join(compatibility_notes)) if compatibility_notes else ""
         summary = (
             f"Lichtfeld training completed successfully ({int(iterations):,} configured "
-            f"iterations). Output: {output}{exported}\nLog: {log_file}"
+            f"iterations). Output: {output}{exported}{noted}\nLog: {log_file}"
         )
         ui_text = [summary, tail] if export_path is None else [summary, export_tail, tail]
         return {"ui": {"text": ui_text},

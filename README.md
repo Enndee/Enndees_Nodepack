@@ -316,7 +316,8 @@ retain their output connections. You may also enter a dataset path manually.
   own `convert` subcommand on the finished `.ply` right after training, so the compressed
   file appears next to it (the `.ply` stays in the folder and can be re-exported any time).
   The node picks the finished splat itself: an explicit Output Name wins, otherwise the
-  highest iteration number - checkpoint saves never win over the final model.
+  highest iteration number - checkpoint saves never win over the final model. A build
+  without the `convert` subcommand keeps the `.ply` and logs a warning instead of failing.
 - **Config File:** optionally supplies a Lichtfeld Studio JSON config for
   additional settings supported by your installed Studio build. The selected
   file must exist and contain valid JSON.
@@ -351,6 +352,25 @@ Training is a synchronous Comfy job: the queue item runs until Lichtfeld Studio
 finishes. The node outputs `output_path`, `command`, `log_file`, and `summary`;
 a `.sog`/`.spz` export adds its converted path to the summary as a `Splat:` line
 and streams the converter's own progress to the console.
+
+### Older and free Studio builds
+
+The node asks the executable itself what it supports - `--version`, `--help`, and
+`convert --help` when the build advertises that subcommand - and adapts the run instead of
+trusting a version number. Older free builds print "unknown" for `--version` and reject
+unknown flags outright (`Error: Parse error: Flag could not be matched: bg-mode`), so
+capability probing is the only reliable trigger. Read-only and cached per executable.
+
+- Flags the build does not know (`--bg-mode`, `--bg-color`, `--centralize`, `--output-name`,
+  ...) are left out and listed in the node summary; the build's own defaults apply.
+- `sog`/`spz` without a `convert` subcommand fall back to the `.ply` export, with a warning in
+  the console and in the summary. (LichtFeld Studio 0.5.0 already ships `convert` including
+  SOG/SPZ - the fallback is for builds that predate it.)
+- Strategy and mask mode are checked against the build's own list (an older build may only
+  offer `mcmc`/`adc`/`igs+`). An unsupported choice raises with that list; a log level the
+  build does not know falls back to `info` with a note.
+- A build without `--python-script` logs that Grow Until / Stop Refine / Save Steps /
+  Eval Steps are ignored for this run.
 
 ### Tracker features vs. trained splats
 

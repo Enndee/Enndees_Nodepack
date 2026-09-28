@@ -18,7 +18,12 @@ from lichtfeld_training_node import (  # noqa: E402
     build_conversion_command,
     build_lfs_settings_script,
     build_training_command,
+    check_studio_choice,
+    filter_supported_flags,
     parse_iteration_steps,
+    parse_studio_capabilities,
+    probe_studio_support,
+    resolve_export_support,
     run_streaming_command,
     resolve_studio_executable,
     resolve_trained_splat,
@@ -73,6 +78,57 @@ def default_command_options():
         "max_image_width": 3840,
         "disable_downscaling": False,
     }
+
+
+def capable_studio(**overrides):
+    """Probed capabilities of a current LichtFeld Studio build (for mocked probes).
+
+    `flags`/`value_flags`/choice lists stay None on purpose: a mocked build then filters and
+    validates nothing, which keeps these tests focused on the export/fallback logic.
+    """
+    support = {
+        "version": "v0.5.3 (d8c50c6a)",
+        "flags": None,
+        "value_flags": None,
+        "convert": True,
+        "formats": frozenset({"ply", "sog", "spz", "html"}),
+        "strategies": None,
+        "mask_modes": None,
+        "log_levels": None,
+    }
+    support.update(overrides)
+    return support
+
+
+OLD_FLAGS = frozenset({
+    "--data-path", "--output-path", "--iter", "--strategy", "--sh-degree", "--max-cap",
+    "--steps-scaler", "--mask-mode", "--log-level", "--log-file", "--resize_factor",
+    "--max-width", "--headless", "--train", "--invert-masks", "--enable-mip",
+    "--bilateral-grid", "--eval", "--enable-sparsity", "--config", "--python-script",
+})
+OLD_VALUE_FLAGS = frozenset({
+    "--data-path", "--output-path", "--iter", "--strategy", "--sh-degree", "--max-cap",
+    "--steps-scaler", "--mask-mode", "--log-level", "--log-file", "--config",
+    "--python-script",
+})
+
+
+def old_studio(**overrides):
+    """Probed capabilities of an older free build: no bg-mode/bg-color/centralize/output-name,
+    a shorter strategy list, and `--version` printing "unknown"."""
+    support = capable_studio(
+        version="unknown (bdd8f92)",
+        convert=False,
+        formats=frozenset({"ply"}),
+        flags=OLD_FLAGS,
+        value_flags=OLD_VALUE_FLAGS,
+        strategies=frozenset({"mcmc", "adc", "igs+"}),
+        mask_modes=frozenset({"none", "segment", "ignore", "alpha_consistent"}),
+        log_levels=frozenset({"trace", "debug", "info", "perf", "warn", "error",
+                              "critical", "off"}),
+    )
+    support.update(overrides)
+    return support
 
 
 class LichtfeldDatasetTests(unittest.TestCase):
@@ -460,6 +516,9 @@ class LichtfeldCommandTests(unittest.TestCase):
             ), mock.patch(
                 "lichtfeld_training_node.run_streaming_command",
                 side_effect=fake_run,
+            ), mock.patch(
+                "lichtfeld_training_node.probe_studio_support",
+                return_value=capable_studio(),
             ):
                 result = LichtfeldHeadlessTrainer().train(**inputs)
 
@@ -537,6 +596,9 @@ class LichtfeldCommandTests(unittest.TestCase):
             ), mock.patch(
                 "lichtfeld_training_node.run_streaming_command",
                 side_effect=fake_run,
+            ), mock.patch(
+                "lichtfeld_training_node.probe_studio_support",
+                return_value=capable_studio(),
             ):
                 with self.assertRaisesRegex(RuntimeError, r"\.spz conversion exited with code 3"):
                     LichtfeldHeadlessTrainer().train(**inputs)
@@ -557,12 +619,242 @@ class LichtfeldCommandTests(unittest.TestCase):
                 export_format="spz",
                 preview_only=True,
             )
-            result = LichtfeldHeadlessTrainer().train(**inputs)
+            with mock.patch(
+                "lichtfeld_training_node.probe_studio_support",
+                return_value=capable_studio(),
+            ):
+                result = LichtfeldHeadlessTrainer().train(**inputs)
             self.assertIn(".spz export would follow", result["result"][3])
             self.assertFalse(output.exists())
 
 
-class LichtfeldStreamingTests(unittest.TestCase):
+OLD_HELP_SNIPPET = """  LichtFeld-Studio.exe {OPTIONS}
+        -i[iterations], --iter=[iterations]
+                                          Number of iterations
+        --strategy=[strategy]             Optimization strategy: mcmc, adc, igs+
+        --max-cap=[max_cap]               Max Gaussians for MCMC or igs+
+        -o[output_path], --output-path=[output_path]
+                                          Path to output
+        -r[resize_factor], --resize_factor=[resize_factor]
+                                          Resize resolution by factor: auto, 1, 2, 4, 8 (default: auto)
+        --mask-mode=[mask_mode]           Mask mode: none, segment, ignore, alpha_consistent (default: none)
+        --log-level=[level]               Log level: trace, debug, info, perf, warn, error, critical, off
+        -q, --quiet                       Suppress non-error output (equivalent to --log-level error)
+        --headless                        Disable visualization during training
+        --train                           Start training immediately on startup
+    SUBCOMMANDS:
+    convert -- Convert between .ply, .sog, .spz, .html
+"""
+
+NEW_HELP_SNIPPET = """  LichtFeld-Studio.exe {OPTIONS}
+        --output-name=[output_name]       Output filename (replaces default splat_ITER.ply stem)
+        --strategy=[strategy]             Optimization strategy: mcmc, mrnf, igs+ (legacy aliases: mnrf, lfs)
+        --bg-mode=[mode]                  Background mode: solidcolor, modulation, image, random (default: solidcolor)
+        --bg-color=[color]                solidcolor background color as #RRGGBB (default: #000000)
+        --mask-mode=[mask_mode]           Mask mode: none, segment, ignore, segment_and_ignore, alpha_consistent
+        --centralize=[centralize]         Dataset origin: off, by_pointcloud, by_cameras
+    SUBCOMMANDS:
+    convert -- Convert between .ply, .sog, .spz, .usd/.usda/.usdc, .html
+    mesh2splat -- Convert a mesh file to Gaussian splats
+"""
+
+NEW_CONVERT_SNIPPET = """  LichtFeld-Studio.exe convert {OPTIONS} [input] [output]
+      -f[format], --format=[format]     Output format: ply, sog, spz, html, usd, usda, usdc, rad
+    SUPPORTED FORMATS:
+      Input: .ply, .sog, .spz, .usd, .resume (checkpoint)
+      Output: .ply, .sog, .spz, .usd, .usda, .usdc, .html, .rad
+"""
+
+
+class LichtfeldStudioCompatibilityTests(unittest.TestCase):
+    """The <0.5.3 fallbacks: capabilities are probed, never assumed from a version number."""
+
+    def test_parse_studio_capabilities_reads_old_and_new_help(self):
+        old = parse_studio_capabilities(OLD_HELP_SNIPPET)
+        self.assertTrue(old["convert"])                      # 0.5.0 already ships convert
+        self.assertLessEqual({"ply", "sog", "spz"}, old["formats"])
+        self.assertNotIn("--bg-mode", old["flags"])          # flags that abort old builds
+        self.assertNotIn("--centralize", old["flags"])
+        self.assertNotIn("--output-name", old["flags"])
+        self.assertIn("--resize_factor", old["flags"])
+        self.assertIn("--resize_factor", old["value_flags"])
+        self.assertIn("--iter", old["value_flags"])
+        self.assertNotIn("--headless", old["value_flags"])   # booleans take no value
+        self.assertEqual(old["strategies"], frozenset({"mcmc", "adc", "igs+"}))
+        self.assertEqual(old["mask_modes"],
+                         frozenset({"none", "segment", "ignore", "alpha_consistent"}))
+        self.assertIn("off", old["log_levels"])
+
+        new = parse_studio_capabilities(NEW_HELP_SNIPPET, NEW_CONVERT_SNIPPET)
+        self.assertTrue(new["convert"])
+        self.assertLessEqual({"ply", "sog", "spz", "rad"}, new["formats"])
+        self.assertIn("--bg-mode", new["flags"])
+        self.assertIn("--centralize", new["flags"])
+        self.assertIn("--output-name", new["value_flags"])
+        self.assertEqual(new["strategies"], frozenset({"mcmc", "mrnf", "igs+"}))
+        self.assertIn("segment_and_ignore", new["mask_modes"])
+
+        # the probe may hand a convert help dump over as the single text argument
+        convert_only = parse_studio_capabilities(NEW_CONVERT_SNIPPET)
+        self.assertTrue(convert_only["convert"])
+        self.assertLessEqual({"ply", "sog", "spz", "rad", "usd", "usda", "usdc", "html"},
+                             convert_only["formats"])
+
+    def test_probe_studio_support_reports_unknown_for_a_non_lichtfeld_binary(self):
+        # The test interpreter answers --version/--help but never identifies as LichtFeld, so
+        # nothing is filtered and nothing is promised (the wrong-executable case).
+        support = probe_studio_support(sys.executable)
+        self.assertEqual(support["version"], "")
+        self.assertFalse(support["convert"])
+        self.assertEqual(support["formats"], frozenset({"ply"}))
+        self.assertIsNone(support["flags"])
+        self.assertIsNone(support["strategies"])
+
+    def test_filter_supported_flags_drops_unknown_flags_with_their_values(self):
+        command = ["Studio.exe", "--data-path", "dataset", "--iter", "20000",
+                   "--bg-mode", "solidcolor", "--bg-color", "#FFFFFF", "--centralize=off",
+                   "--output-name", "final_splat", "--headless", "--train"]
+        filtered, dropped = filter_supported_flags(
+            command, {"--data-path", "--iter", "--headless", "--train"},
+        )
+        self.assertEqual(
+            filtered,
+            ["Studio.exe", "--data-path", "dataset", "--iter", "20000", "--headless", "--train"],
+        )
+        self.assertEqual(sorted(dropped),
+                         ["--bg-color", "--bg-mode", "--centralize", "--output-name"])
+        untouched, nothing_dropped = filter_supported_flags(command, None)
+        self.assertEqual(untouched, command)
+        self.assertEqual(nothing_dropped, [])
+
+    def test_resolve_export_support_falls_back_to_ply_on_old_builds(self):
+        self.assertEqual(resolve_export_support(old_studio(), "ply"), ("ply", ""))
+        export_format, note = resolve_export_support(old_studio(), "sog")
+        self.assertEqual(export_format, "ply")
+        self.assertIn("has no `convert` subcommand", note)
+        self.assertIn("unknown (bdd8f92)", note)
+
+        partial = capable_studio(formats=frozenset({"ply", "sog", "html"}))
+        self.assertEqual(resolve_export_support(partial, "sog"), ("sog", ""))
+        export_format, note = resolve_export_support(partial, "spz")
+        self.assertEqual(export_format, "ply")
+        self.assertIn("cannot write .spz", note)
+
+    def test_check_studio_choice_raises_or_falls_back_against_the_builds_list(self):
+        strategies = frozenset({"mcmc", "adc", "igs+"})
+        self.assertEqual(check_studio_choice("mcmc", strategies, "strategy"), ("mcmc", ""))
+        with self.assertRaisesRegex(ValueError, "does not support strategy 'mrnf'"):
+            check_studio_choice("mrnf", strategies, "strategy")
+        self.assertEqual(check_studio_choice("mrnf", None, "strategy"), ("mrnf", ""))
+        level, note = check_studio_choice("trace", frozenset({"info", "warn"}), "log level",
+                                          fallback="info")
+        self.assertEqual(level, "info")
+        self.assertIn("using 'info'", note)
+
+    def test_train_drops_flags_an_old_build_rejects(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dataset = make_dataset(Path(temp_dir) / "dataset")
+            output = Path(temp_dir) / "trained output"
+            calls = []
+
+            def fake_run(command, cwd, progress_callback=None):
+                calls.append(list(command))
+                return 0, "mock training output"
+
+            inputs = {
+                name: metadata.get("default", choices[0] if isinstance(choices, list) else None)
+                for name, (choices, metadata)
+                in LichtfeldHeadlessTrainer.INPUT_TYPES()["required"].items()
+            }
+            inputs.update(
+                studio_executable=sys.executable,
+                dataset_path=str(dataset),
+                output_path=str(output),
+                iterations=20000,
+                output_name="final_splat",
+            )
+            with mock.patch(
+                "lichtfeld_training_node._check_running_studio_processes",
+                return_value=[],
+            ), mock.patch(
+                "lichtfeld_training_node.run_streaming_command",
+                side_effect=fake_run,
+            ), mock.patch(
+                "lichtfeld_training_node.probe_studio_support",
+                return_value=old_studio(),
+            ):
+                result = LichtfeldHeadlessTrainer().train(**inputs)
+
+            command = calls[0]
+            for flag in ("--bg-mode", "--bg-color", "--centralize", "--output-name"):
+                self.assertNotIn(flag, command)
+            self.assertNotIn("final_splat", command)          # the value left with its flag
+            self.assertIn("--mask-mode", command)
+            self.assertIn("--resize_factor=auto", command)
+            self.assertIn("does not support", result["result"][3])
+
+    def test_train_falls_back_to_ply_when_the_build_cannot_convert(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dataset = make_dataset(Path(temp_dir) / "dataset")
+            output = Path(temp_dir) / "trained output"
+            calls = []
+
+            def fake_run(command, cwd, progress_callback=None):
+                calls.append(list(command))
+                if len(calls) == 1:
+                    (output / "splat_20000.ply").write_bytes(b"synthetic splat")
+                return 0, "mock training output"
+
+            inputs = {
+                name: metadata.get("default", choices[0] if isinstance(choices, list) else None)
+                for name, (choices, metadata)
+                in LichtfeldHeadlessTrainer.INPUT_TYPES()["required"].items()
+            }
+            inputs.update(
+                studio_executable=sys.executable,
+                dataset_path=str(dataset),
+                output_path=str(output),
+                iterations=20000,
+                export_format="sog",
+            )
+            with mock.patch(
+                "lichtfeld_training_node._check_running_studio_processes",
+                return_value=[],
+            ), mock.patch(
+                "lichtfeld_training_node.run_streaming_command",
+                side_effect=fake_run,
+            ), mock.patch(
+                "lichtfeld_training_node.probe_studio_support",
+                return_value=old_studio(),
+            ):
+                result = LichtfeldHeadlessTrainer().train(**inputs)
+
+            self.assertEqual(len(calls), 1)                    # training only, no convert
+            self.assertNotIn("convert", calls[0])
+            self.assertIn("exporting .ply instead", result["result"][3])
+            self.assertNotIn("Splat:", result["result"][3])
+
+    def test_train_raises_for_a_strategy_the_build_lacks(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dataset = make_dataset(Path(temp_dir) / "dataset")
+            inputs = {
+                name: metadata.get("default", choices[0] if isinstance(choices, list) else None)
+                for name, (choices, metadata)
+                in LichtfeldHeadlessTrainer.INPUT_TYPES()["required"].items()
+            }
+            inputs.update(
+                studio_executable=sys.executable,
+                dataset_path=str(dataset),
+                strategy="mrnf",
+                preview_only=True,
+            )
+            with mock.patch(
+                "lichtfeld_training_node.probe_studio_support",
+                return_value=old_studio(),
+            ):
+                with self.assertRaisesRegex(ValueError, "does not support strategy 'mrnf'"):
+                    LichtfeldHeadlessTrainer().train(**inputs)
+
     def test_streams_child_output_and_returns_the_tail(self):
         messages = []
         code, tail = run_streaming_command(
