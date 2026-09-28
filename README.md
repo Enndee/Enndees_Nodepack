@@ -33,7 +33,7 @@ Lichtfeld Studio dataset in a single step.
 | **MiniMax H3 Direct Promptor (Enndee)** | `H3_Multimodal_Promptor_Enndee` | Official-format MiniMax H3 prompts from reference images (vision LLM) |
 | **Resolution Selector (Enndee)** | `Enndee_ResolutionSelector` | Aspect-ratio + megapixel sizing plus the nine core resize types and a resized image output |
 | **Load & Resize Image (Enndee)** | `Enndee_ImageLoaderResize` | Load an image with the classic load-and-resize widgets, core resize types, mask channel, and original-size output |
-| **Meridian Parameters and Camera (Enndee)** | `Enndee_MeridianParametersAndCamera` | Meridian geometry arguments plus the camera path: hand-authored O orbits / alternating-height pendulum / spiral sweeps, or an automatic speed-capped orbit around the subject or the whole scene |
+| **Meridian Parameters and Camera (Enndee)** | `Enndee_MeridianParametersAndCamera` | Meridian geometry arguments plus the camera path: hand-authored O orbits / alternating-height pendulum / spiral sweeps, or an automatic mode that estimates the subject's (or scene's) geometric pivot from the still's depth profile and flies a speed-capped, collision-guarded path around it |
 | **Meridian Geometry (Enndee)** | `Enndee_MeridianGeometry` | Run VGGT geometry preview; optionally repeat the first frame to a connected custom path's required length |
 | **Lichtfeld Headless Trainer (Enndee)** | `Enndee_LichtfeldHeadlessTrainer` | Start configurable Lichtfeld Studio Gaussian-splat training from a tracker dataset and export the result as .ply, .sog or .spz |
 
@@ -51,13 +51,14 @@ geometry pass: connect its `args` output to **Meridian Geometry**'s
 
 **Camera Mode** decides where the path comes from:
 
-- **Manual path** - the hand-authored paths below (O orbits, alternating-height
+- **Manual** - the hand-authored paths below (O orbits, alternating-height
   pendulum, monotone spiral sweep), built by the same code the retired
-  configurator used.
-- **Automatic (estimated)** - the node looks at the connected `reference_image`
-  (and the optional `subject_mask`) and estimates an optimal orbit: the camera
-  positions come from the still's own surface data, capped to a camera-speed
-  budget. Nothing else needs to be set.
+  configurator used, around the absolute look-pivot.
+- **Automatic** - the node looks at the connected `reference_image` (and the
+  optional `subject_mask`), estimates the subject's - or the scene's -
+  **geometric pivot** from its depth profile and then flies either the
+  estimated path or the manual one around that pivot. Nothing else needs to be
+  set.
 
 ### Manual path
 
@@ -104,35 +105,54 @@ surface never reappears at the end. Watch the key-frame budget: each O loop
 needs 8 key intervals and each transfer 4, so 73/90-frame paths fit up to 6/7
 stations while the full eight-station sweep needs 107 frames or more; the node
 raises a clear error when a selection does not fit.
-### Automatic (estimated) camera
+### Automatic camera
 
-Select **Automatic (estimated)** and connect the still to `reference_image` -
-the same image the Geometry node receives. The estimator:
+Select **Automatic** and connect the still to `reference_image` - the same
+image the Geometry node receives. The estimator:
 
 1. runs a depth pass on the still (Depth-Anything-3-Small by default; it reuses
    the fast-depth backend's loaded model, so it costs one extra forward pass
    per queue);
-2. builds the surface in the source camera's coordinates and fits a sphere to
-   the **target** you picked:
+2. places the **pivot** in the middle of the target's depth profile - the
+   *geometric* midpoint of its robust bounding box (per-axis 2 %/98 %
+   percentiles), not the picture centre and not the median, which would hug the
+   dense front face. The **target** decides which geometry is used:
    - **subject** - the connected `subject_mask`, else the near-depth layer that
      an Otsu split separates from the background. Any segmentation node can
      drive the mask (the GLOMAP tracker's `use_rmbg` output works well); without
      one the depth split does the job;
-   - **scene** - the whole reconstructed surface, framed wider.
-3. places the camera on that sphere so the target fills roughly 45 % (subject)
-   of the frame and orbits it **starting in front** (the source camera's side),
-   rising/falling a little over the run while always looking at the centre;
-4. caps the motion: **Max Speed** (`auto_max_speed`, percent of the content
-   radius per frame, 12 % default) plus a hard 6 degrees/frame azimuth limit.
-   If the frame count cannot cover the full swing (360 degrees for a subject,
-   270 for a scene) under that budget, the swing is shortened instead of
-   speeding up - too much new surface per frame is what makes the depth
-   reprojections smear.
+   - **scene** - the whole reconstructed surface, whose pivot sits in the middle
+     of all depth points and whose path is wider.
+   **Auto Pivot X/Y/Z** shifts the estimated pivot by up to one content radius
+   per axis (frame-0 camera axes: +X right, +Y down, +Z away) - for subjects
+   whose depth midpoint is not the point you want framed.
+3. picks the path with **Auto Path Mode**:
+   - **Automatic** - the estimated path. For a subject: first a big front
+     **O orbit** (azimuth +/-62 degrees, elevation +/-30) that shows the front
+     from below, right, above and left in one loop, then a 270-degree **height
+     lap** around the rest of the subject that eases from -30 up to +38 degrees
+     elevation, so the last frames show new surface at a new height instead of
+     repeating the start. For a scene: one big **oval** - a 350-degree lap at
+     twice the scene radius that rises from -12 to +28 degrees while it goes
+     round.
+   - **Manual** - the manual styles below, but aimed at the estimated pivot
+     instead of the absolute look-pivot (the `path_pivot_*` widgets are ignored
+     and hidden then; every other path widget applies as usual).
+4. fits the path to **Max Speed** (`auto_max_speed`, percent of the content
+   radius per frame, 12 % default): the path is built at full amplitude, the
+   true per-frame travel is measured and every amplitude is scaled down the
+   ladder until it fits - the console line reports the factor ("0.28x
+   amplitude"). Slow and steady beats fast: too much new surface per frame is
+   what makes the depth reprojections smear.
+5. runs the **collision guard**: every path key is checked against the whole
+   scene cloud and pushed away from the pivot until it is at least 15 % of the
+   content radius clear of the nearest point, so the camera never ends up inside
+   the geometry it orbits (the console line reports how many keys were moved).
 
-Every estimate prints a one-line summary to the ComfyUI console (target,
-centre, radius, swing, degrees and units per frame, key count, and whether the
-swing had to be shortened). The `subject_mask` input is optional; the label in
-the summary says which source was used.
+Every estimate prints a one-line summary to the ComfyUI console (pivot, depth
+extents, source label, path style, units per frame, amplitude factor, collision
+fixes). The `subject_mask` input is optional; the summary says which source was
+used.
 
 ### What this node no longer has
 

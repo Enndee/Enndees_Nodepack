@@ -33,16 +33,27 @@ AUTO_TARGETS = (SUBJECT_TARGET, SCENE_TARGET)
 AUTO_DEPTH_RES = 504              # DA3 process_res for the surface estimate (stats need no more)
 MIN_SUBJECT_PIXELS = 64           # absolute floor for a near layer / mask to count as a subject
 MIN_SUBJECT_SHARE = 0.01          # ... plus 1 % of the cloud, so big frames need a real subject
+PIVOT_PERCENTILE_LOW = 2.0        # per-axis clip before the bounding-box midpoint (robust pivot)
+PIVOT_PERCENTILE_HIGH = 98.0
 SUBJECT_FILL = 2.2                # orbit radius / subject radius (~45 % frame fill at 55 deg vfov)
-SCENE_FILL = 1.5                  # orbit radius / scene radius
-SUBJECT_ELEVATION = 12.0          # deg, the orbit rises/falls this much over the path
-SCENE_ELEVATION = 8.0
-SUBJECT_SPAN = 360.0              # deg of azimuth a subject orbit would like to cover
-SCENE_SPAN = 270.0
+SCENE_FILL = 2.0                  # the scene gets a deliberately big oval
+FRONT_ORBIT_SHARE = 0.5           # share of the frames spent on the front O-orbit
+FRONT_YAW_AMPLITUDE = 62.0        # deg, the front O swings this far to either side
+FRONT_ELEVATION = 30.0            # deg, the front O reaches this high/low
+REST_YAW_SPAN = 270.0             # deg, the height orbit laps around the rest of the subject
+REST_ELEVATION_HIGH = 38.0        # where the height orbit ends: a new height, no surface repeat
+SCENE_SPAN = 350.0                # deg, the scene oval stops just short of a full lap
+SCENE_ELEVATION_LOW = -12.0
+SCENE_ELEVATION_HIGH = 28.0
 KEY_TARGET = 17                   # path keys (Catmull-Rom control points)
-MAX_AZIMUTH_PER_FRAME = 6.0       # hard cap: 360 deg then needs at least 60 frames
+AMPLITUDE_STEPS = 40              # lambda ladder: 1.0, 0.975, ... 0.025 (2.5 % rungs)
 MIN_ORBIT_RADIUS = 0.05           # never place the camera on the content
 DEFAULT_MAX_SPEED = 0.12          # fraction of the content radius the camera may travel per frame
+COLLISION_MARGIN = 0.15           # of the content radius: how close a camera key may come to geometry
+COLLISION_ITERATIONS = 4
+COLLISION_MAX_POINTS = 120_000    # stride bigger clouds down for the distance checks
+MAX_PIVOT_OFFSET = 1.0            # pivot offset widgets, in content radii
+
 
 
 def _finite(value, label):
@@ -93,7 +104,7 @@ def surface_points(depth, mask=None):
                           (yy - height / 2.0) / focal * depth,
                           depth], dim=-1).reshape(-1, 3)
     if mask is not None:
-        selection = _fit_mask(mask, height, width).reshape(-1)
+        selection = _fit_mask(mask, height, width).reshape(-1).to(device=points.device)
         points = points[selection]
     if points.numel() == 0:
         raise ValueError("The subject mask is empty - nothing to orbit.")
@@ -116,7 +127,8 @@ def _otsu_threshold(values, bins=64):
     if high - low < 1e-9:
         return high
     histogram = torch.histc(values, bins=bins, min=low, max=high)
-    centres = low + (high - low) * (torch.arange(bins, dtype=torch.float32) + 0.5) / bins
+    centres = low + (high - low) * (torch.arange(bins, dtype=torch.float32,
+                                                device=values.device) + 0.5) / bins
     weights = histogram / histogram.sum()
     omega = torch.cumsum(weights, dim=0)
     means = torch.cumsum(weights * centres, dim=0)
@@ -148,31 +160,55 @@ def subject_points(depth, mask=None):
     return split_subject(surface_points(depth))
 
 
-def sphere_of(points):
-    """Robust (centre, radius) of a point set: median centre, 90th-percentile distance."""
-    centre = torch.stack([points[:, axis].median() for axis in range(3)])
-    radius = _percentile((points - centre).norm(dim=-1), 0.90)
-    return centre, max(radius, 1e-6)
+def geometric_pivot(points):
+    """Robust 3D bounding-box midpoint of a point set: the *volumetric* centre.
 
-
-def speed_limited_span(desired_span, radius, content_radius, frames, max_speed):
-    """(span_deg, travel_per_frame, limited, azimuth_per_frame) for one orbit.
-
-    The camera travels `radius * azimuth` along the arc; its budget is `max_speed *
-    content_radius` per frame, and the azimuth never exceeds `MAX_AZIMUTH_PER_FRAME`.
-    `content_radius` (subject or scene radius) makes the cap gauge- and resolution-independent:
-    every number is a ratio, not a metre.
+    Per-axis 2 %/98 % percentiles clip stray points, then the midpoint of that box is taken.
+    Unlike a plain median (which hugs the dense front face, because that is where most samples
+    sit) this sits in the middle of the depth profile, so an orbit around it keeps the subject
+    centred from every side. Returns (midpoint [3], extents [3]).
     """
+    low = torch.tensor([_percentile(points[:, axis], PIVOT_PERCENTILE_LOW / 100.0)
+                        for axis in range(3)], dtype=points.dtype, device=points.device)
+    high = torch.tensor([_percentile(points[:, axis], PIVOT_PERCENTILE_HIGH / 100.0)
+                         for axis in range(3)], dtype=points.dtype, device=points.device)
+    midpoint = (low + high) / 2.0
+    extents = (high - low).clamp(min=1e-6)
+    return midpoint, extents
+
+
+def pivot_radius(points, pivot):
+    """90th-percentile distance from a pivot: the radius that encloses the content."""
+    return max(_percentile((points - pivot).norm(dim=-1), 0.90), 1e-6)
+
+
+def validate_frames(frames):
+    """The frame count as an int, checked against the node's CAMERA_FRAME_OPTIONS."""
     frames = int(frames)
-    if frames < 2:
-        raise ValueError("A camera path needs at least two frames.")
-    budget_per_frame = max(1e-6, _finite(max_speed, "Max camera speed")) * max(1e-6, content_radius)
-    azimuth_cap = MAX_AZIMUTH_PER_FRAME * (frames - 1)
-    span = min(_finite(desired_span, "Desired swing"), azimuth_cap)
-    span = min(span, math.degrees(budget_per_frame / max(radius, 1e-6)) * (frames - 1))
-    span = max(0.0, span)
-    per_frame = span / (frames - 1)
-    return span, math.radians(per_frame) * radius, span < desired_span - 1e-9, per_frame
+    if frames not in {int(value) for value in CAMERA_FRAME_OPTIONS}:
+        raise ValueError(
+            f"Unsupported Meridian frame count {frames}; choose {', '.join(CAMERA_FRAME_OPTIONS)}."
+        )
+    return frames
+
+
+def _fit_amplitude(samples_of, budget_per_frame, ladder=AMPLITUDE_STEPS):
+    """Largest amplitude scale whose path keeps every per-frame step within the speed budget.
+
+    The path is sampled at full amplitude first, the true camera travel between consecutive
+    frames is measured, then the amplitudes are scaled down the ladder until the step fits. Every
+    number stays a *ratio* to the content radius, so the estimate is scale-, resolution- and
+    gauge-independent. Returns (scale, samples, travel_per_frame).
+    """
+    scale, samples, travel = 1.0, [], 0.0
+    for step in range(ladder):
+        scale = round(1.0 - 0.025 * step, 3)
+        samples = samples_of(scale)
+        travel = max((math.dist(samples[index - 1], samples[index])
+                      for index in range(1, len(samples))), default=0.0)
+        if travel <= budget_per_frame:
+            break
+    return scale, samples, travel
 
 
 def _place(centre, radius, yaw_degrees, elevation_degrees):
@@ -201,86 +237,234 @@ def _key_frames(frames, target=KEY_TARGET):
     return ticks
 
 
-def build_path_document(frames, centre, radius, span, elevation, name, description):
-    """The MERIDIAN_CAMERA_PATH JSON for one speed-limited orbit plus its parsed keys."""
-    frames = int(frames)
-    if frames not in {int(value) for value in CAMERA_FRAME_OPTIONS}:
-        raise ValueError(
-            f"Unsupported Meridian frame count {frames}; choose {', '.join(CAMERA_FRAME_OPTIONS)}."
-        )
-    keys = []
-    for tick in _key_frames(frames):
-        fraction = tick / (frames - 1)
-        position = _place(centre, radius, span * fraction, -elevation + 2.0 * elevation * fraction)
-        keys.append({
-            "pos": [round(value, 6) for value in position],
-            "look": [round(float(value), 6) for value in centre],
-            "src": int(tick),
-            "t": int(tick),
-        })
-    document = {"name": name, "description": description, "frames": frames,
-                "stations": ["Auto"], "path": keys}
-    return json.dumps(document, separators=(",", ":"), allow_nan=False), keys
+def subject_samples(frames, pivot, radius, scale=1.0):
+    """Per-frame positions of the subject path: a big front O-orbit, then a height lap.
 
-
-def estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DEFAULT_MAX_SPEED,
-                         subject_mask=None, model_size="", depth_res=AUTO_DEPTH_RES,
-                         device=None, depth_fn=None):
-    """(signal JSON, summary) for one still: probe the surface, size the orbit, cap the speed.
-
-    `target` is "subject" (the mask input, else the near depth layer) or "scene" (the whole
-    reconstructed surface). The camera starts in front of the centre - the source camera's side,
-    yaw 0 - swings away from it and rises/falls by the target's elevation range while always
-    looking at the centre. The summary carries every number behind the decision, for the node's
-    console line. `depth_fn` injects a depth map instead of running a depth model (tests).
+    Phase 1 (FRONT_ORBIT_SHARE of the frames) traces a big closed loop in front of the subject -
+    the azimuth swings +/-FRONT_YAW_AMPLITUDE while the elevation goes low, level, high, level
+    and back - so the front is shown from below, right, above and left in one move. Phase 2 laps
+    the rest (REST_YAW_SPAN) while the elevation eases from the loop's low point up to
+    REST_ELEVATION_HIGH: the back gets *new heights* instead of a flat ring, and the path ends on
+    surface the front loop did not show. `scale` is the speed-fit amplitude.
     """
     frames = int(frames)
-    if frames not in {int(value) for value in CAMERA_FRAME_OPTIONS}:
-        raise ValueError(
-            f"Unsupported Meridian frame count {frames}; choose {', '.join(CAMERA_FRAME_OPTIONS)}."
-        )
+    yaw_amplitude = FRONT_YAW_AMPLITUDE * scale
+    elevation_amplitude = FRONT_ELEVATION * scale
+    rest_span = REST_YAW_SPAN * scale
+    rest_high = REST_ELEVATION_HIGH * scale
+    split = max(1.0, (frames - 1) * FRONT_ORBIT_SHARE)
+    positions = []
+    for index in range(frames):
+        if index <= split:
+            phase = index / split
+            yaw = yaw_amplitude * math.sin(2.0 * math.pi * phase)
+            elevation = -elevation_amplitude * math.cos(2.0 * math.pi * phase)
+        else:
+            phase = (index - split) / max(1.0, (frames - 1) - split)
+            yaw = rest_span * phase
+            elevation = -elevation_amplitude + (rest_high + elevation_amplitude) * (
+                1.0 - math.cos(math.pi * phase)) / 2.0
+        positions.append(_place(pivot, radius, yaw, elevation))
+    return positions
+
+
+def scene_samples(frames, pivot, radius, scale=1.0):
+    """Per-frame positions of the scene path: one big oval lap around the whole scene.
+
+    A near-full azimuth lap (SCENE_SPAN) at SCENE_FILL x the scene radius whose elevation eases
+    from just below the horizon to well above it: the camera rises while it goes round, so the
+    move reads as a big oval orbit *over* the scene instead of a flat ring. `scale` is the
+    speed-fit amplitude.
+    """
+    frames = int(frames)
+    span = SCENE_SPAN * scale
+    low = SCENE_ELEVATION_LOW * scale
+    high = SCENE_ELEVATION_HIGH * scale
+    positions = []
+    for index in range(frames):
+        phase = index / max(1, frames - 1)
+        yaw = span * phase
+        elevation = low + (high - low) * (1.0 - math.cos(math.pi * phase)) / 2.0
+        positions.append(_place(pivot, radius, yaw, elevation))
+    return positions
+
+
+def automatic_keys(frames, pivot, radius, content_radius, target, max_speed=DEFAULT_MAX_SPEED):
+    """(keys, info) for the automatic path of `target`: subject composite or scene oval.
+
+    The path is fitted to the speed budget by scaling its amplitudes; the keys are the
+    Catmull-Rom control points the Geometry node samples (evenly spaced, whole frame indices).
+    """
+    frames = validate_frames(frames)
+    budget = max(1e-6, _finite(max_speed, "Max camera speed")) * max(1e-6, content_radius)
+    if str(target).strip().lower() == SUBJECT_TARGET:
+        samples_of = lambda scale: subject_samples(frames, pivot, radius, scale)
+        style = "front O-orbit + height lap"
+    else:
+        samples_of = lambda scale: scene_samples(frames, pivot, radius, scale)
+        style = "big scene oval"
+    scale, samples, travel = _fit_amplitude(samples_of, budget)
+    keys = [{
+        "pos": [round(value, 6) for value in samples[tick]],
+        "look": [round(float(value), 6) for value in pivot],
+        "src": int(tick),
+        "t": int(tick),
+    } for tick in _key_frames(frames)]
+    info = {"style": style, "amplitude_scale": scale, "travel_per_frame": travel,
+            "budget_per_frame": budget, "keys": len(keys)}
+    return keys, info
+
+
+def document_from_keys(frames, keys, name, description):
+    """The MERIDIAN_CAMERA_PATH JSON for a finished key list (used by both camera paths)."""
+    frames = validate_frames(frames)
+    document = {"name": name, "description": description, "frames": frames,
+                "stations": ["Auto"], "path": keys}
+    return json.dumps(document, separators=(",", ":"), allow_nan=False)
+
+
+def probe_surface(reference, target=SUBJECT_TARGET, subject_mask=None, model_size="",
+                  depth_res=AUTO_DEPTH_RES, device=None, depth_fn=None):
+    """One depth pass -> everything the automatic camera mode needs to know.
+
+    Returns the scene cloud, the target's *geometric pivot* (the midpoint of its depth profile's
+    bounding box, not the dense-surface median), the enclosing radius and the labels for the
+    summary. Both automatic paths start here: the automatic one builds its orbit from it, the
+    manual one only takes the pivot (plus the user's offset) - and both run the collision guard
+    against this cloud. `depth_fn` injects a depth map instead of running a depth model (tests).
+    """
     target = str(target or SUBJECT_TARGET).strip().lower()
     if target not in AUTO_TARGETS:
         raise ValueError(f"Automatic camera target must be one of {', '.join(AUTO_TARGETS)}.")
-
     depth = (depth_fn(reference) if depth_fn is not None else
              depth_from_reference(reference, model_size=model_size, depth_res=depth_res,
                                   device=device))
     cloud = surface_points(depth)
-    scene_centre, scene_radius = sphere_of(cloud)
+    scene_pivot, scene_extents = geometric_pivot(cloud)
+    scene_radius = pivot_radius(cloud, scene_pivot)
     if target == SUBJECT_TARGET:
         points, source_label = subject_points(depth, mask=subject_mask)
-        centre, content_radius = sphere_of(points)
-        fill, desired_span, elevation = SUBJECT_FILL, SUBJECT_SPAN, SUBJECT_ELEVATION
-        mode_label = "subject orbit"
+        pivot, extents = geometric_pivot(points)
+        radius = pivot_radius(points, pivot)
     else:
         points, source_label = cloud, "whole surface (scene)"
-        centre, content_radius = scene_centre, scene_radius
-        fill, desired_span, elevation = SCENE_FILL, SCENE_SPAN, SCENE_ELEVATION
-        mode_label = "scene scan"
+        pivot, extents, radius = scene_pivot, scene_extents, scene_radius
+    return {
+        "target": target, "source": source_label,
+        "scene_points": cloud, "scene_radius": float(scene_radius),
+        "scene_pivot": [float(value) for value in scene_pivot],
+        "scene_extents": [float(value) for value in scene_extents],
+        "points": int(cloud.shape[0]),
+        "content_points": int(points.shape[0]),
+        "pivot": [float(value) for value in pivot],
+        "extents": [float(value) for value in extents],
+        "content_radius": float(radius),
+    }
 
+
+def offset_pivot(surface, offsets):
+    """The surface's pivot shifted by the user's offset (fractions of the content radius).
+
+    The automatic pivot is the algorithm's answer; this is how the user nudges it without
+    touching the estimate - the same three numbers the manual path would otherwise set, only
+    relative to what the depth profile says.
+    """
+    radius = max(1e-6, float(surface["content_radius"]))
+    return [float(surface["pivot"][axis]) + _finite(offsets[axis], "Pivot offset") * radius
+            for axis in range(3)]
+
+
+def guard_collisions(keys, surface, margin=COLLISION_MARGIN):
+    """Push camera keys out of the scene until none sits closer than `margin` to any point.
+
+    The distance to the scene points is checked for every key (the cloud is strided down to a
+    bounded pool); offending keys move *away from the pivot* - the direction that keeps the
+    subject framed - and are re-checked, up to COLLISION_ITERATIONS times. The margin is measured
+    in content radii, so it scales with the subject (or scene) that is being orbited instead of
+    with the reconstruction's absolute units. Returns (keys, fixed, worst_before, worst_after),
+    the two clearances as content-radius fractions.
+    """
+    cloud = surface["scene_points"]
+    unit = max(1e-6, float(surface["content_radius"]))
+    clearance = max(0.0, _finite(margin, "Collision margin")) * unit
+    if cloud.shape[0] == 0 or clearance <= 0.0 or not keys:
+        return keys, 0, math.inf, math.inf
+    stride = max(1, int(cloud.shape[0]) // COLLISION_MAX_POINTS)
+    pool = cloud[::stride]
+    pivot = torch.tensor(surface["pivot"], dtype=pool.dtype, device=pool.device)
+    positions = torch.tensor([key["pos"] for key in keys], dtype=pool.dtype, device=pool.device)
+    distances = torch.cdist(positions, pool).amin(dim=1)
+    worst_before = float(distances.min()) / unit
+    fixed = set()
+    for _ in range(COLLISION_ITERATIONS):
+        offenders = torch.nonzero(distances < clearance, as_tuple=False).flatten().tolist()
+        if not offenders:
+            break
+        for index in offenders:
+            fixed.add(index)
+            direction = positions[index] - pivot
+            length = float(direction.norm())
+            if length < 1e-9:
+                direction, length = positions.new_tensor([0.0, 0.0, -1.0]), 1.0
+            push = (clearance - float(distances[index]) + 1e-3) * 1.15
+            positions[index] = positions[index] + (direction / length) * push
+        distances = torch.cdist(positions, pool).amin(dim=1)
+    for index in sorted(fixed):
+        keys[index]["pos"] = [round(value, 6) for value in positions[index].tolist()]
+    return keys, len(fixed), worst_before, float(distances.min()) / unit
+
+
+def estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DEFAULT_MAX_SPEED,
+                         subject_mask=None, model_size="", depth_res=AUTO_DEPTH_RES,
+                         device=None, depth_fn=None, pivot_offset=(0.0, 0.0, 0.0)):
+    """(signal JSON, summary) for one still: geometric pivot, automatic path, collision guard.
+
+    The pivot is the *geometric midpoint* of the target's depth profile - the robust bounding-box
+    midpoint, so the depth of the subject is what places it, not the picture centre - optionally
+    shifted by `pivot_offset` (in content radii). The path is the subject composite (front
+    O-orbit + height lap) or the scene's big oval, fitted to the speed budget; the camera never
+    comes closer to the scene than COLLISION_MARGIN x the content radius. The summary carries every
+    number behind the decision, for the node's console line. `depth_fn` injects a depth map
+    instead of running a depth model (tests).
+    """
+    frames = validate_frames(frames)
+    surface = probe_surface(reference, target=target, subject_mask=subject_mask,
+                            model_size=model_size, depth_res=depth_res, device=device,
+                            depth_fn=depth_fn)
+    target = surface["target"]
+    max_speed = _finite(max_speed, "Max camera speed")
+    pivot = offset_pivot(surface, pivot_offset)
+    content_radius = max(1e-6, float(surface["content_radius"]))
+    fill = SUBJECT_FILL if target == SUBJECT_TARGET else SCENE_FILL
     orbit_radius = max(fill * content_radius, MIN_ORBIT_RADIUS)
-    span, travel, limited, azimuth_per_frame = speed_limited_span(
-        desired_span, orbit_radius, content_radius, frames, max_speed)
+    keys, info = automatic_keys(frames, pivot, orbit_radius, content_radius, target, max_speed)
+    keys, fixed, worst_before, worst_after = guard_collisions(keys, surface)
     description = (
-        f"Estimated from the still's surface ({source_label}): {mode_label} at {fill:g}x the "
-        f"content radius ({orbit_radius:.3g} vs {content_radius:.3g} units), {span:.1f} deg of "
-        f"azimuth over {frames} frames ({azimuth_per_frame:.2f} deg/frame, {travel:.3g} "
-        f"units/frame; budget {float(max_speed) * 100:.0f} % of the content radius per frame"
-        + (", swing shortened to fit the budget" if limited else "") + "). The camera starts in "
-        f"front of the centre, always looks at it and rises/falls by {elevation:g} deg. "
-        "Non-front views are synthetic depth reprojections, not observed geometry."
+        f"Estimated from the still's surface ({surface['source']}): pivot "
+        f"[{pivot[0]:.3g}, {pivot[1]:.3g}, {pivot[2]:.3g}] is the geometric midpoint of the "
+        f"depth profile ({surface['extents'][0]:.3g} x {surface['extents'][1]:.3g} x "
+        f"{surface['extents'][2]:.3g} units), {info['style']} at {fill:g}x the content radius "
+        f"({orbit_radius:.3g} vs {content_radius:.3g} units), amplitudes at "
+        f"{info['amplitude_scale']:.2f} of full ({info['travel_per_frame']:.3g} units per frame, "
+        f"budget {max_speed * 100:.0f} % of the content radius per frame)"
+        + (f"; {fixed} key(s) pushed clear of the scene geometry" if fixed else "")
+        + ". Non-front views are synthetic depth reprojections, not observed geometry."
     )
-    document, keys = build_path_document(frames, centre, orbit_radius, span, elevation,
-                                         f"Auto {mode_label} ({frames} frames)", description)
+    document = document_from_keys(frames, keys, f"Auto {info['style']} ({frames} frames)",
+                                  description)
     summary = {
-        "target": target, "frames": frames, "source": source_label,
-        "points": int(points.shape[0]), "scene_radius": float(scene_radius),
-        "centre": [float(value) for value in centre], "content_radius": float(content_radius),
-        "orbit_radius": float(orbit_radius), "swing": span, "desired_swing": desired_span,
-        "elevation": elevation, "azimuth_per_frame": azimuth_per_frame,
-        "travel_per_frame": travel, "speed_limited": limited, "keys": len(keys),
-        "max_speed": float(max_speed),
+        "target": target, "frames": frames, "source": surface["source"],
+        "points": surface["points"], "content_points": surface["content_points"],
+        "pivot": pivot, "extents": surface["extents"],
+        "pivot_offset": [float(value) for value in pivot_offset],
+        "content_radius": content_radius, "orbit_radius": float(orbit_radius),
+        "style": info["style"], "amplitude_scale": info["amplitude_scale"],
+        "travel_per_frame": info["travel_per_frame"],
+        "budget_per_frame": info["budget_per_frame"], "keys": info["keys"],
+        "max_speed": max_speed, "scene_radius": float(surface["scene_radius"]),
+        "scene_pivot": surface["scene_pivot"], "collision_fixes": fixed,
+        "collision_margin": COLLISION_MARGIN, "clearance_before": worst_before,
+        "clearance_after": worst_after,
     }
     return document, summary
 
@@ -321,15 +505,19 @@ def depth_from_reference(reference, model_size="", depth_res=AUTO_DEPTH_RES, dev
 
 
 def format_summary(summary):
-    """One console-friendly line describing an estimate (used by the picker node)."""
+    """One console-friendly line describing an estimate (used by the node)."""
     line = (
-        f"auto camera: {summary['target']} orbit around "
-        f"[{summary['centre'][0]:.3g}, {summary['centre'][1]:.3g}, {summary['centre'][2]:.3g}] "
-        f"- {summary['source']}, radius {summary['orbit_radius']:.3g} "
-        f"({summary['swing']:.0f}/{summary['desired_swing']:.0f} deg over {summary['frames']} "
-        f"frames, {summary['azimuth_per_frame']:.2f} deg + {summary['travel_per_frame']:.3g} "
-        f"units per frame, {summary['keys']} keys)"
+        f"auto camera: {summary['style']} around "
+        f"[{summary['pivot'][0]:.3g}, {summary['pivot'][1]:.3g}, {summary['pivot'][2]:.3g}] "
+        f"- the geometric midpoint of the {summary['target']} depth profile "
+        f"({summary['extents'][0]:.3g} x {summary['extents'][1]:.3g} x "
+        f"{summary['extents'][2]:.3g} units, {summary['source']}), radius "
+        f"{summary['orbit_radius']:.3g} over {summary['frames']} frames "
+        f"({summary['travel_per_frame']:.3g} units/frame at {summary['amplitude_scale']:.2f}x "
+        f"amplitude, budget {summary['max_speed'] * 100:.0f} %/frame, {summary['keys']} keys)"
     )
-    if summary["speed_limited"]:
-        line += f" - swing shortened to stay under {summary['max_speed'] * 100:.0f} %/frame"
+    if summary["collision_fixes"]:
+        line += (f" - {summary['collision_fixes']} key(s) pushed out of the scene "
+                 f"(closest approach {summary['clearance_before'] * 100:.1f} % -> "
+                 f"{summary['clearance_after'] * 100:.1f} % of the content radius)")
     return line
