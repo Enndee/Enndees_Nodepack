@@ -144,16 +144,16 @@ Use **Camera Mode** instead - manual path or automatic estimate. The retired
 **Meridian Parameter Picker** and **Meridian Camera Path Configurator** nodes
 were replaced by this one; re-add it in workflows that still reference them.
 
-### Meridian Geometry IMAGE input: stills and video batches
+### Meridian Geometry IMAGE input
 
 The `image` socket on **Meridian Geometry (Enndee)** accepts one still or a
-multi-frame ComfyUI IMAGE batch; with a `custom_camera` signal connected the
-Geometry node repeats the first frame to the path's length itself, writes a
-temporary camera-path JSON and passes both to Meridian. Repeated stills only
-satisfy Meridian's source-frame indexing - they do not add observed backside
-geometry, so inspect the geometry preview for holes/stretching before using the
-render as an H3 video reference. Restart ComfyUI after updating the node pack
-to register the new node.
+multi-frame ComfyUI IMAGE batch; the fast-depth backend renders from the first
+frame and repeats it for every flight frame, so a batch only decides which
+picture is used. A `video` path works the same way when no image is connected:
+the node decodes its first frame. Repeated stills do not add observed backside
+geometry - the back-facing views are depth reprojections - so inspect the render
+for holes or stretching before feeding it to H3. Restart ComfyUI after updating
+the node pack to register the new node.
 
 ## Node: Lichtfeld Headless Trainer (Enndee)
 

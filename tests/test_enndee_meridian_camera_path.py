@@ -398,158 +398,59 @@ class MeridianCameraPathConfiguratorTests(unittest.TestCase):
                 build_meridian_custom_camera(*values)
 
 class MeridianGeometryCustomCameraTests(unittest.TestCase):
-    class CompletedProcess:
-        stdout = "source 512x512 -> canvas (736, 544)"
+    """The custom_camera signal now drives the in-process fast-depth renderer directly."""
 
-        @staticmethod
-        def check_returncode():
-            return None
-
-    def test_custom_camera_repeats_first_image_and_overrides_motion_arguments(self):
+    def test_custom_camera_is_forwarded_to_the_fast_renderer(self):
         signal = build_meridian_custom_camera("73", ["Front", "Left"], 0.28, 0, 0, 1)
-        image = torch.zeros((4, 16, 24, 3), dtype=torch.float32)
-        image[0, ..., 0] = 1.0
-        image[1, ..., 1] = 1.0
-        image[2, ..., 2] = 1.0
-        image[3, ...] = 0.5
-        observed = {}
+        captured = {}
 
-        def run_meridian(command, **kwargs):
-            observed["command"] = command
-            video_path = Path(command[command.index("--video") + 1])
-            path_path = Path(command[command.index("--camera-path") + 1])
-            observed["video_path"] = video_path
-            observed["path_path"] = path_path
-            observed["camera_json"] = json.loads(path_path.read_text(encoding="utf-8"))
-            with av.open(str(video_path)) as container:
-                observed["frames"] = [frame.to_ndarray(format="rgb24") for frame in container.decode(video=0)]
-            observed["video_exists_during_run"] = video_path.is_file()
-            observed["json_exists_during_run"] = path_path.is_file()
-            return self.CompletedProcess()
+        def fake_render(first, device, **kwargs):
+            captured["first"] = first
+            captured.update(kwargs)
+            return (torch.zeros(73, 8, 12, 3), torch.ones(73, 8, 12, 3), 736, 544, 73)
 
-        with (
-            mock.patch.object(geometry.subprocess, "run", side_effect=run_meridian),
-            mock.patch.object(
-                geometry,
-                "_frames",
-                side_effect=[torch.zeros((73, 8, 12, 3)), torch.ones((73, 8, 12, 3))],
-            ),
-        ):
+        with mock.patch.object(geometry, "render_depth_aligned", side_effect=fake_render):
             result = geometry.EnndeeMeridianGeometry().build(
                 video="unused.mp4",
-                args="--freeze 0:73 --yaw 40 --frames 124 --camera-path stale.json --vggt-repo repo --vggt checkpoint.pt --cull",
-                repo="meridian",
-                python="python",
-                image=image,
+                args="--freeze 0:73 --yaw 40 --frames 124",
+                image=torch.zeros((4, 16, 24, 3), dtype=torch.float32),
                 custom_camera=signal,
             )
 
-        command = observed["command"]
-        self.assertEqual(command[command.index("--frames") + 1], "73")
-        self.assertEqual(command[command.index("--camera-path") + 1], str(observed["path_path"]))
-        self.assertEqual(command[command.index("--start") + 1], "0")
-        self.assertIn("--cull", command)
-        for conflicting in ("--freeze", "--yaw", "--follow", "stale.json"):
-            self.assertNotIn(conflicting, command)
-        self.assertEqual(observed["camera_json"]["frames"], 73)
-        self.assertEqual(observed["camera_json"]["path"][-1]["t"], 72)
-        self.assertEqual(len(observed["frames"]), 73)
-        self.assertTrue(observed["video_exists_during_run"])
-        self.assertTrue(observed["json_exists_during_run"])
-        for frame in observed["frames"]:
-            self.assertTrue(np.all(frame[..., 0] > 240))
-            self.assertTrue(np.all(frame[..., 1] < 10))
-        self.assertFalse(observed["video_path"].exists())
-        self.assertFalse(observed["path_path"].exists())
+        self.assertEqual(captured["custom_camera"], signal)
+        self.assertEqual(captured["frames"], 73)                  # the path wins over --frames
+        self.assertEqual(captured["first"].shape, (1, 16, 24, 3))  # first image frame only
         self.assertEqual(result[2:], (736, 544, 73))
 
-    def test_custom_camera_can_use_first_frame_from_video_path(self):
+    def test_custom_camera_uses_the_first_video_frame_without_an_image(self):
         signal = build_meridian_custom_camera("73", ["Front"], 0.28, 0, 0, 1)
-        frames = np.zeros((2, 12, 16, 3), dtype=np.uint8)
-        frames[0, ..., 2] = 255
-        frames[1, ..., 0] = 255
-        with tempfile.TemporaryDirectory() as temp_dir:
-            input_video = Path(temp_dir) / "input.mp4"
-            geometry._write_rgb_frames_video(frames, str(input_video))
-            observed = {}
+        frame = torch.full((12, 16, 3), 0.25)
+        captured = {}
 
-            def run_meridian(command, **kwargs):
-                path = Path(command[command.index("--video") + 1])
-                with av.open(str(path)) as container:
-                    observed["frames"] = [frame.to_ndarray(format="rgb24") for frame in container.decode(video=0)]
-                observed["path"] = path
-                return self.CompletedProcess()
+        def fake_render(first, device, **kwargs):
+            captured["first"] = first
+            return (torch.zeros(73, 8, 12, 3), torch.zeros(73, 8, 12, 3), 736, 544, 73)
 
-            with (
-                mock.patch.object(geometry.subprocess, "run", side_effect=run_meridian),
-                mock.patch.object(
-                    geometry,
-                    "_frames",
-                    side_effect=[torch.zeros((73, 8, 12, 3)), torch.zeros((73, 8, 12, 3))],
-                ),
-            ):
+        with mock.patch.object(geometry, "render_depth_aligned", side_effect=fake_render), \
+                mock.patch.object(geometry, "_read_first_video_frame", return_value=frame), \
+                mock.patch.object(geometry.os.path, "isfile", return_value=True):
+            geometry.EnndeeMeridianGeometry().build(video="clip.mp4", args="--frames 73",
+                                                    custom_camera=signal)
+
+        self.assertEqual(captured["first"].shape, (1, 12, 16, 3))
+        self.assertAlmostEqual(float(captured["first"].mean()), 0.25, places=5)
+
+    def test_malformed_signals_are_rejected_before_any_render(self):
+        with mock.patch.object(geometry, "render_depth_aligned",
+                               side_effect=AssertionError("no render for a bad signal")):
+            with self.assertRaisesRegex(ValueError, "valid signal"):
                 geometry.EnndeeMeridianGeometry().build(
-                    video=str(input_video),
-                    args="",
-                    repo="meridian",
-                    python="python",
-                    custom_camera=signal,
-                )
-
-        self.assertEqual(len(observed["frames"]), 73)
-        self.assertTrue(all(frame[..., 2].mean() > frame[..., 0].mean() for frame in observed["frames"]))
-        self.assertFalse(observed["path"].exists())
-
-    def test_custom_camera_signal_validation_rejects_invalid_source_mapping(self):
-        data = json.loads(build_meridian_custom_camera("73", ["Front"], 0.28, 0, 0, 1))
-        data["path"][-1]["src"] = 71
-        with self.assertRaisesRegex(ValueError, "src equal to t"):
-            geometry._parse_custom_camera(json.dumps(data))
-
-    def test_legacy_single_image_mode_keeps_png_behavior_without_custom_signal(self):
-        image = torch.zeros((1, 8, 10, 3), dtype=torch.float32)
-        observed = {}
-
-        def run_meridian(command, **kwargs):
-            observed["command"] = command
-            input_path = Path(command[command.index("--video") + 1])
-            observed["path"] = input_path
-            observed["exists_during_run"] = input_path.is_file()
-            return self.CompletedProcess()
-
-        with (
-            mock.patch.object(geometry.subprocess, "run", side_effect=run_meridian),
-            mock.patch.object(
-                geometry,
-                "_frames",
-                side_effect=[torch.zeros((73, 8, 10, 3)), torch.zeros((73, 8, 10, 3))],
-            ),
-        ):
-            geometry.EnndeeMeridianGeometry().build(
-                video="unused.mp4",
-                args="--freeze 0:73",
-                repo="meridian",
-                python="python",
-                image=image,
-            )
-
-        self.assertEqual(observed["path"].suffix, ".png")
-        self.assertTrue(observed["exists_during_run"])
-        self.assertFalse(observed["path"].exists())
-        self.assertIn("--freeze", observed["command"])
-
-    def test_custom_path_removes_equals_form_motion_flags_and_keeps_quoted_windows_paths(self):
-        args = (
-            '--freeze=0:73 --yaw=90 --vggt-repo "D:\\Model Store\\VGGT" '
-            '--vggt "D:\\Weights\\vggt.pt" --cull'
-        )
-        command_args = geometry._args_for_custom_camera(args, "camera path.json", 73)
-        self.assertNotIn("--freeze", command_args)
-        self.assertNotIn("--yaw", command_args)
-        self.assertEqual(command_args[command_args.index("--vggt-repo") + 1], "D:/Model Store/VGGT")
-        self.assertEqual(command_args[command_args.index("--vggt") + 1], "D:/Weights/vggt.pt")
-        self.assertEqual(command_args[command_args.index("--camera-path") + 1], "camera path.json")
-        self.assertIn("--cull", command_args)
+                    video="unused.mp4", args="--frames 73", image=torch.zeros(1, 8, 12, 3),
+                    custom_camera="not-json")
+            with self.assertRaisesRegex(ValueError, "missing its camera-path keyframes"):
+                geometry.EnndeeMeridianGeometry().build(
+                    video="unused.mp4", args="--frames 73", image=torch.zeros(1, 8, 12, 3),
+                    custom_camera="{}")
 
 
 if __name__ == "__main__":
