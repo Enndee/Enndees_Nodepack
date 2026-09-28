@@ -31,11 +31,17 @@ alignment, so `_load_da3_api` swaps in raise-on-use stubs for
 the model code itself then needs only torch, einops, addict and omegaconf. Import takes
 ~1.7 s and a still costs ~0.4 s on a Blackwell GPU.
 
-Both families resize before inference. Depth-Anything-3 caps the *longest* side at `process_res`
-(default `DA3_RES` = 504, aspect preserved, then rounded to multiples of 14), so `depth_res=0`
-means "run the still at its own resolution": the finer grid keeps smaller depth steps alive
-through the edge mask and the cloud rebuild, at a cost that grows with the square of the pixel
-count. Depth-Anything-V2 always runs at its native 518 square (`DEPTH_RES`).
+Both families resize before inference. `depth_res` caps the *still's* longest side: a larger
+picture is bilinearly downsized before the depth model, the frame colours and the unprojection
+grid are built (`_fit_working_still`), so a 24 Mpx camera photo cannot build a cloud that trips
+`torch.quantile`'s hard 2**24-element ceiling - `cloud_scale` alone could never shrink a source
+that was already over `MAX_CLOUD_PIXELS` on its own. `depth_res=0` keeps the still's own pixels
+(bounded only by that ceiling) and a still at or below the cap is never upscaled.
+Depth-Anything-3 additionally receives the cap as its own `process_res` (aspect preserved,
+rounded to multiples of 14 by the library; values above the still's side upscale), while
+Depth-Anything-V2 keeps its native 518 square (`DEPTH_RES`) - the still and the cloud follow
+the same cap for both families, so a finer grid keeps smaller depth steps alive through the
+edge mask and the cloud rebuild at a cost that grows with the square of the pixel count.
 
 Two render guards mirror Meridian's own pipeline (recam/geometry.py, inference/sample.py):
 
@@ -76,9 +82,10 @@ VFOV_DEGREES = 55.0                   # assumed vertical field of view of the so
 DEPTH_NEAR, DEPTH_FAR = 1.0, 5.0      # metric window the relative depth is mapped onto (the gauge is zm-relative)
 DEPTH_PCT_LO, DEPTH_PCT_HI = 0.01, 0.99   # percentile clip so one speck cannot squash the range
 PIVOT_WINDOW = 0.05                   # Meridian's +-5 % window around a picked pivot point
-MAX_CLOUD_PIXELS = 16_777_216         # unprojection-grid safety cap (16 M points)
+MAX_CLOUD_PIXELS = 16_777_216         # unprojection-grid + working-still ceiling (2**24 pixels)
+QUANTILE_MAX = 1 << 24                # torch.quantile's hard element limit (`numel <= 2**24`)
 DEPTH_RES = 518                       # Depth-Anything-V2's native square input side
-DA3_RES = 504                         # Depth-Anything-3 default `process_res` (longest-side cap; depth_res 0 = source)
+DA3_RES = 504                         # default `depth_res`: still + Depth-Anything-3 longest-side cap (0 = source)
 DISPARITY_EPS = 0.001                 # floor before the 1/x inversion, so the far plane stays finite
 KEEP_PARENT_RATIO = 0.999             # recam/geometry.py `upsample`: a hi-res pixel needs every parent kept
 
@@ -212,6 +219,49 @@ def _da3_process_res(depth_res, width: int, height: int) -> int:
     longest = max(int(width), int(height))
     cap = int(depth_res or 0)
     return cap if cap > 0 else longest
+
+
+def _fit_working_still(first: torch.Tensor, depth_res) -> Tuple[torch.Tensor, Optional[str]]:
+    """Downscale a too-big still to `depth_res`' longest side (0 = its own resolution).
+
+    `depth_res` is the *working-resolution* cap of the whole fast path: the depth model, the
+    frame colours and the unprojection grid are all built from this still, so a camera photo
+    (24 Mpx and up) is resized here instead of further down, where the pool handed to
+    `torch.quantile` would exceed ATen's hard 2**24-element ceiling. The `MAX_CLOUD_PIXELS`
+    ceiling also applies when `depth_res=0` asks for the own resolution, because there
+    `cloud_scale` can no longer shrink the base grid. Never upscales: a still at or below both
+    caps is returned unchanged, together with the note to print (or `None` when nothing moved).
+    """
+    height, width = int(first.shape[1]), int(first.shape[2])
+    cap = int(depth_res or 0)
+    side_cap = cap / float(max(width, height)) if cap > 0 else 1.0
+    area_cap = math.sqrt(MAX_CLOUD_PIXELS / float(width * height))
+    factor = min(side_cap, area_cap)
+    if factor >= 1.0:
+        return first, None
+    # the 1e-6 tolerance absorbs the float error of `cap / max(width, height)`, so an exact
+    # fraction (2400 px at cap 400) lands on 400 instead of one pixel short
+    new_w = max(1, int(math.floor(width * factor + 1e-6)))
+    new_h = max(1, int(math.floor(height * factor + 1e-6)))
+    small = F.interpolate(first.permute(0, 3, 1, 2), size=(new_h, new_w), mode="bilinear",
+                          align_corners=False).permute(0, 2, 3, 1)
+    reason = f"depth_res {cap} cap" if side_cap <= area_cap else f"MAX_CLOUD_PIXELS {MAX_CLOUD_PIXELS} cap"
+    return small, f"still {width}x{height} -> {new_w}x{new_h} ({reason})"
+
+
+def _flat_quantile(pool: torch.Tensor, q: float) -> torch.Tensor:
+    """`torch.quantile` for pools of any size: ATen rejects inputs above 2**24 elements.
+
+    The unprojection grid sits exactly on `MAX_CLOUD_PIXELS`, which is that same 2**24, so a
+    boundary overshoot alone would crash a long flight. The percentile clip only needs the
+    shape of the distribution, so bigger pools are strided down first - the stride walks the
+    whole field instead of cropping it to one corner, and the measured 1 %/99 % boundaries
+    stay identical on a monotone ramp.
+    """
+    flat = pool.reshape(-1)
+    if flat.numel() > QUANTILE_MAX:
+        flat = flat[:: -(-flat.numel() // QUANTILE_MAX)]
+    return torch.quantile(flat, q)
 
 
 def _predict_da3_depth(model_name: str, first: torch.Tensor, device: torch.device,
@@ -532,9 +582,14 @@ def render_depth_aligned(first, device, model_size="Depth-Anything-V2-Small-hf",
     `camera`         settings dict from `parse_camera_settings` (None = every default).
     `custom_camera`  Meridian Camera Path Configurator signal; its path and frame count win.
     `back_face_cull` mirrors Meridian's `--cull`; a `--cull` token in `camera` also turns it on.
-    `depth_res`      Depth-Anything-3 longest-side cap: the default `DA3_RES` (504) is the fast
-                     setting and the `0` the node passes turns it into "the still's own
-                     resolution" (maximum depth detail); the V2 models keep their 518 square.
+    `depth_res`      working-resolution cap in pixels: the still's longest side is resized down
+                     to it (`_fit_working_still`, never up) before the depth model, the frame
+                     colours and the cloud grid are built, and Depth-Anything-3 additionally
+                     receives it as its own `process_res` (the library rounds to multiples of
+                     14). `DA3_RES` (504) is the fast default; 0 = the still's own resolution
+                     (maximum depth detail, bounded only by the `MAX_CLOUD_PIXELS` ceiling).
+                     The V2 models keep their native 518 depth grid but the still and the cloud
+                     follow the same cap.
 
     Returns exactly what the VGGT geometry pass returns - (source, render, width, height, length) -
     so the pair drops straight into MeridianRefConditioning as `<Video 1>` / `<Video 2>`.
@@ -551,6 +606,16 @@ def render_depth_aligned(first, device, model_size="Depth-Anything-V2-Small-hf",
     first = first[0:1].to(device=device, dtype=torch.float32).clamp(0.0, 1.0)
     _, src_h, src_w, _ = first.shape
 
+    # working still: `depth_res` caps the picture's longest side, so an oversized input (a 24 Mpx
+    # camera photo) is resized right here - the depth model, the frame colours and the cloud grid
+    # all work from the smaller still, which keeps the pool of the percentile clip below
+    # torch.quantile's hard 2**24-element ceiling. `cloud_scale` alone could never do that: the
+    # scale loop below stops at 1, so a source already over MAX_CLOUD_PIXELS stayed huge.
+    first, resize_note = _fit_working_still(first, depth_res)
+    if resize_note:
+        print(f"[Enndee] Meridian fast depth: {resize_note}", flush=True)
+    _, work_h, work_w, _ = first.shape
+
     # canvas: Meridian's 480-class condition ladder (the trained reference canvas), or explicit
     if canvas_mode == "custom":
         out_w, out_h = int(custom_width), int(custom_height)
@@ -560,7 +625,7 @@ def render_depth_aligned(first, device, model_size="Depth-Anything-V2-Small-hf",
     # --- depth: Depth-Anything-V2 (disparity -> invert) or Depth-Anything-3 (already depth) -------
     if model_size.startswith(DA3_PREFIX):
         depth_low = _predict_da3_depth(model_size, first, device,
-                                       _da3_process_res(depth_res, src_w, src_h))
+                                       _da3_process_res(depth_res, work_w, work_h))
     else:
         depth_model = _get_depth_model(model_size, device)
         mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
@@ -578,14 +643,15 @@ def render_depth_aligned(first, device, model_size="Depth-Anything-V2-Small-hf",
     # cloud grid: the frame (and the depth under it) upscaled so silhouettes get finer points;
     # `_upsample_depth_keep` re-checks the parents, so bilinear cannot bridge a depth jump
     scale = max(1, int(cloud_scale))
-    while scale > 1 and (src_w * scale) * (src_h * scale) > MAX_CLOUD_PIXELS:
+    while scale > 1 and (work_w * scale) * (work_h * scale) > MAX_CLOUD_PIXELS:
         scale -= 1
-    cloud_w, cloud_h = src_w * scale, src_h * scale
+    cloud_w, cloud_h = work_w * scale, work_h * scale
     depth_cloud, keep_cloud = _upsample_depth_keep(depth_low, keep_low, cloud_h, cloud_w)
 
     pool = depth_cloud[keep_cloud] if keep_cloud.any() else depth_cloud.flatten()
-    d_lo = torch.quantile(pool, DEPTH_PCT_LO)
-    d_hi = torch.quantile(pool, DEPTH_PCT_HI)
+    # `_flat_quantile` strides pools past ATen's 2**24-element limit instead of raising
+    d_lo = _flat_quantile(pool, DEPTH_PCT_LO)
+    d_hi = _flat_quantile(pool, DEPTH_PCT_HI)
     # The span floor is relative to the depth magnitude: an absolute floor turns float noise
     # into a fake bumpy surface when the depth is (nearly) constant, which would scramble the
     # `--cull` normals below.

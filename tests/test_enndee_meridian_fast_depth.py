@@ -3,8 +3,9 @@
 The depth model is faked by patching the module's `_get_depth_model` (Depth-Anything-V2) and
 `_predict_da3_depth` (Depth-Anything-3) hooks, so the suite covers signal parsing, the arguments
 parser, canvas bucketing, the ported camera math, depth inversion, the Meridian-style edge keep /
-all-parents upsample, the `--cull` normals and the full unproject + point-render contract without
-downloading or loading any depth model.
+all-parents upsample, the working-still resolution cap, the strided percentile clip, the `--cull`
+normals and the full unproject + point-render contract without downloading or loading any depth
+model.
 
 The V2 fake returns *inverse* depth like the real Depth-Anything-V2 (larger = closer): a near
 pier post reads 4.4 while the far sky reads 0.3. The V3 fakes return true relative depth (larger
@@ -145,6 +146,36 @@ class MeridianFastDepthHelperTests(unittest.TestCase):
         self.assertEqual(fast_depth._da3_process_res(-4, 800, 600), 800)     # defended at the backend
         self.assertEqual(fast_depth._da3_process_res(504, 1024, 1536), 504)  # the fast default
         self.assertEqual(fast_depth._da3_process_res(1008, 64, 112), 1008)   # explicit, even upscaling
+
+    def test_fit_working_still_caps_the_longest_side_and_never_upscales(self):
+        still = _gradient_image(height=400, width=600)
+        capped, note = fast_depth._fit_working_still(still, 300)
+        self.assertEqual(tuple(capped.shape), (1, 200, 300, 3))              # 600x400 -> 300x200
+        self.assertEqual(note, "still 600x400 -> 300x200 (depth_res 300 cap)")
+        wide, note = fast_depth._fit_working_still(still, 2048)              # above the own side
+        self.assertIs(wide, still)                                           # never upscales
+        self.assertIsNone(note)
+        own, note = fast_depth._fit_working_still(still, 0)                  # 0 = the own resolution
+        self.assertIs(own, still)
+        self.assertIsNone(note)
+
+    def test_fit_working_still_falls_back_to_the_cloud_ceiling_with_depth_res_zero(self):
+        # MAX_CLOUD_PIXELS is patched small so the 2**24-pixel ceiling is testable on a tiny still.
+        with mock.patch.object(fast_depth, "MAX_CLOUD_PIXELS", 1000):
+            small, note = fast_depth._fit_working_still(torch.zeros(1, 100, 200, 3), 0)
+        self.assertEqual(tuple(small.shape), (1, 22, 44, 3))                 # both sides * sqrt(1000/20000)
+        self.assertLessEqual(22 * 44, 1000)
+        self.assertEqual(note, "still 200x100 -> 44x22 (MAX_CLOUD_PIXELS 1000 cap)")
+
+    def test_flat_quantile_strides_pools_over_the_aten_element_limit(self):
+        ramp = torch.arange(1, 4097, dtype=torch.float32)
+        self.assertEqual(float(fast_depth._flat_quantile(ramp, 0.5)),
+                         float(torch.quantile(ramp, 0.5)))                   # small pools stay exact
+        huge = torch.arange((1 << 24) + 2, dtype=torch.float32)              # just past the ceiling
+        with self.assertRaises(RuntimeError):
+            torch.quantile(huge, 0.5)                                        # the crash this helper prevents
+        self.assertAlmostEqual(float(fast_depth._flat_quantile(huge, 0.5)),
+                               (huge.numel() - 1) / 2, delta=4.0)            # the stride keeps the median
 
     def test_edge_keep_culls_only_the_depth_step(self):
         depth = torch.ones(9, 9)
@@ -368,6 +399,31 @@ class MeridianFastDepthEngineTests(unittest.TestCase):
                                                 camera=None, custom_camera=None,
                                                 **options, **overrides)
         self.assertEqual(seen, [fast_depth.DA3_RES, 112, 1008])
+
+    def test_big_stills_are_resized_to_the_depth_res_cap_before_the_model(self):
+        # A 24 Mpx photo used to crash the percentile clip (torch.quantile rejects pools over
+        # 2**24 elements); with the working-still cap the 3.8 Mpx test still reaches the depth
+        # model already resized, and the whole flight runs off the smaller working still.
+        seen = []
+
+        def fake(model_name, first, device, process_res=fast_depth.DA3_RES):
+            seen.append((tuple(first.shape), process_res))
+            return torch.ones(7, 21)
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer), \
+                mock.patch.object(fast_depth, "_predict_da3_depth", fake):
+            source, render, width, height, length = fast_depth.render_depth_aligned(
+                _gradient_image(height=1600, width=2400), torch.device("cpu"),
+                model_size="Depth-Anything-3-Small", frames=3, canvas_mode="custom",
+                custom_width=112, custom_height=64, cloud_scale=1, point_size=0,
+                edge_cull=True, edge_threshold=0.30, back_face_cull=False,
+                camera=None, custom_camera=None, depth_res=400)
+        self.assertEqual(seen, [((1, 266, 400, 3), 400)])                    # model sees the capped still
+        self.assertEqual((width, height, length), (112, 64, 3))
+        self.assertEqual(tuple(source.shape), (3, 64, 112, 3))
+        self.assertEqual(tuple(render.shape), (3, 64, 112, 3))
+        self.assertIn("still 2400x1600 -> 400x266 (depth_res 400 cap)", buffer.getvalue())
 
     def test_da3_variants_map_to_hugging_face_repos_and_unknown_ones_fail_loudly(self):
         self.assertEqual(fast_depth.DA3_MODEL_REPOS["Depth-Anything-3-Small"],

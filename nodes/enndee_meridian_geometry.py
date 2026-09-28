@@ -360,7 +360,7 @@ class EnndeeMeridianGeometry:
                 "custom_height": ("INT", {"default": 480, "min": 64, "max": 2048, "step": 32,
                                           "tooltip": "Fast depth only: 'custom' canvas height."}),
                 "cloud_scale": ("INT", {"default": 2, "min": 1, "max": 4, "step": 1,
-                                        "tooltip": "Fast depth only: unprojection-grid upscale over the input frame: 2 doubles the point count (denser silhouette fill), 1 keeps the frame's own resolution."}),
+                                        "tooltip": "Fast depth only: unprojection-grid upscale over the working still: 2 doubles the point count (denser silhouette fill), 1 keeps the working still's own resolution."}),
                 "point_size": ("INT", {"default": 1, "min": 0, "max": 3, "step": 1,
                                        "tooltip": "Fast depth only: point footprint 0=1x1, 1=3x3, 2=5x5, 3=7x7. Larger fills holes where the cloud is sparse after a big camera move."}),
                 "edge_cull": ("BOOLEAN", {"default": True,
@@ -382,7 +382,7 @@ class EnndeeMeridianGeometry:
                 "vggt_repo": ("STRING", {"default": "", "tooltip": "VGGT preview only: VGGT-Omega source folder. Empty = the installation auto-detected next to `repo`, or the picker's --vggt-repo when its args string carries one."}),
                 "vggt_checkpoint": ("STRING", {"default": "", "tooltip": "VGGT preview only: VGGT-Omega checkpoint (.pt). Empty = the checkpoint auto-detected next to `repo`, or the picker's --vggt when its args string carries one."}),
                 "depth_res": ("INT", {"default": DA3_RES, "min": 0, "max": 4096, "step": 1,
-                                      "tooltip": "Fast depth only, Depth-Anything-3 models only: the depth model's longest-side cap in pixels (aspect preserved, then rounded to multiples of 14). 0 = run the still at its own resolution for maximum depth detail - the attention cost grows with the square of the pixel count, so a full-resolution still takes seconds instead of tenths. Values above the still's own side make DA3 upscale. The V2 models ignore it and keep their native 518 square."}),
+                                      "tooltip": "Fast depth only: working-resolution cap in pixels on the still's longest side (aspect preserved). A bigger input picture is resized down to it *before* the depth model, the colours and the point cloud are built, so huge photos stay fast and can never overflow the percentile clip; the same number is Depth-Anything-V3's `process_res` (rounded to multiples of 14 by the library; a value above the still's own side makes the model upscale). 0 = keep the still's own resolution for maximum depth detail - only a 16.7 Mpx safety ceiling still applies, and a full-resolution still costs seconds per frame on the depth model. The V2 models keep their native 518 depth grid, but the still and the cloud follow this cap for them too."}),
             },
             "optional": {
                 "image": ("IMAGE",),
@@ -400,8 +400,8 @@ class EnndeeMeridianGeometry:
         "VGGT preview runs Meridian's VGGT-Omega subprocess (repo/python/cache and the canvas, "
         "source-size and VGGT-path overrides live on this node as well); Fast depth runs the "
         "in-process Depth-Anything point-cloud flight for a single still (V2 or V3 via "
-        "`model_size`, no VGGT, no external environment; `depth_res` trades time for depth "
-        "detail, 0 = the still's own resolution). Both accept the same args string and "
+        "`model_size`, no VGGT, no external environment; `depth_res` caps the still's working "
+        "resolution and the V3 depth grid, 0 = the picture's own resolution). Both accept the same args string and "
         "custom_camera signal - the Meridian Parameter Picker configures either - and both return "
         "(source, render, width, height, length) at the 480-class condition canvas."
     )
