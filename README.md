@@ -33,243 +33,127 @@ Lichtfeld Studio dataset in a single step.
 | **MiniMax H3 Direct Promptor (Enndee)** | `H3_Multimodal_Promptor_Enndee` | Official-format MiniMax H3 prompts from reference images (vision LLM) |
 | **Resolution Selector (Enndee)** | `Enndee_ResolutionSelector` | Aspect-ratio + megapixel sizing plus the nine core resize types and a resized image output |
 | **Load & Resize Image (Enndee)** | `Enndee_ImageLoaderResize` | Load an image with the classic load-and-resize widgets, core resize types, mask channel, and original-size output |
-| **Meridian Parameter Picker (Enndee)** | `Enndee_MeridianParameterPicker` | Unified: Meridian geometry arguments plus the optional custom camera path (vertical O orbits or an alternating-height sweep), with widgets that adapt to the configuration |
-| **Meridian Camera Path Configurator (Enndee)** | `Enndee_MeridianCameraPath` | Standalone path-only variant: a 1–8 station vertical O-orbit camera path with selectable start and 120° rear stations |
+| **Meridian Parameters and Camera (Enndee)** | `Enndee_MeridianParametersAndCamera` | Meridian geometry arguments plus the camera path: hand-authored O orbits / alternating-height pendulum / spiral sweeps, or an automatic speed-capped orbit around the subject or the whole scene |
 | **Meridian Geometry (Enndee)** | `Enndee_MeridianGeometry` | Run VGGT geometry preview; optionally repeat the first frame to a connected custom path's required length |
 | **Lichtfeld Headless Trainer (Enndee)** | `Enndee_LichtfeldHeadlessTrainer` | Start configurable Lichtfeld Studio Gaussian-splat training from a tracker dataset and export the result as .ply, .sog or .spz |
 
 ---
 
-## Node: Meridian Parameter Picker (Enndee)
+## Node: Meridian Parameters and Camera (Enndee)
 
-Use **Meridian Parameter Picker (Enndee)** to select a supported output length,
-freeze window, authored camera move, pivot, and geometry/render options. Hover
-each widget for its description. Connect its `args` output to the optional
-`args_override` input on **Meridian Geometry**. When connected, the generated
-arguments override the Geometry node's editable `args` text; disconnect it to
-use that text again.
+**Meridian Parameters and Camera (Enndee)** replaces the old parameter picker and
+the standalone camera-path configurator. It emits both halves of a Meridian
+geometry pass: connect its `args` output to **Meridian Geometry**'s
+`args_override` input and its `custom_camera` output to that node's
+`custom_camera` input. The path always matches `Output Frames` (73, 90, 107,
+124, 141, 158, 175 or 243), and the node deliberately does not expose `--video`,
+`--out` or `--preview-only` - the Geometry node supplies those itself.
 
-The picker includes the geometry-affecting Meridian options, including source
-start/frame count, freeze, yaw, truck, boom, dolly/zoom, pivot/aim, sweep shape,
-follow/smoothing, culling, diagnostics, seed, camera-path JSON, canvas/source
-size, and optional VGGT code/checkpoint paths. Meridian's available output lengths are
-73, 90, 107, 124, 141, 158, 175, and 243 frames. For a still image, leave
-**Freeze Source** and **Freeze Full Output** enabled. For example, select 158
-frames to get the closest supported Meridian length to a 150-frame request.
+**Camera Mode** decides where the path comes from:
 
-The picker **combines the parameter picker and the camera path configurator** in
-one node: switch **Use Custom Camera** on and it builds the **custom O-orbit
-camera path** (same code as the standalone configurator) and fills the
-`custom_camera` output - connect that to **Meridian Geometry**'s
-`custom_camera` input. While the toggle is off the output stays empty and the
-`path_*` widgets are hidden.
+- **Manual path** - the hand-authored paths below (O orbits, alternating-height
+  pendulum, monotone spiral sweep), built by the same code the retired
+  configurator used.
+- **Automatic (estimated)** - the node looks at the connected `reference_image`
+  (and the optional `subject_mask`) and estimates an optimal orbit: the camera
+  positions come from the still's own surface data, capped to a camera-speed
+  budget. Nothing else needs to be set.
 
-The widget list adapts to the chosen configuration:
+### Manual path
 
-- **Use Custom Camera on**: the path group appears - **Camera Mode** plus the
-  controls of the active style, and the shared orbit diameter and look pivot -
-  while the freeze window, source start, follow and the authored camera move /
-  pivot options disappear. Meridian Geometry strips those flags and repeats the
-  first frame whenever a custom path is connected, so the picker also leaves
-  them out of `args`. The path length always follows `Output Frames`, keeping
-  `args` and `custom_camera` in sync.
-- **Camera Mode** reveals the station list (O Orbits) or the sweep controls
-  (Alternating Height); see *Camera-path styles* below.
-- **Freeze Source** reveals Freeze Frame and Freeze Full Output; **Freeze Full
-  Output** off reveals Freeze Length.
-- **Pivot Enabled** reveals the pivot coordinates and Lock Pivot; **Aim Camera**
-  reveals the secondary pivot.
-- **Follow** reveals Smooth; **Canvas Enabled** reveals the canvas size; **Full
-  Enabled** reveals the VGGT source size.
+The path widgets follow the selected **Camera Mode** style:
 
-Hidden widgets keep their values, so saved workflows and the geometry arguments
-stay reproducible. The standalone **Meridian Camera Path Configurator** node
-remains available for path-only setups.
-
-### Camera-path styles
-
-**Camera Mode** switches the generated path:
-
-- **O Orbits**: the classic closed vertical O loops at the selected stations
-  (Front, Left, Right, Back, Up, Down, LeftBack, RightBack) with the usual start
-  station choice.
+- **O Orbits**: closed vertical O loops at the selected stations (Front, Left,
+  Right, Back, Up, Down, LeftBack, RightBack) with a start-station choice. The
+  two rear stations sit exactly 120 degrees from the front direction and from
+  each other, so `Front + LeftBack + RightBack` is a balanced tripod route.
+  Selected loops run in the builder's own sweep order and stop at the final
+  selection instead of wrapping to the front. **Orbit Diameter** (median-depth
+  units) sets the loop size.
 - **Alternating Height**: the camera sweeps its **azimuth (yaw)** from **Start
-  Yaw** to **Target Yaw** while the **elevation (altitude angle)** alternates
-  between the **Low Arc** and **High Arc** on the way - a pendulum that eases
-  out at every apex. Yaw counts in degrees: 0 = in front of the subject
-  (toward the source camera), +90 = the subject's right, 180 = behind it;
-  Start and Target Yaw accept up to +/-360 degrees (values wrap, so 270 and -90
-  point the same way). Elevation is the standard altitude angle: 0 = level with
-  the pivot, positive = above it looking down, negative = below it looking up.
-  The mathematical extremes (-90/+90, straight below/above) are deliberately
-  capped at -70/+70, like the Up/Down O stations, because a fully vertical look
-  direction is gimbal lock for Meridian's zero-roll orientation. **Arc
-  Switches** sets how often the camera flips sides (an odd count finishes on
-  the opposite arc, an even count returns to the starting one) and **Start
-  Arc** picks the first arc.
-- **Spiral Sweep**: the coverage/artefact-optimised sweep. Azimuth and
-  elevation both advance monotonically (Start Yaw -> Target Yaw, Spiral Start
-  Elevation -> Spiral End Elevation), so the camera never re-covers a band,
-  follows the shortest route across the whole envelope and keeps a nearly
-  constant angular speed - less velocity means fewer synthesis artefacts, and
-  every frame shows new surface. The elevations may rise or fall (the spiral
-  descends when the end sits below the start).
+  Yaw** to **Target Yaw** while the **elevation** alternates between the **Low
+  Arc** and **High Arc** - a pendulum that eases out at every apex. Yaw is in
+  degrees: 0 = in front of the subject (toward the source camera, i.e. between
+  it and the pivot), +90 = the subject's right, 180 = behind it; values accept
+  up to +/-360 and wrap (270 and -90 point the same way). Elevation is the
+  altitude angle: 0 = level with the pivot, positive = above it looking down,
+  negative = below looking up - capped at +/-70 like the Up/Down O stations,
+  because a fully vertical look direction is gimbal lock for Meridian's
+  zero-roll orientation. **Arc Switches** sets how often the camera flips sides
+  (odd = ends on the opposite arc, even = returns to the starting one) and
+  **Start Arc** picks the first arc.
+- **Spiral Sweep**: the coverage/artefact-optimised sweep. Azimuth and elevation
+  both advance monotonically (Start Yaw -> Target Yaw, Spiral Start Elevation ->
+  Spiral End Elevation), so the camera never re-covers a band, follows the
+  shortest route across the whole envelope and keeps a nearly constant angular
+  speed - less velocity means fewer synthesis artefacts, and every frame shows
+  new surface. The elevations may rise or fall freely.
 
-**Orbit Diameter** belongs to O Orbits; the sweeps orbit at the
-source-camera-to-pivot radius. **Path Dolly** (shared by every style, in
-median-depth units) shifts the whole path along the view axis - positive values
-zoom out and the O loops keep their diameter on the shifted sphere - because the
-args Dolly is ignored while a custom path drives the Geometry node. All styles
-always look at the shared **Pivot**, and the picker only shows the controls of
-the active style.
+All styles orbit the shared **Pivot** (`x`, `y`, `z` in frame-0 camera
+coordinates) and honour **Path Dolly** (median-depth units): positive values
+shift the whole path along the view axis to zoom out, negative to push in.
 
 For the most surface at the lowest camera speed prefer **Spiral Sweep** with a
-long sweep (e.g. Start Yaw 0 -> Target Yaw 270), a rising elevation (Spiral
-Start Elevation -20 -> Spiral End Elevation 45), a slightly wider framing
-(**Path Dolly** 0.2-0.5) and the largest frame count (243). The pendulum
-zig-zags across the same envelope, so it needs roughly 1.4-2x the travel length
-for the same covered surface - and that extra travel is exactly the per-frame
-velocity that creates artefacts. Keep the end at least one field of view
-(~60-90 degrees) away from the start so the slightly drifted front surface never
-reappears at the end.
+long sweep (e.g. Start Yaw 0 -> Target Yaw 270), a rising elevation (-20 -> 45),
+a slightly wider framing (**Path Dolly** 0.2-0.5) and a large frame count. The
+pendulum zig-zags across the same envelope, so it needs roughly 1.4-2x the
+travel length for the same covered surface - and that extra travel is exactly
+the per-frame velocity that creates artefacts. Keep the end at least one field
+of view (~60-90 degrees) away from the start so the slightly drifted front
+surface never reappears at the end. Watch the key-frame budget: each O loop
+needs 8 key intervals and each transfer 4, so 73/90-frame paths fit up to 6/7
+stations while the full eight-station sweep needs 107 frames or more; the node
+raises a clear error when a selection does not fit.
+### Automatic (estimated) camera
 
-The picker intentionally does not expose `--video`, `--out`, or
-`--preview-only`: the ComfyUI Geometry node supplies those itself. It also does
-not configure H3 denoising/sampler options; those belong to the downstream H3
-nodes. A connected argument picker does not remove the existing Geometry
-`args` widget, so saved workflows that do not use the new socket remain
-compatible.
+Select **Automatic (estimated)** and connect the still to `reference_image` -
+the same image the Geometry node receives. The estimator:
+
+1. runs a depth pass on the still (Depth-Anything-3-Small by default; it reuses
+   the fast-depth backend's loaded model, so it costs one extra forward pass
+   per queue);
+2. builds the surface in the source camera's coordinates and fits a sphere to
+   the **target** you picked:
+   - **subject** - the connected `subject_mask`, else the near-depth layer that
+     an Otsu split separates from the background. Any segmentation node can
+     drive the mask (the GLOMAP tracker's `use_rmbg` output works well); without
+     one the depth split does the job;
+   - **scene** - the whole reconstructed surface, framed wider.
+3. places the camera on that sphere so the target fills roughly 45 % (subject)
+   of the frame and orbits it **starting in front** (the source camera's side),
+   rising/falling a little over the run while always looking at the centre;
+4. caps the motion: **Max Speed** (`auto_max_speed`, percent of the content
+   radius per frame, 12 % default) plus a hard 6 degrees/frame azimuth limit.
+   If the frame count cannot cover the full swing (360 degrees for a subject,
+   270 for a scene) under that budget, the swing is shortened instead of
+   speeding up - too much new surface per frame is what makes the depth
+   reprojections smear.
+
+Every estimate prints a one-line summary to the ComfyUI console (target,
+centre, radius, swing, degrees and units per frame, key count, and whether the
+swing had to be shortened). The `subject_mask` input is optional; the label in
+the summary says which source was used.
+
+### What this node no longer has
+
+VGGT is not part of this pack any more: the Geometry node runs the in-process
+fast-depth backend only, so the VGGT/canvas/source-size options, the
+freeze/start/follow window, the authored camera move (yaw, truck, boom, dolly,
+zoom, pivot, aim), diagnostics, seed and the camera-path JSON widget are gone.
+Use **Camera Mode** instead - manual path or automatic estimate. The retired
+**Meridian Parameter Picker** and **Meridian Camera Path Configurator** nodes
+were replaced by this one; re-add it in workflows that still reference them.
 
 ### Meridian Geometry IMAGE input: stills and video batches
 
-The optional `image` socket on **Meridian Geometry (Enndee)** accepts one still or a
-multi-frame ComfyUI IMAGE batch. A single image is written as a temporary PNG;
-a batch is encoded as a temporary, lossless H.264 RGB MP4 so every decoded frame
-is available to Meridian. The temporary input is removed after the run. For a
-custom `--camera-path`, connect the multi-frame video loader's IMAGE output (or
-set Geometry's `video` field to a real clip path) and make sure the clip has at
-least as many source frames as the path's `src` indices. The still-image PNG
-route is not suitable for a path requiring source frames 0–72.
-
-### Meridian Camera Path Configurator and Geometry (Enndee)
-
-Connect **Meridian Camera Path Configurator (Enndee)**'s `custom_camera`
-output to **Meridian Geometry (Enndee)**'s `custom_camera` input, or enable
-**Use Custom Camera** on the **Meridian Parameter Picker**, which builds the
-same path together with the geometry arguments. The path node provides:
-
-- a Meridian-supported frame count (73, 90, 107, 124, 141, 158, 175, or 243);
-- independently selectable Front, Left, Right, Back, Up, Down, LeftBack and
-  RightBack vertical O loops. The two rear stations sit exactly 120° from the
-  front direction and from each other (like the hand-authored Meridian
-  3-orbit 120° paths), so `Front + LeftBack + RightBack` is a balanced tripod
-  route. Selected loops run in a clockwise sweep order; the path skips
-  unselected stations and stops at the final selection rather than wrapping to
-  the front;
-- a Start Station choice: keep the optimized visit order or rotate the same
-  cycle so any selected station runs the first O loop;
-- O-loop diameter in median-depth units; and
-- a 3D camera look-pivot (`x`, `y`, `z`) in frame-0 camera coordinates.
-
-> Key frames need room: each O uses 8 key intervals and each transfer 4, so
-> 73/90-frame paths fit up to 6/7 stations, while the full eight-station sweep
-> needs 107 frames or more. The node raises a clear error when a selection
-> cannot fit the chosen length.
-
-With `custom_camera` connected, Geometry takes the first connected IMAGE frame
-(or the first decoded frame of its `video` path), writes exactly the configured
-number of lossless repeated frames, writes a temporary camera-path JSON, and
-passes both to Meridian. It automatically supplies `--frames`, `--start 0`, and
-`--camera-path`; camera-motion/freeze/follow flags from the args widgets are
-ignored in this mode, while unrelated options such as `--vggt` and `--cull` are
-preserved. Both temporary files are removed after the preview, including when
-Meridian exits with an error. Without a connected camera signal, the existing
-still-image PNG and multi-frame video-batch behavior remains available.
-
-Repeated stills only satisfy Meridian's source-frame indexing. They do not add
-observed backside geometry; inspect the geometry preview for holes/stretching
-before using the render as an H3 video reference. Restart ComfyUI after
-installing/updating the node pack to register both nodes.
-
----
-
-## Installation
-
-### ComfyUI-Manager (recommended)
-
-Install the pack as usual - Manager installs `requirements.txt` and then executes
-`install.py`, which downloads COLMAP + GLOMAP into `<pack>/bin/`.
-Watch the console for the `[Enndees-Nodepack]` messages.
-
-### Manual
-
-```bash
-cd ComfyUI/custom_nodes
-git clone <your-repo-url> Enndees-Nodepack
-cd Enndees-Nodepack
-# uses the same python that runs ComfyUI, e.g.
-python install.py
-```
-
-`install.py` is idempotent - running it again only downloads what is missing.
-
-```text
-python install.py                  # download what is missing
-python install.py --check          # only report the current status
-python install.py --force          # re-download everything
-python install.py --nocuda         # CPU builds (no NVIDIA GPU)
-python install.py --only glomap    # single component
-python install.py --pin colmap="C:\Tools\colmap-x64-windows-cuda\COLMAP.bat"
-python install.py --with-requirements
-```
-
-### Optional: RMBG background removal
-
-The `use_rmbg` option of the GLOMAP node uses `transparent_background` (RMBG via
-onnxruntime). When it is missing the node logs a warning and simply skips
-background removal - everything else keeps working:
-
-```bash
-pip install transparent_background             # CPU onnxruntime is included
-# optional: pip install onnxruntime-gpu        # CUDA acceleration (auto-detected)
-```
-
-### What gets downloaded
-
-| Component | Version | Flavor | Size (approx.) | Why |
-|-----------|---------|--------|----------------|-----|
-| COLMAP | 3.11.1 | `cuda` / `nocuda` | 154 MB / 64 MB | SIFT features + matching |
-| GLOMAP | 1.2.0 | `cuda` / `nocuda` | 74 MB / 18 MB | global mapper |
-
-Both are official GitHub release archives of
-[colmap/colmap](https://github.com/colmap/colmap/releases) and
-[colmap/glomap](https://github.com/colmap/glomap/releases); checksums are
-verified whenever upstream publishes them.
-
-`auto` flavor = CUDA build when a CUDA GPU is detected, CPU build otherwise
-(override with `--cuda` / `--nocuda` or `ENNDEE_BIN_FLAVOR`).
-
-Everything lands in:
-
-```text
-Enndees-Nodepack/
-|-- bin/                            # git-ignored
-|   |-- colmap-3.11.1-cuda/
-|   |-- glomap-1.2.0-cuda/
-|   `-- enndee_binaries.json        # optional user config (pinned paths)
-```
-
-### Already have COLMAP/GLOMAP?
-
-Nothing is downloaded when a usable binary is found. Resolution order:
-
-1. the path typed into the node's `colmap_path` / `glomap_path` widget
-2. `ENNDEE_COLMAP_PATH` / `ENNDEE_GLOMAP_PATH` environment variables
-3. `bin/enndee_binaries.json` (created by `install.py --pin KIND=PATH`)
-4. the pack's own `bin/` folder
-5. auto detection (`PATH`, `C:\Tools\colmap*`, `C:\Program Files\COLMAP`, ...)
-
----
+The `image` socket on **Meridian Geometry (Enndee)** accepts one still or a
+multi-frame ComfyUI IMAGE batch; with a `custom_camera` signal connected the
+Geometry node repeats the first frame to the path's length itself, writes a
+temporary camera-path JSON and passes both to Meridian. Repeated stills only
+satisfy Meridian's source-frame indexing - they do not add observed backside
+geometry, so inspect the geometry preview for holes/stretching before using the
+render as an H3 video reference. Restart ComfyUI after updating the node pack
+to register the new node.
 
 ## Node: Lichtfeld Headless Trainer (Enndee)
 

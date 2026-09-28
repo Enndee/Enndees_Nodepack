@@ -96,7 +96,7 @@ class AutoCameraPathTests(unittest.TestCase):
         for key in keys:
             distance = float((torch.tensor(key["pos"]) - centre).norm())
             self.assertAlmostEqual(distance, radius, delta=1e-3 * max(1.0, radius))
-        self.assertGreater(float(torch.tensor(keys[0]["pos"])[2]), float(centre[2]))
+        self.assertLess(float(torch.tensor(keys[0]["pos"])[2]), float(centre[2]))
         self.assertFalse(torch.allclose(torch.tensor(keys[0]["pos"]),
                                         torch.tensor(keys[-1]["pos"])))
         self.assertLessEqual(summary["azimuth_per_frame"], MAX_AZIMUTH_PER_FRAME + 1e-9)

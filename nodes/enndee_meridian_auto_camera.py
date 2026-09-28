@@ -178,15 +178,16 @@ def speed_limited_span(desired_span, radius, content_radius, frames, max_speed):
 def _place(centre, radius, yaw_degrees, elevation_degrees):
     """Camera position on the orbit sphere around `centre`.
 
-    Yaw 0 faces the source camera, positive yaw moves to the subject's right; elevation 0 is
-    level with the centre, positive is above it (the OpenCV frame has y pointing down) -
-    exactly the Camera Path Configurator's sweep maths.
+    Yaw 0 sits *between* the centre and the source camera (the origin), positive yaw moves to the
+    subject's right; elevation 0 is level with the centre, positive is above it (the OpenCV frame
+    has y pointing down). That is the Camera Path Configurator's convention (`_yaw_direction`):
+    the source camera at the origin is the closest possible viewpoint of the subject.
     """
     yaw = math.radians(yaw_degrees)
     elevation = math.radians(elevation_degrees)
     offset = (math.cos(elevation) * math.sin(yaw),
               -math.sin(elevation),
-              math.cos(elevation) * math.cos(yaw))
+              -math.cos(elevation) * math.cos(yaw))
     return [float(centre[axis]) + offset[axis] * radius for axis in range(3)]
 
 

@@ -27,7 +27,6 @@ from enndee_meridian_camera_path import (  # noqa: E402
     SPIRAL_KEY_COUNT,
     START_STATION_OPTIONS,
     SWEEP_SUBSTEPS,
-    MeridianCameraPathConfigurator,
     _order_selected_stations,
     _orbit_position,
     _round_position,
@@ -274,17 +273,6 @@ class MeridianCameraPathConfiguratorTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "at least 0.15"):
             build_meridian_spiral_sweep("124", 0, 180, -20, 30, 0, 0, 1, dolly=-1.0)
 
-    def test_configure_passes_rear_stations_and_start_station(self):
-        node = MeridianCameraPathConfigurator()
-        document = json.loads(node.configure(
-            "124", True, False, False, False, False, False, 0.28, 0.0, 0.0, 1.0,
-            orbit_left_back=True, orbit_right_back=True, start_station="RightBack",
-        )[0])
-        self.assertEqual(document["stations"], ["RightBack", "Front", "LeftBack"])
-
-        legacy = json.loads(node.configure("124", True, True, True, False, False, False, 0.28, 0.0, 0.0, 1.0)[0])
-        self.assertEqual(legacy["stations"], ["Right", "Front", "Left"])
-
     def test_up_station_looks_down_and_orbits_in_camera_plane(self):
         pivot = [0.0, 0.0, 1.0]
         diameter = 0.28
@@ -408,33 +396,6 @@ class MeridianCameraPathConfiguratorTests(unittest.TestCase):
         for values, message in invalid:
             with self.subTest(values=values), self.assertRaisesRegex(ValueError, message):
                 build_meridian_custom_camera(*values)
-
-    def test_every_required_parameter_has_an_explanatory_tooltip(self):
-        parameters = MeridianCameraPathConfigurator.INPUT_TYPES()["required"]
-        self.assertEqual(
-            set(parameters),
-            {
-                "number_of_frames", "orbit_front", "orbit_left", "orbit_right", "orbit_back",
-                "orbit_up", "orbit_down", "orbit_left_back", "orbit_right_back",
-                "orbit_diameter", "pivot_x", "pivot_y", "pivot_z", "start_station",
-            },
-        )
-        self.assertTrue(all("tooltip" in metadata for _options, metadata in parameters.values()))
-        self.assertTrue(all(
-            parameters[ORBIT_WIDGET_NAMES[name]][1]["default"] == (name in ("Front", "Left", "Right"))
-            for name in ORBIT_OPTIONS
-        ))
-        self.assertEqual(parameters["start_station"][1]["default"], "Visit order")
-        self.assertEqual(list(parameters["start_station"][0]), list(START_STATION_OPTIONS))
-        # Legacy widgets keep their serialized positions; new widgets are appended.
-        self.assertEqual(
-            list(parameters)[:11],
-            ["number_of_frames", "orbit_front", "orbit_left", "orbit_right", "orbit_back",
-             "orbit_up", "orbit_down", "orbit_diameter", "pivot_x", "pivot_y", "pivot_z"],
-        )
-        self.assertEqual(MeridianCameraPathConfigurator.RETURN_TYPES, (CAMERA_SIGNAL_TYPE,))
-        self.assertEqual(MeridianCameraPathConfigurator.RETURN_NAMES, ("custom_camera",))
-
 
 class MeridianGeometryCustomCameraTests(unittest.TestCase):
     class CompletedProcess:
