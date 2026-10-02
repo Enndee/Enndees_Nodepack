@@ -33,9 +33,48 @@ Lichtfeld Studio dataset in a single step.
 | **MiniMax H3 Direct Promptor (Enndee)** | `H3_Multimodal_Promptor_Enndee` | Official-format MiniMax H3 prompts from reference images (vision LLM) |
 | **Resolution Selector (Enndee)** | `Enndee_ResolutionSelector` | Aspect-ratio + megapixel sizing plus the nine core resize types and a resized image output |
 | **Load & Resize Image (Enndee)** | `Enndee_ImageLoaderResize` | Load an image with the classic load-and-resize widgets, core resize types, mask channel, and original-size output |
-| **Meridian Parameters and Camera (Enndee)** | `Enndee_MeridianParametersAndCamera` | Meridian geometry arguments plus the camera path: hand-authored O orbits / alternating-height pendulum / spiral sweeps, or an automatic mode that estimates the subject's (or scene's) geometric pivot from the still's depth profile and flies a speed-capped, collision-guarded path around it |
+| **Meridian Parameters and Camera (Enndee)** | `Enndee_MeridianParametersAndCamera` | Meridian geometry arguments plus the camera path: hand-authored O orbits / alternating-height pendulum / spiral sweeps, or an automatic mode that estimates the subject's (or scene's) geometric pivot from the still's depth profile and flies a speed-capped, collision-guarded path around it (subject: almost a full circle; scene: lateral survey rows for side coverage) |
 | **Meridian Geometry (Enndee)** | `Enndee_MeridianGeometry` | Run VGGT geometry preview; optionally repeat the first frame to a connected custom path's required length |
 | **Lichtfeld Headless Trainer (Enndee)** | `Enndee_LichtfeldHeadlessTrainer` | Start configurable Lichtfeld Studio Gaussian-splat training from a tracker dataset and export the result as .ply, .sog or .spz |
+| **Standby On Signal (Enndee)** | `Enndee_StandbyOnSignal` | Puts the PC into S3 standby when the workflow reaches the node and the ComfyUI queue is empty (last queued prompt) |
+
+---
+
+## Node: Standby On Signal (Enndee)
+
+Puts the PC into **S3 standby** once the workflow reaches the node - the
+overnight-batch helper. It is the ComfyUI side of the `Wakeup_from_Sleep`
+toolkit (`Standby_Timer.ps1` / `Standby_Guard.ps1`) and uses the identical
+mechanism (`SetSuspendState`, `bHibernate = FALSE`), so it always sleeps -
+even when Windows' own idle standby is blocked by something.
+
+### Inputs (required)
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `enabled` | BOOLEAN | false | Safety switch - only True really triggers standby |
+| `mode` | COMBO | `Standby (S3)` | `Standby (S3)` suspends the PC, `DryRun (log only)` just prints |
+| `delay_seconds` | INT | 30 | Grace period before sleeping (0-3600 s); abortable with the ComfyUI Cancel button |
+| `check_queue` | BOOLEAN | true | Sleep only when the ComfyUI queue is empty - with many queued prompts only the last one sleeps |
+| `server_url` | STRING | `http://127.0.0.1:8188` | ComfyUI API base URL for the queue check |
+
+### Inputs (optional) / Outputs
+
+| Name | Type | Description |
+|------|------|-------------|
+| `signal` | ANY | optional passthrough signal; connect the last node of your graph so the standby node runs after it |
+
+As an output node it is executed even without a connected input - simply place
+it at the end of the graph.
+
+### Notes
+
+- While `Standby_Guard.ps1` runs, start ComfyUI through `Keep-AwakeDuring.ps1`
+  (or pause the guard): ComfyUI holds no power requests, so the idle guard
+  would otherwise sleep mid-generation. This node then sleeps at the end.
+- After the wake, ComfyUI keeps running; new prompts are picked up again.
+- The queue is re-checked after the grace period; an unreachable server means
+  "stay awake" (safe default).
 
 ---
 
@@ -122,19 +161,70 @@ image the Geometry node receives. The estimator:
      drive the mask (the GLOMAP tracker's `use_rmbg` output works well); without
      one the depth split does the job;
    - **scene** - the whole reconstructed surface, whose pivot sits in the middle
-     of all depth points and whose path is wider.
+     of all depth points. Its path is a **lateral survey**, deliberately *not* a
+     360-degree lap: rows of viewpoints are spread across the scene's own width,
+     and each row sweeps the elevation from -12 up to +28 degrees, so every
+     lateral station is seen from below, level and above. This is the drone
+     mapping pattern (boustrophedon flight lines with 70-80 % side overlap)
+     mapped onto Meridian's reprojection camera, because what a walk-in VR viewer
+     needs is *side* parallax - a depth reprojection cannot invent the far side of
+     a scene, so a surround would only spend frames on invented surface. The row
+     spacing follows the frame's footprint at the survey distance (55 deg vertical
+     FOV and the still's aspect decide it); three rows (left/centre/right) are the
+     minimum, nine the maximum, and a short frame or speed budget buys *fewer rows
+     with the full sweep* instead of many cramped ones. A scene wider than the rows
+     reach is what **Auto Orbit Distance** is for - the console line says how far
+     they currently reach ("fly higher for a bigger area", as the mapping guides
+     put it).
+     The survey also **solves its own stand-off** (`scene_survey_fill`), because a
+     fixed fill cannot fit every scene: the camera is pulled out until the outermost
+     row really reaches the scene's edge (`radius >= half_width / sin(yaw limit)` -
+     coverage is the hard requirement) and pulled in until the frame's footprint is
+     about a third of the scene's width, so the frames are not mostly empty - never
+     closer than one content radius. The console line reports the solved ratio, the
+     reach ("reaching 100 % of the scene's half width") and the footprint. **Auto
+     Orbit Distance** still overrides the solve.
+     The **subject inside the scene** is measured too: the estimator keeps the same
+     near-layer/mask layer the subject target would use and reports how big it
+     appears along the survey ("the subject inside it covers 6.4 % of the picture in
+     24 of 73 frames (18 whole)"). A lateral survey sweeps past a subject, so the
+     useful question is not "is it always in frame" but "does a row show it well":
+     the console warns when the subject covers less than 2 % of the picture ("a
+     lower Auto Orbit Distance brings the rows closer, a smaller Auto Orbit Size
+     narrows them onto the subject") or when no frame shows it at all. Connect a
+     **MASK** to make that number mean the person rather than the near depth layer.
    **Auto Pivot X/Y/Z** shifts the estimated pivot by up to one content radius
    per axis (frame-0 camera axes: +X right, +Y down, +Z away) - for subjects
    whose depth midpoint is not the point you want framed.
 3. picks the path with **Auto Path Mode**:
-   - **Automatic** - the estimated path. For a subject: first a big front
-     **O orbit** (azimuth +/-62 degrees, elevation +/-30) that shows the front
-     from below, right, above and left in one loop, then a 270-degree **height
-     lap** around the rest of the subject that eases from -30 up to +38 degrees
-     elevation, so the last frames show new surface at a new height instead of
-     repeating the start. For a scene: one big **oval** - a 350-degree lap at
-     twice the scene radius that rises from -12 to +28 degrees while it goes
-     round.
+   - **Automatic** - the estimated path. For a subject: first the front
+     **O orbit** (azimuth and elevation swings starting at +/-62 / +/-30 degrees
+     and *growing* towards +/-85 / +/-60 as far as the pixel budget allows). It
+     opens on the framed front pose - frame 0 is the view the fill solve targets -
+     rises to the top of the O (12 o'clock), swings around past 9 and 6 to
+     3 o'clock (the front from the middle, above, the left, below and the right in
+     one move) and hands over to the **concluding orbit** there. **Auto Orbit
+     Direction** picks the way: `counter-clockwise` (the default) turns 12 -> 9 ->
+     6 -> 3 o'clock, `clockwise` mirrors the whole path to 12 -> 3 -> 6 -> 9.
+     **Auto Orbit End** says where the orbit stops, in degrees measured from the
+     start - the *middle of the O*: `360` (the default) is the complete round, back
+     at the start point, its height arc rising to +38 degrees at the back and
+     easing back to 0 so the last frame sits on the first one and the clip loops;
+     `180` stops behind the subject, `270` on its other side, `0` flies the front O
+     alone (up to `720`, two rounds). **The max camera speed is a hard limit**, and
+     **Auto Orbit Size is the floor for the front**: the fit grows the O above it
+     when the budget allows (a wider O keeps the front's angle variety *and*
+     shortens the orbit), and when the budget cannot pay for the requested end at
+     that width, the *orbit* is cut - the coverage gives way, never the front O and
+     never the speed cap. The console names the levers ("the max camera speed ends
+     the orbit at 265 deg of the requested 360 deg - more Output Frames, a higher
+     Auto Max Speed or a shorter Auto Orbit End balance the round"; and only if the
+     cap cannot even pay for the O itself: "the cap could not even pay for Auto
+     Orbit Size 1.00x, so the front O had to shrink below it to 0.42x"). The frames
+     are split between O and orbit so that both run at the same drift
+     (`balanced_front_share`) - the cheapest way to honour the cap, because whatever
+     one half gives up the other half uses. For a scene: the **lateral survey** of
+     rows described at `scene` above (no surround).
    - **Manual** - the manual styles below, but aimed at the estimated pivot
      instead of the absolute look-pivot (the `path_pivot_*` widgets are ignored
      and hidden then; every other path widget applies as usual).
@@ -144,7 +234,57 @@ image the Geometry node receives. The estimator:
    ladder until it fits - the console line reports the factor ("0.28x
    amplitude"). Slow and steady beats fast: too much new surface per frame is
    what makes the depth reprojections smear.
-5. runs the **collision guard**: every path key is checked against the whole
+   **Auto Orbit Distance** (`auto_orbit_distance`, in content radii) sets how far
+   the camera flies from the estimated pivot: 2.2 is the built-in stand-off (2.0
+   for a scene), lower values push in for more parallax and a fuller frame, higher
+   values pull back for a wider, calmer view. **Auto Orbit Size**
+   (`auto_orbit_size`) multiplies the path's swing amplitudes: 1.0 is the built-in
+   O orbit described above, 0.5 a tight loop that only grazes the front, 2.0 a far
+   sweep. Both shape the *automatic* path only - the manual path keeps its own pivot
+   and dolly - and the speed fit and the collision guard below still have the last
+   word.
+   **Auto Subject Fill** (`auto_subject_fill`, default 40 %) is the framing target: the
+   node solves the camera distance so the subject's projected bounding box covers that
+   share of the picture *area*, and re-centres the pivot on the subject's projected
+   midpoint (the perspective residual a plain 3D midpoint would leave). 30-50 % is the
+   sweet spot for depth reprojections; `0` switches the framing off and Auto Orbit
+   Distance applies again. **Auto Orbit Distance** (`auto_orbit_distance`, in content
+   radii) overrides the framing with a fixed stand-off.
+   **The whole subject stays in the picture**: the fill solve already reserves the room for the
+   whole path - the camera is pulled back until *every* pose of the O *and* the concluding orbit
+   keeps the subject inside the frame with a 2 % border (`_room_distance`, and the fill target is
+   solved against that safe area rather than the bare frame). Room is never bought by cutting the
+   orbit any more: the stand-off (with it the fill) pays instead - the console names the pull-back.
+   On top of that the estimator checks the subject's own pixels
+   (0.2 %/99.8 % of its projected points) against every single frame of the fitted path and repairs
+   any leftover: first the swing is **shortened** (free - the front framing stays, and the orbit
+   keeps its own end), then the pivot is **re-aimed** at the pose with the least room, and only
+   if that is still not enough is the camera **pulled back** in bisected steps. What comes out is
+   *as much as the geometry and the speed cap allow*: the O at whatever the drift and the room
+   permit, the orbit out to its end or as far as the budget pays for, the fill whatever the room
+   leaves - all reported, never hidden. The only budget that may cut the *coverage* is the *speed*
+   cap (the user's own parameter), and the console says so with the numbers
+   ("the max camera speed ends the orbit at 265 deg of the requested 360 deg - more Output Frames,
+   a higher Auto Max Speed or a shorter Auto Orbit End balance the round"). A subject that fills
+   40 % of the frame at ~1.5 radii simply cannot be circled at +/-62 deg within 12 %/frame: that is
+   physics, not a setting. Remedies, in the order that helps most: more `output_frames` or a higher
+   **Auto Max Speed**, a shorter **Auto Orbit End** (the freed budget goes to the front O), a
+   **MASK input** (e.g. the installed RMBG-2.0 node) that hugs the subject, a lower **Auto Subject
+   Fill** (further out = room for a wider loop), a smaller **Auto Orbit Size**. The QC plot carries
+   the per-frame border clearance with the 0/25/50/75/100 % marks and the worst frame.
+5. the **speed cap** (`auto_max_speed`) is measured in *pixels* for a subject: the
+   node projects the subject's own surface points along the path and keeps the
+   per-frame drift of the 95th percentile inside that percentage of the subject's
+   apparent radius - the background is never part of the budget, so a distant
+   background cannot slow the subject down. The front **O orbit grows toward its view
+   limits** (+/-85 deg azimuth, +/-60 deg elevation) as far as that budget allows, so
+   the front side is covered as far round as the frame count permits; a tight budget
+   shrinks the loop instead and the console line says so ("raise Auto Max Speed or
+   Output Frames for a bigger O"). **Auto Orbit Size** multiplies the amplitudes if
+   you want to override the fit. The saved path is written in **median-depth units**
+   (1.0 = the scene's median depth), exactly like the manual Camera Path Configurator,
+   because the Geometry node multiplies the keys by that median before rendering.
+6. runs the **collision guard**: every path key is checked against the whole
    scene cloud and pushed away from the pivot until it is at least 15 % of the
    content radius clear of the nearest point, so the camera never ends up inside
    the geometry it orbits (the console line reports how many keys were moved).
@@ -548,6 +688,7 @@ socket (the source size with `resize` off). `keep_proportion` pads with
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `match` | IMAGE | reference image for the `match size` resize type |
+| `megapixels_in` | FLOAT | `forceInput` socket: when a float link is connected, this value replaces the `megapixels` widget for `scale total pixels` (clamped to 0.01 - 16.0) |
 
 ### Outputs
 
@@ -610,6 +751,34 @@ call (OpenAI, Ollama, Gemini or Claude). Vendored here from the standalone
   (`max_tokens` is the generating LLM's budget, not H3's limit).
 
 ---
+
+## Global: save without the running counter
+
+ComfyUI appends a running number to **every** saved file
+(`ComfyUI_00001_.png`, `MiniMax_H3_00001_.mp4`, `Preview_00025.mp4`, ...).
+There is no core option to disable this - each save node formats the counter
+unconditionally (`folder_paths.get_save_image_path` only computes it).
+
+This pack therefore ships a small global hook (`nodes/enndee_unique_filenames.py`,
+loaded automatically, no node appears in the UI): after a save finishes the
+file is renamed so the number only stays when the plain name is already taken:
+
+| written by ComfyUI | ends up on disk |
+|---|---|
+| `MyClip_20261002_143022_00001_.png` | `MyClip_20261002_143022.png` |
+| ... saved again with the same name | `MyClip_20261002_143022_1.png` |
+
+- Covered: core **Save Image**, **Save Latent**, **Save Video**, **Save WEBM**
+  and **VHS Video Combine** (including `-audio` sidecars and poster frames).
+  The UI previews keep working because the result entries are updated in
+  place; batch saves number from the second file on (`X.png`, `X_1.png`, ...).
+- Not touched: temp previews (`PreviewImage`), output files whose name has no
+  5-digit counter block.
+- Opt out: set the environment variable `ENNDEE_KEEP_FILE_COUNTER=1` before
+  starting ComfyUI.
+
+Works perfectly together with `DateTimeToString` prefixes: a per-second unique
+prefix means the number never shows up at all.
 
 ## License
 

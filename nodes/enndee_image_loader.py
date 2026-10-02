@@ -4,8 +4,9 @@ The widget layout mirrors the classic WAS "Load & Resize Image" node (file combo
 with upload button, ``resize`` toggle, width/height, repeat, keep_proportion,
 divisible_by, mask_channel, background_color). Additionally it offers the
 ``original_image`` output, the nine resize types of ComfyUI core's
-``ResizeImageMaskNode`` (see ``enndee_resize_modes``) and a ``match`` input for
-the "match size" type.
+``ResizeImageMaskNode`` (see ``enndee_resize_modes``), a ``match`` input for
+the "match size" type and a ``megapixels_in`` float socket that overrides the
+``megapixels`` widget when a link is connected (forceInput, no widget).
 """
 
 import hashlib
@@ -161,6 +162,11 @@ class ImageLoaderResizeEnndee:
                 "match": ("IMAGE", {
                     "tooltip": "Reference image for the 'match size' resize type.",
                 }),
+                "megapixels_in": ("FLOAT", {
+                    "default": 1.0, "min": 0.01, "max": 16.0, "step": 0.01,
+                    "forceInput": True,
+                    "tooltip": "Float signal for 'scale total pixels': when connected, this value replaces the 'megapixels' widget (clamped to 0.01 - 16.0).",
+                }),
             },
         }
 
@@ -185,12 +191,19 @@ class ImageLoaderResizeEnndee:
 
     def load(self, image, resize, resize_type, width, height, repeat, keep_proportion,
              divisible_by, mask_channel, background_color, multiplier, longer_size,
-             shorter_size, megapixels, multiple, scale_method, no_upscale=False, match=None):
+             shorter_size, megapixels, multiple, scale_method, no_upscale=False, match=None,
+             megapixels_in=None):
         image_path = folder_paths.get_annotated_filepath(image)
         loaded, alpha = load_image_frames(image_path)
         mask = extract_mask(loaded, alpha, mask_channel)
         original = loaded
         result = loaded
+
+        if megapixels_in is not None:
+            # Float signal socket (forceInput): a connected link wins over the
+            # widget. min/max mirror the widget spec so API links cannot leave
+            # the documented 0.01 - 16.0 range.
+            megapixels = min(16.0, max(0.01, float(megapixels_in)))
 
         if resize:
             step = max(1, int(divisible_by))

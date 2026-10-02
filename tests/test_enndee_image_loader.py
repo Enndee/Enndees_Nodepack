@@ -256,6 +256,41 @@ class ImageLoaderResizeEnndeeTests(unittest.TestCase):
         self.gradient("photo.png", 9, 4)
         self.assertNotEqual(first, loader.ImageLoaderResizeEnndee.IS_CHANGED(image=name))
 
+    def test_megapixels_in_is_a_force_input_float_socket(self):
+        node_types = loader.ImageLoaderResizeEnndee.INPUT_TYPES()
+        spec_type, metadata = node_types["optional"]["megapixels_in"]
+        self.assertEqual(spec_type, "FLOAT")
+        self.assertTrue(metadata["forceInput"])
+        self.assertEqual(metadata["min"], 0.01)
+        self.assertEqual(metadata["max"], 16.0)
+        self.assertIn("tooltip", metadata)
+        # The slider widget keeps its own FLOAT definition so saved workflows
+        # stay valid, and the socket does not duplicate the widget name.
+        self.assertEqual(node_types["required"]["megapixels"][0], "FLOAT")
+        self.assertNotIn("megapixels_in", node_types["required"])
+
+    def test_megapixels_in_overrides_the_widget_value(self):
+        name = self.gradient("photo.png", 8, 4)
+        widget_only = self.load(
+            image=name, resize=True, resize_type="scale total pixels",
+            divisible_by=1, megapixels=1.0)
+        self.assertEqual((widget_only[3], widget_only[4]), (1448, 724))
+        linked = self.load(
+            image=name, resize=True, resize_type="scale total pixels",
+            divisible_by=1, megapixels=1.0, megapixels_in=0.5)
+        self.assertEqual((linked[3], linked[4]), (1024, 512))
+
+    def test_megapixels_in_is_clamped_to_the_widget_bounds(self):
+        name = self.gradient("photo.png", 8, 4)
+        below = self.load(
+            image=name, resize=True, resize_type="scale total pixels",
+            divisible_by=1, megapixels=1.0, megapixels_in=0.0)
+        self.assertEqual((below[3], below[4]), (145, 72))
+        above = self.load(
+            image=name, resize=True, resize_type="scale total pixels",
+            divisible_by=1, megapixels=1.0, megapixels_in=99.0)
+        self.assertEqual((above[3], above[4]), (5793, 2896))
+
     def test_frontend_visibility_rules_match_the_backend_parameters(self):
         script = (PACK_DIR / "web" / "js" / "enndee_image_loader.js").read_text(encoding="utf-8")
         for resize_type in resize_modes.RESIZE_TYPES:

@@ -63,6 +63,22 @@ except Exception as _e:
     print(f"\033[31m[Enndee] LichtfeldHeadlessTrainer unavailable: {_e}\033[0m")
     LichtfeldHeadlessTrainer = None
 
+try:
+    from enndee_standby_signal import Enndee_StandbyOnSignal
+except Exception as _e:
+    print(f"\033[31m[Enndee] Enndee_StandbyOnSignal unavailable: {_e}\033[0m")
+    Enndee_StandbyOnSignal = None
+
+# Global save-behavior hook (no node): strip ComfyUI's running counter and
+# number files only when the target name is already taken. Opt out with the
+# environment variable ENNDEE_KEEP_FILE_COUNTER=1.
+try:
+    from enndee_unique_filenames import install as install_unique_filenames
+
+    install_unique_filenames()
+except Exception as _e:
+    print(f"\033[31m[Enndee] unique filenames unavailable: {_e}\033[0m")
+
 NODE_CLASS_MAPPINGS = {}
 NODE_DISPLAY_NAME_MAPPINGS = {}
 
@@ -99,6 +115,10 @@ if EnndeeMeridianGeometry is not None:
 if LichtfeldHeadlessTrainer is not None:
     NODE_CLASS_MAPPINGS["Enndee_LichtfeldHeadlessTrainer"] = LichtfeldHeadlessTrainer
     NODE_DISPLAY_NAME_MAPPINGS["Enndee_LichtfeldHeadlessTrainer"] = "Lichtfeld Headless Trainer (Enndee)"
+
+if Enndee_StandbyOnSignal is not None:
+    NODE_CLASS_MAPPINGS["Enndee_StandbyOnSignal"] = Enndee_StandbyOnSignal
+    NODE_DISPLAY_NAME_MAPPINGS["Enndee_StandbyOnSignal"] = "Standby On Signal (Enndee)"
 
 WEB_DIRECTORY = os.path.join(_pack_dir, "web")
 
