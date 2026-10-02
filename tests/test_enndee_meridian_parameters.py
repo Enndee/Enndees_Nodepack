@@ -50,7 +50,8 @@ def estimate_stub(document='{"frames": 73, "path": []}', summary=None):
         "target": "subject", "frames": 73, "source": "input mask", "points": 4096,
         "content_points": 1024, "pivot": [0.0, 0.0, 2.0], "extents": [1.0, 1.0, 1.0],
         "pivot_offset": [0.0, 0.0, 0.0], "content_radius": 0.5, "orbit_radius": 1.1,
-        "style": "front O-orbit + height lap", "amplitude_scale": 0.75,
+        "orbit_fill": 2.2, "orbit_size": 1.0,
+        "style": "front O-orbit + closing orbit", "amplitude_scale": 0.75,
         "travel_per_frame": 0.02, "budget_per_frame": 0.06, "keys": 19, "max_speed": 0.02,
         "scene_radius": 3.0, "scene_pivot": [0.0, 0.0, 2.5], "collision_fixes": 0,
         "collision_margin": 0.15, "clearance_before": 0.4, "clearance_after": 0.4,
@@ -125,6 +126,26 @@ class MeridianParametersWidgetTests(unittest.TestCase):
             metadata = required[f"auto_pivot_{axis}"][1]
             self.assertEqual(metadata["default"], 0.0)
             self.assertEqual((metadata["min"], metadata["max"]), (-1.0, 1.0))
+        distance = required["auto_orbit_distance"][1]
+        self.assertEqual(distance["default"], 0.0)          # 0 = the auto framing decides the distance
+        self.assertEqual((distance["min"], distance["max"]),
+                         (0.0, parameters.ORBIT_DISTANCE_MAX))
+        fill = required["auto_subject_fill"][1]
+        self.assertAlmostEqual(fill["default"], parameters.SUBJECT_FILL_DEFAULT)
+        self.assertEqual((fill["min"], fill["max"]),
+                         (parameters.SUBJECT_FILL_MIN, parameters.SUBJECT_FILL_MAX))
+        size = required["auto_orbit_size"][1]
+        self.assertAlmostEqual(size["default"], parameters.ORBIT_SIZE_DEFAULT)
+        self.assertEqual((size["min"], size["max"]),
+                         (parameters.ORBIT_SIZE_MIN, parameters.ORBIT_SIZE_MAX))
+        end = required["auto_orbit_end"][1]
+        self.assertAlmostEqual(end["default"], parameters.ORBIT_END_DEFAULT)
+        self.assertEqual((end["min"], end["max"]),
+                         (parameters.ORBIT_END_MIN, parameters.ORBIT_END_MAX))
+        turn = required["auto_orbit_direction"][1]
+        self.assertEqual(turn["default"], parameters.ORBIT_DIRECTION_DEFAULT)
+        self.assertIn(turn["default"], parameters.ORBIT_DIRECTIONS)
+        self.assertEqual(required["auto_orbit_direction"][0], list(parameters.ORBIT_DIRECTIONS))
         self.assertEqual(all_defaults()["path_camera_mode"], "O Orbits")
 
     def test_javascript_mirrors_the_widget_names_and_mode_labels(self):
@@ -236,6 +257,19 @@ class MeridianAutomaticCameraTests(unittest.TestCase):
         printed = buffer.getvalue()
         self.assertIn("[Enndee] Meridian auto camera:", printed)
         self.assertIn("2 %/frame", printed)          # the speed cap is reported in percent
+
+    def test_automatic_path_forwards_the_orbit_shape_widgets(self):
+        """Auto Subject Fill / Orbit Size reach the estimator; Orbit Distance is deprecated."""
+        fake, calls, _report = estimate_stub()
+        values = all_defaults()
+        values.update(camera_mode=parameters.AUTOMATIC_MODE, auto_orbit_distance=3.5,
+                      auto_orbit_size=0.6, auto_subject_fill=25.0)
+        with mock.patch.object(parameters, "estimate_camera_path", side_effect=fake):
+            NODE().build(reference_image=torch.zeros(1, 8, 8, 3), **values)
+        self.assertEqual(len(calls), 1)
+        self.assertIsNone(calls[0]["orbit_distance"])   # deprecated: always ignored now
+        self.assertAlmostEqual(calls[0]["orbit_size"], 0.6)
+        self.assertAlmostEqual(calls[0]["subject_fill"], 25.0)
 
     def test_automatic_mode_requires_the_reference_image(self):
         values = all_defaults()

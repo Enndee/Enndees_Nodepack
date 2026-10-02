@@ -3,18 +3,49 @@
 The Meridian Parameter Picker's automatic camera mode asks this module for a path instead of
 letting the user hand-place one. Two targets:
 
-    subject  orbit the main subject - an optional MASK input, else the near depth layer
-    scene    a wider scan that keeps the whole reconstructed surface in frame
+    subject  orbit the main subject - an optional MASK input, else the near depth layer - and
+             close the round around it: the framing solves the distance so the subject fills
+             `Auto Subject Fill` percent of the picture (and re-centres the pivot on its projected
+             midpoint), then the front O-orbit opens on that framed front pose (the middle of the
+             O), rises to the top of the O (12 o'clock) and swings around to the subject's side -
+             counter-clockwise or clockwise, whichever `Auto Orbit Direction` asks for. From there
+             the concluding orbit runs `Auto Orbit End` degrees (360 = all the way back to the start
+             point, the middle of the O; the elevation arcs up to a new height at the back and back
+             down, so the clip loops)
+    scene    a lateral survey: rows of viewpoints spread across the scene's width, each row
+             sweeping the elevation from below the horizon to above it, so every side of the
+             scene has parallax basis. Deliberately *not* a 360 deg surround - a depth
+             reprojection cannot invent the back of a scene, and the frames are better spent on
+             the sides a walk-in viewer actually looks from (the drone-mapping lawnmower rule:
+             rows with ~70 % side overlap instead of crosshatch/oblique excess)
 
-Both keep the per-frame camera travel under a speed cap (`max_speed` x content radius per
-frame): too fast a camera - too much new surface per frame - is what makes Meridian's depth
-reprojections smear and flicker. When the frame count cannot cover the desired swing at that
-speed, the swing is shortened and the summary says so.
+Both keep the per-frame camera travel under a speed cap. For a **subject** the cap is measured in
+the subject's own *pixels* (`max_speed` x its apparent radius per frame, see `subject_drift`) - the
+background never enters that budget, so a far background cannot slow the subject down. The front
+O-orbit grows above Auto Orbit Size as far as the budget allows (the user's size is a *floor*, so
+the front keeps its width), the frames are split between O and lap so both run at the same drift
+(`balanced_front_share`), and when the max camera speed still cannot pay for the requested end, the
+*concluding orbit* is cut there - the cap wins, the coverage gives way, and the summary names the
+levers (more frames, a higher Auto Max Speed, a shorter end). Only when the cap cannot even pay for
+the O's own loop does the fit shrink it below Auto Orbit Size; it then maximises the front's width
+times the azimuth it covers, so neither the front nor the round becomes useless, and says so too.
+The **scene** survey keeps the world-unit cap (`max_speed` x content radius per frame), which also
+backs the subject path when no pixel cap is given. Too fast a camera - too much new surface per
+frame - is what makes Meridian's depth reprojections smear and flicker; when the frame count cannot
+cover the desired swing at that speed, the amplitudes are scaled down and the summary says so.
 
 The surface is unprojected exactly like the fast-depth renderer (frame-0 camera coordinates,
 `VFOV_DEGREES`, `x = (u - cx) / f * z`), and the emitted document is the same
 `MERIDIAN_CAMERA_PATH` JSON the Camera Path Configurator produces, so the Geometry node and
 the fast-depth backend consume it unchanged.
+
+For a *framed subject* the orbit centre is finally **equalised** so the camera-to-subject distance -
+the subject's apparent size - stays as constant as the picture allows around the whole path (0/90/
+180/270 and start/middle/end): the equaliser moves only the orbit centre, the aim (and with it the
+composition) stays exactly on the framing solution, and a move that would crop the subject is scaled
+back until every frame clears again. The **Auto Pivot X/Y/Z offsets** translate the finished path
+(positions *and* aim) and are applied last, on purpose: the framing, visibility and amplitude solves
+can never cancel them - they are the dependable composition nudge.
 """
 
 import json
@@ -33,18 +64,87 @@ AUTO_TARGETS = (SUBJECT_TARGET, SCENE_TARGET)
 AUTO_DEPTH_RES = 504              # DA3 process_res for the surface estimate (stats need no more)
 MIN_SUBJECT_PIXELS = 64           # absolute floor for a near layer / mask to count as a subject
 MIN_SUBJECT_SHARE = 0.01          # ... plus 1 % of the cloud, so big frames need a real subject
+NO_SUBJECT_SOURCE = "whole surface (no clear near layer)"   # split_subject's "there is no subject"
 PIVOT_PERCENTILE_LOW = 2.0        # per-axis clip before the bounding-box midpoint (robust pivot)
 PIVOT_PERCENTILE_HIGH = 98.0
-SUBJECT_FILL = 2.2                # orbit radius / subject radius (~45 % frame fill at 55 deg vfov)
-SCENE_FILL = 2.0                  # the scene gets a deliberately big oval
-FRONT_ORBIT_SHARE = 0.5           # share of the frames spent on the front O-orbit
-FRONT_YAW_AMPLITUDE = 62.0        # deg, the front O swings this far to either side
-FRONT_ELEVATION = 30.0            # deg, the front O reaches this high/low
-REST_YAW_SPAN = 270.0             # deg, the height orbit laps around the rest of the subject
-REST_ELEVATION_HIGH = 38.0        # where the height orbit ends: a new height, no surface repeat
-SCENE_SPAN = 350.0                # deg, the scene oval stops just short of a full lap
-SCENE_ELEVATION_LOW = -12.0
-SCENE_ELEVATION_HIGH = 28.0
+SUBJECT_FILL = 2.2                # fallback orbit radius / subject radius (Auto Orbit Distance 0)
+SCENE_FILL = 2.0                  # stand-off for the scene survey (content radii)
+FRONT_ORBIT_RISE = 0.25           # share *of the front loop* spent rising from the framed front
+                                  # pose (yaw 0, elevation 0 = the middle of the O) to its top
+FRONT_YAW_AMPLITUDE = 62.0        # deg, the front O swings this far to either side at scale 1
+FRONT_ELEVATION = 30.0            # deg, the front O reaches this high/low at scale 1
+FRONT_YAW_LIMIT = 85.0            # deg, the front O never swings past this (the sides, not the lap)
+FRONT_ELEVATION_LIMIT = 60.0      # deg, same for the elevation (gimbal lock starts at 70)
+
+# Subject framing: the orbit distance is solved so the subject covers `auto_subject_fill` percent of
+# the frame *area* (projected bounding box, 1 %/99 % percentiles plus a silhouette margin), and the
+# pivot is re-centred on the subject's projected midpoint. The speed cap is then expressed in the
+# subject's own pixels (drift per frame as a fraction of its apparent radius): a nearer/framed
+# bigger subject buys a larger step, the background never enters the budget.
+SUBJECT_FILL_DEFAULT = 40.0       # percent of the frame area (Auto Subject Fill widget default)
+SUBJECT_FILL_MIN = 0.0            # 0 = off: fly at the Auto Orbit Distance / built-in fill
+SUBJECT_FILL_MAX = 90.0
+SUBJECT_PROJECTION_MARGIN = 1.10  # projected surface points -> visible silhouette allowance
+FRAMING_ITERATIONS = 4            # distance fixed-point steps per round (perspective != exactly 1/d^2)
+FRAMING_ROUNDS = 3                # distance/re-centre rounds (the shift changes the area a little)
+FRAMING_POOL = 20000              # subject points used by the framing / drift metrics
+FRAMING_PERCENTILE_LOW = 1.0      # projected bbox clip (stray points must not inflate the subject)
+FRAMING_PERCENTILE_HIGH = 99.0
+SUBJECT_BOX_PERCENTILE_LOW = 0.2   # per-axis clip of the *whole-subject* box the visibility pass
+SUBJECT_BOX_PERCENTILE_HIGH = 99.8  #   keeps inside the frame (stray points out, nothing else cut)
+VISIBILITY_MARGIN = 0.02           # share of the frame each border keeps free of the subject box
+VISIBILITY_PASSES = 3              # path rebuilds: a pull-back raises the cap -> the amplitude
+VISIBILITY_BISECTIONS = 12         # bisection steps of the pull-back ("dolly out until it fits")
+VISIBILITY_MAX_SCALE = 8.0         # furthest the visibility pass may pull the camera back
+VISIBILITY_SCAN_STEPS = 15         # pivot scan for the worst pose (coarse) ...
+VISIBILITY_REFINE_STEPS = 9        # ... and the refinement around its best sample
+VISIBILITY_QUARTILES = (0.0, 0.25, 0.5, 0.75, 1.0)   # the frames the report names explicitly
+VISIBILITY_POOL = 1500             # subject points per clearance evaluation (per frame, so cheap)
+CANVAS_HEIGHT = 1000.0            # canonical pixel height for the projection metrics (ratios only)
+DRIFT_POOL = 3000                 # subject points used per drift evaluation (speed: keep it small)
+DRIFT_PERCENTILE = 95.0           # per-step drift percentile that has to fit the cap
+DRIFT_STEPS = 40                  # steps sampled along the path for the drift measurement
+FIT_GROW_STEP = 0.05              # amplitude ladder step (the fit searches the *growth* too)
+FULL_CIRCLE = 360.0               # deg, one full round around the subject
+FRONT_ORBIT_SHARE_LOW = 0.10      # the balanced frame split never starves either half of the path
+FRONT_ORBIT_SHARE_HIGH = 0.92
+REST_ELEVATION_HIGH = 38.0        # the height the concluding orbit reaches at the subject's back
+LOOP_TRAVEL_FACTOR = 2.0 * math.pi   # the O's arc: 2*pi x A radii per loop of frames (see below)
+
+# The concluding orbit (the lap after the front O): where it ends and which way it runs. `end` is
+# measured in degrees around the subject from the start azimuth (the middle of the O), so the default
+# 360 brings the camera back to the *start point* - the elevation arc lands on 0 as well, which makes
+# frame N-1 sit on frame 0 (the clip loops). The orbit's *speed* is the hard limit: when the max
+# camera speed cannot pay for the requested end, the lap is cut and the console names the levers.
+ORBIT_END_DEFAULT = 360.0         # deg, back to the start point (the middle of the O)
+ORBIT_END_MIN = 0.0               # 0 = no lap at all: the path is the front O alone
+ORBIT_END_MAX = 720.0             # two rounds; more is never useful
+ORBIT_CUT_TARGET = 0.96           # the cut aims a touch *below* the cap: the analytic step lands on
+                                  # it, and a path that merely touches the cap still measures a hair
+                                  # over it - the margin is what makes the cut rungs *fit*
+ORBIT_CUT_STEPS = 3
+ORBIT_DIRECTIONS = ("counter-clockwise", "clockwise")
+ORBIT_DIRECTION_DEFAULT = ORBIT_DIRECTIONS[0]
+
+# Scene target: a lateral survey instead of a lap around the scene. Meridian's scene renders are
+# depth reprojections, so what a walk-in VR viewer needs is *side* coverage: rows of viewpoints
+# spread across the scene's width at the source viewpoint's distance, each row sweeping the
+# elevation from below the horizon to above it. That is the drone-mapping lawnmower pattern
+# (boustrophedon rows, 70-80 % side overlap, one oblique pass for the off-nadir sides) mapped onto
+# the reprojection camera: no 360 deg surround, every frame buys lateral parallax or a new height.
+SCENE_LATERAL_OVERLAP = 0.7       # side-lap between neighbouring rows (drone mapping default)
+SCENE_COVERAGE_MARGIN = 1.30      # outer rows sit this many half-widths off centre
+SCENE_FILL_MIN = 1.0              # the survey never comes closer than one content radius
+SCENE_FILL_MAX = 8.0              # ... and never further out than this (reach/fill solve ceiling)
+SCENE_SUBJECT_SHARE_MIN = 0.02    # below this the console says the subject is too small to read
+SCENE_LANE_OVERLAP_WARN = 0.30    # rows this far apart (side overlap) leave gaps between them
+SCENE_MIN_LANES = 3               # left / centre / right: the minimum for usable side views
+SCENE_MAX_LANES = 9               # more rows than this buy nothing at 73-243 frames
+SCENE_YAW_LIMIT = 70.0            # deg, the outermost row's azimuth never exceeds this
+SCENE_FRAMES_PER_LANE = 4         # frames a row needs so the Catmull-Rom keys can follow it
+SCENE_ELEVATION_LOW = -12.0       # rows start just below the horizon (under-surfaces)
+SCENE_ELEVATION_HIGH = 28.0       # ... and climb well above it (looking down into the scene)
+
 KEY_TARGET = 17                   # path keys (Catmull-Rom control points)
 AMPLITUDE_STEPS = 40              # lambda ladder: 1.0, 0.975, ... 0.025 (2.5 % rungs)
 MIN_ORBIT_RADIUS = 0.05           # never place the camera on the content
@@ -53,6 +153,45 @@ COLLISION_MARGIN = 0.15           # of the content radius: how close a camera ke
 COLLISION_ITERATIONS = 4
 COLLISION_MAX_POINTS = 120_000    # stride bigger clouds down for the distance checks
 MAX_PIVOT_OFFSET = 1.0            # pivot offset widgets, in content radii
+
+# The pivot equaliser (framed subject paths): after the framing and the visibility pass the orbit
+# centre is nudged so the camera-to-subject distance stays as constant as possible along the final
+# path - that is what keeps the subject *box* the same size at 0/90/180/270 degrees and at the
+# start, the middle and the end of the clip. The spread of |camera - subject centre| over the
+# sampled path is minimised with a coarse-to-fine coordinate scan around the solved pivot, pulled
+# slightly towards the centre and bounded to EQUALIZER_LIMIT content radii. The visibility
+# guarantee wins: a move that crops the subject is bisected down until every frame clears again.
+EQUALIZER_CENTRE_WEIGHT = 0.05    # tie-breaker: the preferred pivot is the subject's own centre
+EQUALIZER_SCAN_STEPS = 13         # coarse scan candidates per axis ...
+EQUALIZER_REFINE_STEPS = 9        # ... and the refinement around the best candidate
+EQUALIZER_LIMIT = 0.75            # furthest the equaliser may move the aim, in content radii
+EQUALIZER_SAMPLES = 33            # poses sampled along the final path for the spread metric
+EQUALIZER_BISECTIONS = 7          # crop fallback: halvings of the move until the path clears
+EQUALIZER_CLEARANCE_TOL = 1.0     # px of the solved path's border clearance the move may spend
+
+# The subject cylinder (2026-10-02): the subject is approximated by a vertical cylinder whose axis
+# is BOTH the orbit centre and the aim, so the subject sits in the horizontal picture centre at every
+# pose (the cylinder is symmetric about its axis, and the axis projects onto the image centre line)
+# and the camera keeps ONE constant distance to the pivot for the whole path. The fit trims outliers
+# per axis (a lance or a stray depth spike must not decide the shape) and the radius is the
+# CYLINDER_COVERAGE percentile of the radial distance in the x-z plane, i.e. ~90-95 % of the surface
+# sits inside the cylinder - the rest is treated as outlier and left out of the framing/visibility
+# pool.
+CYLINDER_PERCENTILE_LOW = 2.5     # per-axis trim of the cylinder centre/height (2.5 %/97.5 %)
+CYLINDER_PERCENTILE_HIGH = 97.5
+CYLINDER_COVERAGE = 0.95          # share of the surface the cylinder radius encloses (90-95 %)
+
+# The automatic path's user knob (the node's Auto Orbit Size widget). Auto Orbit **Distance** is
+# DEPRECATED and ignored: the camera-to-pivot distance now always follows Auto Subject Fill (subject)
+# or the survey solve (scene). For a subject more fill = closer camera (see `subject_framing`); the
+# old fixed stand-off made the fill and the distance fight each other. `size` multiplies every swing
+# amplitude of the path (1.0 = the built-in amplitudes).
+ORBIT_DISTANCE_DEFAULT = SUBJECT_FILL
+ORBIT_DISTANCE_MIN = 0.5          # closer would sit inside the subject before the collision guard
+ORBIT_DISTANCE_MAX = 8.0
+ORBIT_SIZE_DEFAULT = 1.0
+ORBIT_SIZE_MIN = 0.1              # a 10 % loop, for a tiny bit of parallax
+ORBIT_SIZE_MAX = 3.0              # wider than the built-in swing; the speed fit may still cap it
 
 
 
@@ -148,7 +287,7 @@ def split_subject(points):
     share = near.shape[0] / points.shape[0]
     if near.shape[0] >= _minimum_subject_pixels(points.shape[0]) and 0.03 <= share <= 0.70:
         return near, f"near depth layer ({near.shape[0]} of {points.shape[0]} points)"
-    return points, "whole surface (no clear near layer)"
+    return points, NO_SUBJECT_SOURCE
 
 
 def subject_points(depth, mask=None):
@@ -195,20 +334,31 @@ def validate_frames(frames):
 def _fit_amplitude(samples_of, budget_per_frame, ladder=AMPLITUDE_STEPS):
     """Largest amplitude scale whose path keeps every per-frame step within the speed budget.
 
-    The path is sampled at full amplitude first, the true camera travel between consecutive
-    frames is measured, then the amplitudes are scaled down the ladder until the step fits. Every
-    number stays a *ratio* to the content radius, so the estimate is scale-, resolution- and
-    gauge-independent. Returns (scale, samples, travel_per_frame).
+    The path is sampled at every rung of the ladder, the true camera travel between consecutive
+    frames is measured, and the largest scale that fits wins. Every number stays a *ratio* to the
+    content radius, so the estimate is scale-, resolution- and gauge-independent. The ladder is not
+    walked down with an early break any more: once the lap follows the circle rule the travel is no
+    longer monotone in the scale (a narrower O means a longer lap), so all rungs are measured - and
+    when none fits, the one with the smallest overshoot is reported instead of the floor, which may
+    well be worse. Returns (scale, samples, travel_per_frame).
     """
-    scale, samples, travel = 1.0, [], 0.0
+    best = None
+    closest = None
     for step in range(ladder):
         scale = round(1.0 - 0.025 * step, 3)
         samples = samples_of(scale)
         travel = max((math.dist(samples[index - 1], samples[index])
                       for index in range(1, len(samples))), default=0.0)
         if travel <= budget_per_frame:
-            break
-    return scale, samples, travel
+            if best is None:
+                best = (scale, samples, travel)   # the ladder runs down: the first fit is the widest
+        elif closest is None or travel < closest[2]:
+            closest = (scale, samples, travel)
+    if best is not None:
+        return best
+    if closest is not None:
+        return closest
+    return 1.0, samples_of(1.0), 0.0
 
 
 def _place(centre, radius, yaw_degrees, elevation_degrees):
@@ -227,6 +377,715 @@ def _place(centre, radius, yaw_degrees, elevation_degrees):
     return [float(centre[axis]) + offset[axis] * radius for axis in range(3)]
 
 
+def front_camera(pivot, distance):
+    """Camera position of the front pose (yaw 0, elevation 0): between the pivot and the origin."""
+    return _place(pivot, distance, 0.0, 0.0)
+
+
+def front_amplitudes(scale=1.0, size=1.0):
+    """(yaw, elevation) swing of the front O in deg: the built-in amplitudes x scale x size.
+
+    One definition for the path, the fit's ladder and the console, always clamped to the view
+    limits (FRONT_YAW_LIMIT / FRONT_ELEVATION_LIMIT) - the O never swings past the subject's sides.
+    """
+    size = max(1e-3, float(size))
+    return (min(FRONT_YAW_LIMIT, FRONT_YAW_AMPLITUDE * float(scale) * size),
+            min(FRONT_ELEVATION_LIMIT, FRONT_ELEVATION * float(scale) * size))
+
+
+def lap_span_for_end(yaw_amplitude, end=None):
+    """Lap span (deg) that carries the path from the O's side (+A) to `end` degrees around it.
+
+    The concluding orbit always continues where the O ended (its side, +A in the travel direction),
+    so the span is simply what is left of the requested end. `end = 360` (the default) therefore
+    runs the lap around the back and back to the start point - the middle of the O.
+    """
+    end = ORBIT_END_DEFAULT if end is None else max(ORBIT_END_MIN, float(end))
+    return max(0.0, end - max(0.0, float(yaw_amplitude)))
+
+
+def direction_mirror(direction=ORBIT_DIRECTION_DEFAULT):
+    """+1.0 for a counter-clockwise orbit (the default), -1.0 for clockwise - the yaw's sign."""
+    text = str(direction).strip().lower()
+    if text == ORBIT_DIRECTION_DEFAULT:
+        return 1.0
+    if text == ORBIT_DIRECTIONS[1]:
+        return -1.0
+    raise ValueError(f"Unknown orbit direction {direction!r}; choose {', '.join(ORBIT_DIRECTIONS)}.")
+
+
+def direction_label(direction=ORBIT_DIRECTION_DEFAULT):
+    """'ccw' / 'cw' - the short form the console and QC lines use for the orbit direction."""
+    return "ccw" if direction_mirror(direction) > 0.0 else "cw"
+
+
+def balanced_front_share(yaw_amplitude, lap_span):
+    """Share of the frames the front O gets so that O and lap run at the *same* per-frame drift.
+
+    The speed cap is per frame, so the frames are the real currency. The O's arc sweeps 270 deg of
+    its envelope in 3/4 of its frames, i.e. at `2*pi*A` radii per loop of frames, while the lap
+    travels its span on the full circle - splitting the frames in that ratio puts both halves at the
+    same subject motion, which is the smallest worst-case drift the path can have at this frame
+    count (the speed cap's best case). A path without a lap takes (almost) every frame; a very long
+    lap still leaves the O its tenth.
+    """
+    loop = LOOP_TRAVEL_FACTOR * math.radians(max(0.0, float(yaw_amplitude)))
+    lap = math.radians(max(0.0, float(lap_span)))
+    if lap <= 1e-9:
+        return FRONT_ORBIT_SHARE_HIGH
+    return min(FRONT_ORBIT_SHARE_HIGH,
+               max(FRONT_ORBIT_SHARE_LOW, loop / (loop + lap)))
+
+
+def _decimate(points, limit):
+    """Every n-th point of a cloud, capped to about `limit` samples (metrics need no more)."""
+    points = points.reshape(-1, 3)
+    stride = max(1, int(math.ceil(points.shape[0] / max(1, int(limit)))))
+    return points[::stride]
+
+
+def _look_axes(points, camera_position, pivot):
+    """(x, y, z) of `points` in a camera frame - renderer convention (right, down, forward).
+
+    `_look_at` in the fast-depth backend builds the same basis (world up = -y in OpenCV axes, zero
+    roll), so a pixel measured here is a pixel the renderer would produce.
+    """
+    device, dtype = points.device, points.dtype
+    position = torch.as_tensor(camera_position, device=device, dtype=dtype)
+    forward = torch.as_tensor(pivot, device=device, dtype=dtype) - position
+    forward = forward / forward.norm().clamp(min=1e-8)
+    up = torch.tensor([0.0, -1.0, 0.0], device=device, dtype=dtype)
+    right = torch.cross(forward, up, dim=0)
+    if float(right.norm()) < 1e-6:                     # looking straight up or down: keep x
+        right = torch.tensor([1.0, 0.0, 0.0], device=device, dtype=dtype)
+    else:
+        right = right / right.norm()
+    down = torch.cross(forward, right, dim=0)
+    relative = points - position
+    return relative @ right, relative @ down, relative @ forward
+
+
+def project_points(points, camera_position, pivot, surface, height=CANVAS_HEIGHT):
+    """(u, v, z) pixels of world `points` in a camera's frame - the renderer's own pinhole.
+
+    `f = 0.5 * height / tan(vfov / 2)`, canvas width from the still's aspect ratio. The canvas
+    height is a *canonical* 1000 px: every metric below is a ratio of the frame, so it cancels.
+    """
+    focal = 0.5 * float(height) / math.tan(math.radians(fast_depth.VFOV_DEGREES) / 2.0)
+    aspect = float(surface.get("aspect") or (16.0 / 9.0))
+    x_c, y_c, z_c = _look_axes(points, camera_position, pivot)
+    width = float(height) * aspect
+    safe = z_c.clamp(min=1e-6)
+    return 0.5 * width + focal * x_c / safe, 0.5 * float(height) + focal * y_c / safe, z_c
+
+
+def _projected_box(points, camera_position, pivot, surface, height=CANVAS_HEIGHT):
+    """(width, height, centre u, centre v, depth, canvas width) of the projected subject box.
+
+    The box is the 1 %/99 % percentile rectangle of the projected points (stray depth spikes must
+    not inflate the subject) plus SUBJECT_PROJECTION_MARGIN, which stands in for the silhouette
+    between the sampled surface points.
+    """
+    u, v, z = project_points(points, camera_position, pivot, surface, height)
+    visible = z > 1e-4
+    if int(visible.sum()) < 8:
+        raise ValueError("The subject ends up behind the camera - nothing to frame.")
+    u, v, z = u[visible], v[visible], z[visible]
+    low_u = _percentile(u, FRAMING_PERCENTILE_LOW / 100.0)
+    high_u = _percentile(u, FRAMING_PERCENTILE_HIGH / 100.0)
+    low_v = _percentile(v, FRAMING_PERCENTILE_LOW / 100.0)
+    high_v = _percentile(v, FRAMING_PERCENTILE_HIGH / 100.0)
+    canvas_width = float(height) * float(surface.get("aspect") or (16.0 / 9.0))
+    return (max(1.0, high_u - low_u) * SUBJECT_PROJECTION_MARGIN,
+            max(1.0, high_v - low_v) * SUBJECT_PROJECTION_MARGIN,
+            (low_u + high_u) / 2.0, (low_v + high_v) / 2.0, float(_percentile(z, 0.5)),
+            canvas_width)
+
+
+def _fill_envelope(points, pivot, distance, surface, size, canvas_area, height):
+    """(min, max) projected area share of the subject over the path's swing envelope.
+
+    The framing must not hold at the front pose alone: along the orbit the projected box grows
+    (the near side comes closer) and shrinks (the elevation foreshortens it), which pushed the fill
+    to 22-40 % around a 40 % target. Sampling the swing envelope (the built-in amplitudes x the
+    user's O size, clamped by the view limits) gives the range the user actually gets, and the
+    framing targets its geometric mean so the subject stays inside the requested band throughout.
+
+    Only the *front* swing enters the mean: the lap's far side sees the subject at very different
+    distances, and mixing those poses into a mean drags the front pose far above the target (74 % for
+    a 40 % request, measured). The lap is covered by `_envelope_angles` + `_room_distance` instead -
+    a *room* requirement, which can only pull the camera back, never push it in.
+    """
+    angles = _envelope_angles(size, include_lap=False)
+    positions = [_place(pivot, distance, yaw, elevation) for yaw, elevation in angles]
+    u, v, z = _batch_project(points, positions, pivot, surface, height)
+    areas = []
+    for index in range(len(angles)):
+        visible = z[index] > 1e-4
+        if int(visible.sum()) < 8:
+            raise ValueError("The subject ends up behind the camera - nothing to frame.")
+        u_row, v_row = u[index][visible], v[index][visible]
+        width = max(1.0, _percentile(u_row, FRAMING_PERCENTILE_HIGH / 100.0)
+                    - _percentile(u_row, FRAMING_PERCENTILE_LOW / 100.0))
+        height_box = max(1.0, _percentile(v_row, FRAMING_PERCENTILE_HIGH / 100.0)
+                         - _percentile(v_row, FRAMING_PERCENTILE_LOW / 100.0))
+        areas.append(width * SUBJECT_PROJECTION_MARGIN * height_box * SUBJECT_PROJECTION_MARGIN
+                     / canvas_area)
+    return min(areas), max(areas)
+
+
+def _envelope_angles(size, include_lap=True, orbit_end=None, direction=ORBIT_DIRECTION_DEFAULT):
+    """(yaw, elevation) sample list of the path's swing envelope at the built-in amplitudes x `size`.
+
+    With `include_lap` the concluding orbit's own poses are appended (from the O's side around to
+    `end`, the elevation arcing up to REST_ELEVATION_HIGH at its middle and back down to 0): the far
+    side of that lap - looking back at the subject from behind and above - is the tightest pose in
+    practice, and the room check has to include it.
+    """
+    yaw_amplitude = min(FRONT_YAW_LIMIT, FRONT_YAW_AMPLITUDE * size)
+    elevation_amplitude = min(FRONT_ELEVATION_LIMIT, FRONT_ELEVATION * size)
+    angles = [(yaw_amplitude * yaw_step, elevation_amplitude * elevation_step)
+              for yaw_step in (-1.0, -0.5, 0.0, 0.5, 1.0)
+              for elevation_step in (-1.0, 0.0, 1.0)]
+    if not include_lap:
+        return angles
+    span = lap_span_for_end(yaw_amplitude, orbit_end)
+    rest_high = min(FRONT_ELEVATION_LIMIT, REST_ELEVATION_HIGH * size)
+    mirror = direction_mirror(direction)
+    if span <= 1e-9:
+        return angles                      # no concluding orbit -> no lap poses to make room for
+    for fraction in (0.0, 0.25, 0.5, 0.75, 1.0):
+        angles.append((mirror * (yaw_amplitude + span * fraction),
+                       rest_high * (1.0 - math.cos(2.0 * math.pi * fraction)) / 2.0))
+    return angles
+
+
+def _room_distance(pool, surface, pivot, distance, size, height, margin_px, orbit_end=None,
+                   direction=ORBIT_DIRECTION_DEFAULT):
+    """Smallest distance >= `distance` that clears the frame at every pose of the whole path.
+
+    The counterpart of the fill: the framing may want a close camera for the requested fill, but the
+    O-orbit - and the concluding orbit that runs around the back - need room. Both requirements meet
+    here: the returned distance is the larger of the two, so the fill request is never violated
+    *upwards* and no pose of the fitted path leaves the frame. A lap that does not fit at this
+    distance therefore pulls the camera back (the fill pays) instead of being cut (coverage pays) -
+    the *speed* cap is the only thing allowed to shorten the orbit. Bisection works because pulling
+    back shrinks every projection towards the frame centre.
+    """
+    angles = _envelope_angles(size, include_lap=True, orbit_end=orbit_end, direction=direction)
+
+    def worst(factor):
+        positions = [_place(pivot, distance * factor, yaw, elevation) for yaw, elevation in angles]
+        return min(visibility_clearances(pool, positions, pivot, surface, height, margin_px))
+
+    if worst(1.0) >= 0.0:
+        return distance
+    if worst(VISIBILITY_MAX_SCALE) < 0.0:
+        return distance * VISIBILITY_MAX_SCALE
+    low, high = 1.0, VISIBILITY_MAX_SCALE
+    for _ in range(VISIBILITY_BISECTIONS):
+        middle = 0.5 * (low + high)
+        if worst(middle) >= 0.0:
+            high = middle
+        else:
+            low = middle
+    return distance * high
+
+
+def _amplitude_ceiling(size):
+    """Largest amplitude scale the view limits allow (FRONT_YAW_LIMIT / _ELEVATION_LIMIT).
+
+    One definition for the fit's ladder, the visibility pass and the console hint, so a change to
+    the limits can never leave one of them behind.
+    """
+    return min(FRONT_YAW_LIMIT / FRONT_YAW_AMPLITUDE,
+               FRONT_ELEVATION_LIMIT / FRONT_ELEVATION) / max(1e-3, float(size))
+
+
+def subject_box(surface):
+    """(corners [8, 3], extents [3]) - the subject's world-space box, reported for diagnostics.
+
+    Per-axis SUBJECT_BOX_PERCENTILE_LOW/.._HIGH percentiles: a trimmed *minimum/maximum* box, so a
+    few stray depth points cannot inflate it. It is the honest "how deep and how wide is this
+    subject" number for the console/report (a deep subject, e.g. a mask that spans a table top,
+    is what makes the visibility pass work) - the guarantee itself uses the *projected* extent,
+    because a box that is deep in world space is usually a thin silhouette in the picture.
+    """
+    points = surface["content_cloud"].reshape(-1, 3)
+    low = [_percentile(points[:, axis], SUBJECT_BOX_PERCENTILE_LOW / 100.0) for axis in range(3)]
+    high = [_percentile(points[:, axis], SUBJECT_BOX_PERCENTILE_HIGH / 100.0) for axis in range(3)]
+    corners = [[high[axis] if (mask >> axis) & 1 else low[axis] for axis in range(3)]
+               for mask in range(8)]
+    return (torch.tensor(corners, device=points.device, dtype=points.dtype),
+            [high[axis] - low[axis] for axis in range(3)])
+
+
+def fit_subject_cylinder(surface):
+    """(centre [3], radius, coverage, keep) - a vertical cylinder around the subject.
+
+    The subject is approximated by a **cylinder** with a vertical axis (`y` in the frame-0 camera
+    frame): the centre is the robust trimmed midpoint of x, y and z (`CYLINDER_PERCENTILE_LOW/_HIGH`),
+    the radius the `CYLINDER_COVERAGE` percentile of the radial distance in the x-z plane, so ~95 %
+    of the surface sits inside and a lance, a chair leg or a stray depth spike cannot inflate the
+    fit. `keep` is the boolean mask of the points inside the cylinder (radius *and* trimmed height),
+    i.e. the robust 95 % subject the framing and the visibility guarantee work on.
+
+    The cylinder - not a box - is the right primitive here: the whole path aims at its axis, and a
+    rotationally symmetric shape about that axis keeps a *constant* left-right extent whatever the
+    azimuth, which is what puts the subject in the horizontal picture centre at every pose.
+    """
+    points = surface["content_cloud"].reshape(-1, 3)
+    low = torch.tensor([_percentile(points[:, axis], CYLINDER_PERCENTILE_LOW / 100.0)
+                        for axis in range(3)], dtype=points.dtype, device=points.device)
+    high = torch.tensor([_percentile(points[:, axis], CYLINDER_PERCENTILE_HIGH / 100.0)
+                         for axis in range(3)], dtype=points.dtype, device=points.device)
+    centre = (low + high) / 2.0
+    radial = torch.hypot(points[:, 0] - centre[0], points[:, 2] - centre[2])
+    # The radius is the CYLINDER_COVERAGE percentile of the radial distance, so a thin spike (a
+    # lance, an arm reaching out - a few percent of the points) is outside the percentile and cannot
+    # inflate the fit; the per-axis trim above already protects the centre against big structures.
+    radius = max(_percentile(radial, CYLINDER_COVERAGE), 1e-6)
+    keep = radial <= radius
+    coverage = float(keep.float().mean()) if keep.numel() else 0.0
+    return centre, radius, coverage, keep
+
+
+def _batch_project(pool, positions, pivot, surface, height):
+    """(u, v, z) of `pool` for *every* pose at once - the same pinhole as `project_points`.
+
+    Returns [poses, points] tensors: the whole path is evaluated in one call instead of one call per
+    pose, which is what makes the visibility sweep (dozens of candidate pivots x every frame) cheap.
+    """
+    device, dtype = pool.device, pool.dtype
+    pos = torch.as_tensor(positions, device=device, dtype=dtype).reshape(-1, 3)
+    look = torch.as_tensor(pivot, device=device, dtype=dtype).reshape(1, 3)
+    forward = look - pos
+    forward = forward / forward.norm(dim=1, keepdim=True).clamp(min=1e-8)
+    up = torch.tensor([0.0, -1.0, 0.0], device=device, dtype=dtype).expand_as(forward)
+    right = torch.cross(forward, up, dim=1)
+    norms = right.norm(dim=1, keepdim=True)
+    parallel = (norms < 1e-6).squeeze(1)
+    if bool(parallel.any()):                  # looking straight down: keep world x like _look_axes
+        fallback = torch.tensor([1.0, 0.0, 0.0], device=device, dtype=dtype).expand_as(right)
+        right = torch.where(parallel.unsqueeze(1), fallback, right)
+        norms = right.norm(dim=1, keepdim=True)
+    right = right / norms.clamp(min=1e-8)
+    down = torch.cross(forward, right, dim=1)
+    relative = pool.reshape(1, -1, 3) - pos.unsqueeze(1)
+    x = (relative * right.unsqueeze(1)).sum(-1)
+    y = (relative * down.unsqueeze(1)).sum(-1)
+    z = (relative * forward.unsqueeze(1)).sum(-1)
+    focal = 0.5 * float(height) / math.tan(math.radians(fast_depth.VFOV_DEGREES) / 2.0)
+    width = float(height) * float(surface.get("aspect") or (16.0 / 9.0))
+    safe = z.clamp(min=1e-6)
+    return 0.5 * width + focal * x / safe, 0.5 * float(height) + focal * y / safe, z
+
+
+def visibility_clearances(points, positions, pivot, surface, height=CANVAS_HEIGHT, margin=None):
+    """Per pose: the subject's border room in px - negative entries are cropped frames.
+
+    The subject's pixels are what a viewer sees, so the guarantee is stated in them: the
+    0.2 %/99.8 % rectangle of the projected points (times SUBJECT_PROJECTION_MARGIN, the same
+    silhouette allowance the fill solve uses) is compared against all four borders. A subject that is
+    deep in world space but thin in the picture - a plate, a person seen from the side - therefore
+    costs nothing, while a subject that really leaves the frame is caught.
+    """
+    margin_px = (VISIBILITY_MARGIN * float(height)) if margin is None else float(margin)
+    if not len(positions):
+        return []
+    u, v, z = _batch_project(points, positions, pivot, surface, height)
+    visible = z > 1e-4
+    # invisible points are pushed out of the way: +inf cannot win the *low* quantile, -inf cannot
+    # win the *high* one - so both percentiles are taken over the visible points of each pose
+    low_u = torch.quantile(torch.where(visible, u, u.new_full((), math.inf)),
+                           SUBJECT_BOX_PERCENTILE_LOW / 100.0, dim=1)
+    high_u = torch.quantile(torch.where(visible, u, u.new_full((), -math.inf)),
+                            SUBJECT_BOX_PERCENTILE_HIGH / 100.0, dim=1)
+    low_v = torch.quantile(torch.where(visible, v, v.new_full((), math.inf)),
+                           SUBJECT_BOX_PERCENTILE_LOW / 100.0, dim=1)
+    high_v = torch.quantile(torch.where(visible, v, v.new_full((), -math.inf)),
+                            SUBJECT_BOX_PERCENTILE_HIGH / 100.0, dim=1)
+    half_u = 0.5 * (high_u - low_u).clamp(min=1.0) * SUBJECT_PROJECTION_MARGIN
+    half_v = 0.5 * (high_v - low_v).clamp(min=1.0) * SUBJECT_PROJECTION_MARGIN
+    centre_u = 0.5 * (low_u + high_u)
+    centre_v = 0.5 * (low_v + high_v)
+    width = float(height) * float(surface.get("aspect") or (16.0 / 9.0))
+    clearance = torch.minimum(
+        torch.minimum(centre_u - half_u - margin_px, (width - margin_px) - (centre_u + half_u)),
+        torch.minimum(centre_v - half_v - margin_px, (float(height) - margin_px)
+                      - (centre_v + half_v)))
+    too_few = visible.sum(dim=1) < 8          # nothing in front of the camera: not a valid pose
+    clearance = torch.where(too_few, clearance.new_full((), -math.inf),
+                            torch.nan_to_num(clearance, nan=-math.inf))
+    return [float(value) for value in clearance]
+
+
+def _path_positions(unit_positions, pivot, distance):
+    """Poses of a path whose orbit radius is 1.0 -> real positions at `distance` around `pivot`."""
+    return [[pivot[axis] + (position[axis] - pivot[axis]) * distance for axis in range(3)]
+            for position in unit_positions]
+
+
+def _centre_for_visibility(pool, unit_positions, pivot, distance, surface, height, margin_px,
+                           limit):
+    """(pivot, worst clearance) - aim the pivot at the pose that has the *least* room.
+
+    The framing's re-centring optimises the front pose; a guarantee has to hold for the worst pose of
+    the whole path (the end of the lap, the top of the swing), so the objective here is the smallest
+    clearance over all poses. That objective is not monotone in the shift - a shift that helps one
+    pose hurts another - so each axis is scanned coarse-to-fine instead of bisected. `limit` is one
+    content radius at most: the aim moves from one side of the subject to the other, never off it.
+    """
+    def score(value, axis, base):
+        probe = list(base)
+        probe[axis] = value
+        positions = _path_positions(unit_positions, probe, distance)
+        return min(visibility_clearances(pool, positions, probe, surface, height, margin_px))
+
+    result = list(pivot)
+    best_score = min(visibility_clearances(
+        pool, _path_positions(unit_positions, result, distance), result, surface, height,
+        margin_px))
+    for axis in (0, 1):
+        best = float(result[axis])
+        span = max(float(limit), 1e-6)
+        for steps in (VISIBILITY_SCAN_STEPS, VISIBILITY_REFINE_STEPS):
+            step_size = 2.0 * span / max(1, steps - 1)
+            for index in range(steps):
+                value = best + (index - (steps - 1) / 2.0) * step_size
+                candidate = score(value, axis, result)
+                if candidate > best_score:
+                    best_score, best = candidate, value
+            span = 2.0 * step_size
+        result[axis] = best
+    return result, best_score
+
+
+def _dolly_for_visibility(pool, unit_positions, pivot, distance, surface, height, margin_px):
+    """Smallest factor k >= 1 with the subject clear at every pose of the k * d path.
+
+    Pulling the camera back shrinks the projection towards the frame centre, so "the subject fits"
+    is monotone in k and the factor can be bisected instead of searched. VISIBILITY_MAX_SCALE comes
+    back when even that is not enough - the caller reports the shortfall instead of cropping.
+    """
+    def worst(factor):
+        positions = _path_positions(unit_positions, pivot, distance * factor)
+        return min(visibility_clearances(pool, positions, pivot, surface, height, margin_px))
+
+    if worst(1.0) >= 0.0:
+        return 1.0
+    if worst(VISIBILITY_MAX_SCALE) < 0.0:
+        return VISIBILITY_MAX_SCALE
+    low, high = 1.0, VISIBILITY_MAX_SCALE
+    for _ in range(VISIBILITY_BISECTIONS):
+        middle = 0.5 * (low + high)
+        if worst(middle) >= 0.0:
+            high = middle
+        else:
+            low = middle
+    return high
+
+
+def _path_fits(pool, surface, pivot, distance, scale, size, frames, height, margin_px,
+               orbit_end=None, direction=ORBIT_DIRECTION_DEFAULT):
+    """Does the subject stay inside the frame at every pose of this amplitude?"""
+    units = subject_samples(frames, pivot, 1.0, scale, size, orbit_end, direction)
+    positions = _path_positions(units, pivot, distance)
+    return min(visibility_clearances(pool, positions, pivot, surface, height, margin_px)) >= 0.0
+
+
+def _shrink_amplitude(pool, surface, pivot, distance, scale, size, frames, height, margin_px,
+                      orbit_end=None, direction=ORBIT_DIRECTION_DEFAULT):
+    """Largest amplitude <= `scale` whose whole path keeps the subject visible.
+
+    Shrinking is the *cheap* fix: the front pose - and with it the requested fill - does not move at
+    all, only the viewing angles narrow. Pulling the camera back is the expensive one (it shrinks the
+    subject everywhere), so the pass always tries this first. Bisection is enough because the
+    clearance falls with the swing: a wider loop moves the subject further towards the border.
+    """
+    scale = max(FIT_GROW_STEP, float(scale))
+    if _path_fits(pool, surface, pivot, distance, scale, size, frames, height, margin_px, orbit_end,
+                  direction):
+        return scale
+    low, high = FIT_GROW_STEP, scale
+    if not _path_fits(pool, surface, pivot, distance, low, size, frames, height, margin_px,
+                      orbit_end, direction):
+        return low                      # even the smallest loop does not fit: the dolly must help
+    for _ in range(VISIBILITY_BISECTIONS):
+        middle = 0.5 * (low + high)
+        if _path_fits(pool, surface, pivot, distance, middle, size, frames, height, margin_px,
+                      orbit_end, direction):
+            low = middle
+        else:
+            high = middle
+    return low
+
+
+def enforce_subject_visibility(surface, pivot, distance, scale, size, frames, height=CANVAS_HEIGHT,
+                               orbit_end=None, direction=ORBIT_DIRECTION_DEFAULT, pool=None,
+                               recentre=True):
+    """(distance, pivot, metrics) - no frame of the fitted path may crop the subject.
+
+    The fill solve frames the subject in the front pose and keeps its *area* centred along the path;
+    it cannot promise that nothing is cut off, because a wide or high swing - and the lap in
+    particular - moves the subject towards, and sometimes past, the picture edge. This pass checks
+    the subject's *own pixels* against *every* frame of the fitted path (the same `subject_samples`
+    the keys come from, 0.2 %/99.8 % of the projected points, with the fitted end and direction) and
+    fixes a violation in the order an operator would:
+
+    1. **shrink the swing** (`_shrink_amplitude`) - free for the framing, only viewing angles are
+       lost, and the caller's amplitude ladder is capped with `amplitude_cap`,
+    2. **re-aim the pivot** at the pose with the least room (`_centre_for_visibility`) - only when
+       `recentre` is set: the cylinder path passes `recentre=False`, because moving the aim off the
+       cylinder axis would break the exact horizontal centring it guarantees,
+    3. **pull the camera back** in bisected steps until the subject clears the frame with a
+       VISIBILITY_MARGIN border on each side (`_dolly_for_visibility`) - this one costs fill, so it
+       is the last resort. It scales the one `distance` the whole path shares, so the camera-to-pivot
+       distance stays constant.
+
+    The metrics carry the new front-pose area, the new along-path band and the clearance at the
+    0/25/50/75/100 % frames - the console line reports the trade instead of hiding it.
+    """
+    _, extents = subject_box(surface)
+    # The pool is the caller's (the cylinder-trimmed 95 % subject) when given, so the guarantee and
+    # the framing judge the same points; otherwise the full cloud.
+    pool = _decimate(surface["content_cloud"] if pool is None else pool, VISIBILITY_POOL)
+    margin_px = VISIBILITY_MARGIN * float(height)
+    start = [float(value) for value in pivot]
+    amplitude_cap = _shrink_amplitude(pool, surface, pivot, distance, scale, size, frames, height,
+                                      margin_px, orbit_end, direction)
+    units = subject_samples(frames, pivot, 1.0, amplitude_cap, size, orbit_end, direction)
+    before = visibility_clearances(pool, _path_positions(units, pivot, distance), pivot,
+                                   surface, height, margin_px)
+    cropped = sum(1 for value in before if value < 0.0)
+    limit = max(float(surface["content_radius"]), MIN_ORBIT_RADIUS)
+    if cropped and recentre:
+        pivot, _ = _centre_for_visibility(pool, units, pivot, distance, surface, height,
+                                          margin_px, limit)
+    factor = _dolly_for_visibility(pool, units, pivot, distance, surface, height, margin_px)
+    distance = max(MIN_ORBIT_RADIUS, distance * factor)
+    after = visibility_clearances(pool, _path_positions(units, pivot, distance), pivot,
+                                  surface, height, margin_px)
+    points = _decimate(surface["content_cloud"], FRAMING_POOL)
+    box = None
+    try:
+        box = _projected_box(points, front_camera(pivot, distance), pivot, surface, height)
+    except ValueError:                        # the camera ended up on the subject: keep the caller's
+        pass
+    canvas_area = 1.0
+    low = high = None
+    if box:
+        canvas_area = float(height) * float(box[5])
+        try:
+            low, high = _fill_envelope(points, pivot, distance, surface, size, canvas_area, height)
+        except ValueError:                    # the front pose is fine, a swing pose is not
+            low = high = None
+    indices = [min(len(after) - 1, int(round(fraction * (len(after) - 1))))
+               for fraction in VISIBILITY_QUARTILES] if after else []
+    worst_index = min(range(len(after)), key=lambda index: after[index]) if after else 0
+    metrics = {
+        "ok": bool(after) and min(after) >= 0.0,
+        "scale": float(factor),
+        "amplitude_cap": float(amplitude_cap),
+        "clearance_px": min(after) if after else 0.0,
+        "cropped": int(cropped),
+        "frames": len(after),
+        "margin_px": margin_px,
+        "shift": [pivot[axis] - start[axis] for axis in range(3)],
+        "quarters_px": [after[index] for index in indices],
+        "worst_frame": int(worst_index),
+        "worst_pct": (worst_index / max(1, len(after) - 1)) if after else 0.0,
+        "area": (box[0] * box[1]) / canvas_area if box else None,
+        "fill_min": low, "fill_max": high,
+        "width_px": box[0] if box else None, "height_px": box[1] if box else None,
+        "radius_px": 0.5 * max(box[0], box[1]) if box else None,
+        "box_extents": [float(value) for value in extents],
+    }
+    return distance, pivot, metrics
+
+
+def equalize_pivot(surface, pivot, distance, scale, size, frames, orbit_end=None,
+                   direction=ORBIT_DIRECTION_DEFAULT, height=CANVAS_HEIGHT):
+    """(pivot, metrics) - place the orbit centre so the subject keeps its apparent size.
+
+    The camera rides the orbit sphere at `distance` around the pivot, so the subject's apparent
+    size only holds along the path when the pivot sits on the subject's own centre: every lateral
+    offset - the framing's front-pose re-centring, the visibility re-aim - makes the distance
+    breathe with the orbit (the box grows on the near side, shrinks on the far one). This pass
+    minimises the *spread* of |camera - subject centre| over the final path (front O + closing
+    orbit) with a coarse-to-fine coordinate scan around the incoming pivot, pulled a little
+    towards the centre by a small weight and bounded to EQUALIZER_LIMIT content radii. The
+    visibility guarantee wins over the equalisation: a move that crops the subject at any frame is
+    bisected down until the whole path clears again, and when even the smallest step crops, the
+    pivot is left exactly where the visibility pass put it.
+    """
+    content_radius = max(1e-6, float(surface["content_radius"]))
+    start = [float(value) for value in pivot]
+    centre = torch.as_tensor(surface["pivot"], dtype=torch.float64)
+    base = subject_samples(frames, [0.0, 0.0, 0.0], distance, scale, size, orbit_end, direction)
+    stride = max(1, len(base) // max(2, int(EQUALIZER_SAMPLES)))
+    offsets = torch.tensor(base[::stride], dtype=torch.float64).reshape(-1, 3)
+
+    def spread_of(candidate):
+        scene = torch.as_tensor(candidate, dtype=torch.float64).reshape(1, 3) + offsets
+        d = (scene - centre).norm(dim=1)
+        mean = float(d.mean())
+        if mean <= 1e-9:
+            return 0.0
+        return float(d.max() - d.min()) / mean
+
+    def score_of(candidate):
+        pull = float((torch.as_tensor(candidate, dtype=torch.float64) - centre).norm())
+        return spread_of(candidate) + EQUALIZER_CENTRE_WEIGHT * pull / content_radius
+
+    best = list(start)
+    best_score = score_of(best)
+    if offsets.shape[0] >= 2:
+        limit = EQUALIZER_LIMIT * content_radius
+        for axis in (0, 1, 2):
+            span = limit
+            for steps in (EQUALIZER_SCAN_STEPS, EQUALIZER_REFINE_STEPS):
+                step_size = 2.0 * span / max(1, steps - 1)
+                # the stage scans around the value the *stage* started with; a running `best` here
+                # would collapse every later candidate onto the clamp boundary (found the hard way)
+                stage_centre = best[axis]
+                for index in range(steps):
+                    candidate = list(best)
+                    value = stage_centre + (index - (steps - 1) / 2.0) * step_size
+                    candidate[axis] = min(max(value, start[axis] - limit), start[axis] + limit)
+                    score = score_of(candidate)
+                    if score < best_score - 1e-12:
+                        best_score, best = score, candidate
+                span = 2.0 * step_size
+    move = [best[axis] - start[axis] for axis in range(3)]
+    spread_before = spread_of(start)
+    applied = False
+    factor = 0.0
+    if any(abs(value) > 1e-9 for value in move):
+        pool = _decimate(surface["content_cloud"], VISIBILITY_POOL)
+        margin_px = VISIBILITY_MARGIN * float(height)
+
+        def worst_clearance(candidate):
+            # The equaliser moves the *orbit centre* only: the aim - and with it the composition -
+            # stays where the framing put it (`start`). The clearance therefore has to be measured
+            # with the original aim and the candidate's positions (see `visibility_clearances`:
+            # positions and look are separate arguments).
+            units = subject_samples(frames, candidate, 1.0, scale, size, orbit_end, direction)
+            positions = _path_positions(units, candidate, distance)
+            return min(visibility_clearances(pool, positions, start, surface, height, margin_px))
+
+        # "No worse than the solved path": the visibility pass guarantees the incoming path clears
+        # (>= 0); the equaliser may spend at most EQUALIZER_CLEARANCE_TOL px of that budget - never
+        # turn a clearing path into a cropping one. A move that would is bisected down.
+        floor = max(0.0, worst_clearance(start)) - EQUALIZER_CLEARANCE_TOL
+
+        def ok(candidate):
+            return worst_clearance(candidate) >= floor
+
+        if ok(best):
+            factor = 1.0
+        else:
+            low, high = 0.0, 1.0
+            for _ in range(EQUALIZER_BISECTIONS):
+                middle = 0.5 * (low + high)
+                candidate = [start[axis] + move[axis] * middle for axis in range(3)]
+                if ok(candidate):
+                    low = middle
+                else:
+                    high = middle
+            factor = low
+        applied = factor > 0.02
+    result = [start[axis] + move[axis] * (factor if applied else 0.0) for axis in range(3)]
+    metrics = {"applied": bool(applied), "factor": round(float(factor), 4),
+               "move": [result[axis] - start[axis] for axis in range(3)],
+               "spread_before": float(spread_before),
+               "spread_after": float(spread_of(result)) if applied else float(spread_before)}
+    return result, metrics
+
+
+def subject_framing(surface, fill_percent, size=1.0, height=CANVAS_HEIGHT, orbit_end=None,
+                    direction=ORBIT_DIRECTION_DEFAULT):
+    """(distance, pivot, metrics): frame the subject's cylinder to `fill_percent` % of the picture.
+
+    The subject is approximated by a vertical cylinder (`fit_subject_cylinder`: robust trimmed fit,
+    ~90-95 % of the surface, outliers like lances or depth spikes left out). **The pivot is the
+    cylinder centre and it is also the aim**: the whole path then keeps the subject in the *horizontal
+    picture centre* at every pose - the cylinder is symmetric about its axis and the axis projects
+    onto the image centre line - and the camera-to-pivot distance is one single constant for every
+    frame (`_place` walks a sphere of exactly that radius). Only the *distance* is solved: the
+    projected-box area fixed point first (the area falls with ~1/d^2), then the swing envelope's
+    geometric mean so the requested fill holds along the O, and finally the room the closing orbit
+    needs (which may only pull the camera back). The old per-axis `_solve_shift` re-centring is gone -
+    it moved the aim off the axis, which is exactly what the centring requirement forbids.
+    `metrics["pool"]` carries the trimmed cloud so the visibility guarantee works on the same 95 %
+    subject.
+    """
+    centre, cylinder_radius, coverage, keep = fit_subject_cylinder(surface)
+    cloud = surface["content_cloud"].reshape(-1, 3)
+    points = _decimate(cloud[keep], FRAMING_POOL)
+    content_radius = max(1e-6, float(surface["content_radius"]))
+    pivot = [float(value) for value in centre]
+    aspect = float(surface.get("aspect") or (16.0 / 9.0))
+    canvas_area = float(height) * float(height) * aspect
+    # The fill is solved against the frame *minus* the visibility border: the guarantee below keeps
+    # VISIBILITY_MARGIN free on every side, and a target that used the whole frame would sit exactly
+    # on that limit - any swing at all would then crop the subject and the O-orbit would collapse to
+    # nothing. So the requested share is scaled down by the safe area (a 40 % request frames ~37 % of
+    # the picture) and the front pose keeps headroom for the swing.
+    margin = VISIBILITY_MARGIN * float(height)
+    safe_area = max(1.0, (float(height) - 2.0 * margin) * (float(height) * aspect - 2.0 * margin))
+    target = max(1.0, min(99.0, float(fill_percent))) / 100.0 * (safe_area / canvas_area)
+    distance = max(MIN_ORBIT_RADIUS, SUBJECT_FILL * content_radius)
+    for _ in range(FRAMING_ROUNDS):
+        for _ in range(FRAMING_ITERATIONS):                # the box area falls with roughly 1/d^2
+            camera = front_camera(pivot, distance)
+            width_px, height_px, centre_u, centre_v, depth, canvas_width = _projected_box(
+                points, camera, pivot, surface, height)
+            distance = max(MIN_ORBIT_RADIUS,
+                           distance * math.sqrt((width_px * height_px) / canvas_area / target))
+        # The front pose alone is not the frame the user sees: correct the distance by the swing
+        # envelope's geometric mean so the fill stays centred on the target *along* the path too.
+        # No pivot shift follows - the cylinder centre IS the aim, which is what keeps the subject in
+        # the horizontal picture centre instead of merely the projected box's.
+        low, high = _fill_envelope(points, pivot, distance, surface, size, canvas_area, height)
+        distance = max(MIN_ORBIT_RADIUS, distance * math.sqrt(math.sqrt(low * high) / target))
+    # ... and the room the O *and* the concluding orbit need: the fill request may not push the
+    # camera so close that a pose of the path leaves the frame (the far side of the lap is the
+    # tightest pose in practice). This may only pull the camera back, so the distance stays ONE
+    # value for every frame - and the aim stays on the cylinder axis.
+    room = _room_distance(_decimate(cloud[keep], VISIBILITY_POOL), surface, pivot,
+                          distance, size, height, VISIBILITY_MARGIN * float(height), orbit_end,
+                          direction)
+    distance_fill = distance
+    if room > distance:
+        distance = max(MIN_ORBIT_RADIUS, room)
+    camera = front_camera(pivot, distance)
+    width_px, height_px, centre_u, centre_v, depth, canvas_width = _projected_box(
+        points, camera, pivot, surface, height)
+    low, high = _fill_envelope(points, pivot, distance, surface, size, canvas_area, height)
+    offset_px = (centre_u - 0.5 * canvas_width, centre_v - 0.5 * float(height))
+    metrics = {
+        "width_px": width_px, "height_px": height_px, "depth": depth,
+        "area": (width_px * height_px) / canvas_area,
+        "fill_min": low, "fill_max": high,
+        "offset_px": offset_px,
+        # The aim IS the cylinder axis, so there is no re-centring residual and no pivot shift. The
+        # two legacy keys are kept (as the same numbers) so the console/summary contract holds.
+        "offset_before_px": offset_px,
+        "offset_uncentred_px": offset_px,
+        "radius_px": 0.5 * max(width_px, height_px),
+        "distance": distance,
+        "distance_fill": float(distance_fill),
+        "room_distance": float(room),
+        "pivot_shift": [0.0, 0.0, 0.0],
+        "points": int(points.shape[0]),
+        "cylinder": {"centre": list(pivot), "radius": float(cylinder_radius),
+                     "coverage": float(coverage)},
+        "pool": cloud[keep],
+    }
+    return distance, pivot, metrics
+
+
 def _key_frames(frames, target=KEY_TARGET):
     """Evenly spaced key frames covering 0..frames-1, each a whole frame index."""
     frames = int(frames)
@@ -237,73 +1096,470 @@ def _key_frames(frames, target=KEY_TARGET):
     return ticks
 
 
-def subject_samples(frames, pivot, radius, scale=1.0):
-    """Per-frame positions of the subject path: a big front O-orbit, then a height lap.
+def subject_samples(frames, pivot, radius, scale=1.0, size=1.0, orbit_end=None,
+                    direction=ORBIT_DIRECTION_DEFAULT, share=None):
+    """Per-frame positions of the subject path: the front O-orbit, then the concluding orbit.
 
-    Phase 1 (FRONT_ORBIT_SHARE of the frames) traces a big closed loop in front of the subject -
-    the azimuth swings +/-FRONT_YAW_AMPLITUDE while the elevation goes low, level, high, level
-    and back - so the front is shown from below, right, above and left in one move. Phase 2 laps
-    the rest (REST_YAW_SPAN) while the elevation eases from the loop's low point up to
-    REST_ELEVATION_HIGH: the back gets *new heights* instead of a flat ring, and the path ends on
-    surface the front loop did not show. `scale` is the speed-fit amplitude.
+    Phase 1 (the front O) opens on the *middle of the O* - the framed front pose (yaw 0, elevation
+    0, the pose the fill solve targets, so frame 0 is that view and its drift is zero) - rises to
+    the top of the O (12 o'clock) within FRONT_ORBIT_RISE of its frames and then swings around,
+    counter-clockwise by default, to the subject's right side (3 o'clock; 'clockwise' mirrors the
+    whole path: 12 -> 3 -> 6 -> 9 o'clock, ending on the left side).
+
+    Phase 2 (the rest of the frames) is the concluding orbit. It starts exactly where the O ended
+    (the side the travel direction just reached) and runs around the subject until it has covered
+    `orbit_end` degrees - measured from the start azimuth. The default 360 brings the camera back to
+    the start point: the elevation arcs up to REST_ELEVATION_HIGH at the lap's middle (the back of
+    the subject gets a new height) and back down to 0, so the last frame sits on the first one and
+    the clip loops. `orbit_end = 0` skips the lap entirely and leaves just the O.
+
+    `share` is the part of the frames the O gets; None uses `balanced_front_share`, the split that
+    gives both phases the same per-frame subject motion (the speed cap's best case).
     """
     frames = int(frames)
-    yaw_amplitude = FRONT_YAW_AMPLITUDE * scale
-    elevation_amplitude = FRONT_ELEVATION * scale
-    rest_span = REST_YAW_SPAN * scale
-    rest_high = REST_ELEVATION_HIGH * scale
-    split = max(1.0, (frames - 1) * FRONT_ORBIT_SHARE)
+    size = max(1e-3, float(size))
+    yaw_amplitude, elevation_amplitude = front_amplitudes(scale, size)
+    rest_high = min(FRONT_ELEVATION_LIMIT, REST_ELEVATION_HIGH * scale * size)
+    span = lap_span_for_end(yaw_amplitude, orbit_end)
+    mirror = direction_mirror(direction)
+    if share is None:
+        share = balanced_front_share(yaw_amplitude, span)
+    share = min(0.95, max(0.05, float(share)))
+    split = max(1.0, (frames - 1) * share)
+    rise = max(1.0, split * FRONT_ORBIT_RISE)
     positions = []
     for index in range(frames):
         if index <= split:
-            phase = index / split
-            yaw = yaw_amplitude * math.sin(2.0 * math.pi * phase)
-            elevation = -elevation_amplitude * math.cos(2.0 * math.pi * phase)
+            if index <= rise:
+                # the middle of the O -> 12 o'clock: a pure crane move, eased so the first and the
+                # last frame of it are gentle (a beat on the top view, no jump at frame 0)
+                phase = index / rise
+                yaw = 0.0
+                elevation = elevation_amplitude * (1.0 - math.cos(math.pi * phase)) / 2.0
+            else:
+                phase = (index - rise) / max(1.0, split - rise)
+                # 12 -> 9 -> 6 -> 3 o'clock for the default, 12 -> 3 -> 6 -> 9 for clockwise
+                angle = math.radians(90.0 + mirror * 270.0 * phase)
+                yaw = yaw_amplitude * math.cos(angle)
+                elevation = elevation_amplitude * math.sin(angle)
         else:
             phase = (index - split) / max(1.0, (frames - 1) - split)
-            yaw = rest_span * phase
-            elevation = -elevation_amplitude + (rest_high + elevation_amplitude) * (
-                1.0 - math.cos(math.pi * phase)) / 2.0
+            yaw = mirror * (yaw_amplitude + span * phase)      # around the back, back to the start
+            elevation = rest_high * (1.0 - math.cos(2.0 * math.pi * phase)) / 2.0
         positions.append(_place(pivot, radius, yaw, elevation))
     return positions
 
 
-def scene_samples(frames, pivot, radius, scale=1.0):
-    """Per-frame positions of the scene path: one big oval lap around the whole scene.
+def subject_drift(pool, positions, pivot, surface, steps=DRIFT_STEPS):
+    """(worst, typical) pixel motion of the subject per frame along a camera path.
 
-    A near-full azimuth lap (SCENE_SPAN) at SCENE_FILL x the scene radius whose elevation eases
-    from just below the horizon to well above it: the camera rises while it goes round, so the
-    move reads as a big oval orbit *over* the scene instead of a flat ring. `scale` is the
-    speed-fit amplitude.
+    For every sampled frame step the DRIFT_PERCENTILE-th percentile of the *point* displacement is
+    measured (the subject's near surface moves most, so the percentile keeps a depth spike from
+    dominating) and the worst step wins - that is the number the speed cap has to cover. Only the
+    subject's own pixels enter: the background is never part of the subject-mode budget. All
+    sampled poses go through ONE batched projection (`_batch_project`) - this function runs dozens
+    of times per amplitude fit, and the per-pose calls were the auto camera's hot loop.
+    """
+    frames = len(positions)
+    if frames < 2:
+        return 0.0, 0.0
+    stride = max(1, frames // max(2, int(steps)))
+    pairs = [(index, index + 1) for index in range(0, frames - 1, stride)]
+    if not pairs:
+        return 0.0, 0.0
+    busy = [positions[index] for pair in pairs for index in pair]
+    u, v, z = _batch_project(pool, busy, pivot, surface, CANVAS_HEIGHT)
+    count = len(pairs)
+    u = u.reshape(count, 2, -1)
+    v = v.reshape(count, 2, -1)
+    z = z.reshape(count, 2, -1)
+    visible = (z[:, 0] > 1e-4) & (z[:, 1] > 1e-4)
+    counts = visible.sum(dim=1)
+    if not bool((counts >= 8).any()):
+        return 0.0, 0.0
+    motion = torch.hypot(u[:, 1] - u[:, 0], v[:, 1] - v[:, 0])
+    # Per-pair percentiles of the *visible* points, vectorised: one sort per call instead of one
+    # `torch.quantile` per pair (this ran ~12k single quantile calls per estimate - the hot loop).
+    # `linear` interpolation between the two order statistics, exactly like torch.quantile's
+    # default, so the numbers do not shift.
+    masked = torch.where(visible, motion, motion.new_full((), math.inf))
+    ordered, _ = torch.sort(masked, dim=1)
+    span = (counts - 1).clamp(min=0).unsqueeze(1)
+
+    def percentile(share):
+        position = share * span
+        low = position.floor().to(torch.long)
+        high = torch.minimum(low + 1, span.to(torch.long))
+        fraction = position - low.to(position.dtype)
+        lower = ordered.gather(1, low).to(motion.dtype)
+        upper = ordered.gather(1, high).to(motion.dtype)
+        return (lower + (upper - lower) * fraction).reshape(-1)
+
+    p95 = percentile(DRIFT_PERCENTILE / 100.0)
+    p50 = percentile(0.5)
+    p95 = torch.where(counts >= 8, p95, p95.new_full((), -math.inf))
+    worst_index = int(torch.argmax(p95))
+    worst = max(float(p95[worst_index]), 0.0)
+    typical = max(float(p50[worst_index]), 0.0) if bool(counts[worst_index] >= 8) else 0.0
+    return worst, typical
+
+
+def _largest_step(samples):
+    """Longest per-frame camera step of a sampled path, in world units."""
+    return max((math.dist(samples[index - 1], samples[index])
+                for index in range(1, len(samples))), default=0.0)
+
+
+def _cut_orbit_end(pool, surface, frames, pivot, radius, scale, size, end, direction, cap_px):
+    """(end, samples, drift, typical) - the longest concluding orbit the speed cap can pay for.
+
+    The max camera speed is a *hard* limit for the orbit, so when the requested end cannot be paid
+    the lap gives way - and only the lap: the O's amplitude was already searched by the ladder, and
+    the room the framing needs never cuts anything. With the balanced frame split the path's drift is
+    `k * (loop travel + lap span) / frames`, so one analytic step on the span lands close; it aims
+    `ORBIT_CUT_TARGET` of the cap rather than the cap itself (a path that exactly touches the cap
+    still measures a hair over it, and then the rung would be rejected), and `ORBIT_CUT_STEPS`
+    rounds of it converge the rest.
+    """
+    yaw_amplitude = front_amplitudes(scale, size)[0]
+    span = max(0.0, float(end) - yaw_amplitude)
+    samples = subject_samples(frames, pivot, radius, scale, size, end, direction)
+    drift, typical = subject_drift(pool, samples, pivot, surface)
+    target = cap_px * ORBIT_CUT_TARGET
+    for _ in range(ORBIT_CUT_STEPS):
+        if drift <= target or span <= 1e-9:
+            break
+        span = span * max(0.0, min(1.0, target / max(1e-9, drift)))
+        end = yaw_amplitude + span
+        samples = subject_samples(frames, pivot, radius, scale, size, end, direction)
+        drift, typical = subject_drift(pool, samples, pivot, surface)
+    return end, samples, drift, typical
+
+
+def _orbit_candidate(pool, surface, frames, pivot, radius, scale, size, end, direction, cap_px):
+    """(scale, samples, drift, typical, info) for one amplitude rung, its orbit cut to the cap."""
+    end, samples, drift, typical = _cut_orbit_end(pool, surface, frames, pivot, radius, scale, size,
+                                                  end, direction, cap_px)
+    yaw_amplitude = front_amplitudes(scale, size)[0]
+    span = max(0.0, end - yaw_amplitude)
+    info = {"front_yaw": yaw_amplitude, "orbit_end": end,
+            "front_share": balanced_front_share(yaw_amplitude, span)}
+    return scale, samples, drift, typical, info
+
+
+def _fit_subject_amplitude(frames, pivot, radius, surface, size, cap_px, amplitude_cap=None,
+                           orbit_end=None, direction=ORBIT_DIRECTION_DEFAULT):
+    """(scale, samples, drift, typical, info) - how far round the speed cap lets the camera go.
+
+    The amplitude ladder walks up from a small loop and every rung is measured with its concluding
+    orbit cut to the cap (`_cut_orbit_end`). **Auto Orbit Size is the floor for the visit's width**
+    (`size`): the fit only grows the O above it, because a wider O shortens the orbit and pays for
+    itself - so `info`'s winner is the rung with the *largest achieved end* among the rungs at or
+    above the floor, i.e. the camera goes as far around the subject as the max camera speed pays for
+    *without* giving the front up; equal ends keep the wider O ("last wins", the ladder runs
+    upward). Only when the cap cannot even pay for the floor's own loop is the O shrunk below it
+    (info carries `front_floor`, the caller's hint names it). When nothing meets the cap at all, the
+    rung with the smallest drift is reported instead (least overshoot). `amplitude_cap` is the
+    visibility pass's ceiling on the O ("a swing this wide would clip the subject"). Returns None
+    when no pixel cap or no cloud is available, which sends the caller back to the world-travel fit.
+    """
+    if cap_px is None or cap_px <= 0.0 or not surface or surface.get("content_cloud") is None:
+        return None
+    pool = _decimate(surface["content_cloud"], DRIFT_POOL)
+    size = max(1e-3, float(size))
+    end = ORBIT_END_DEFAULT if orbit_end is None else max(ORBIT_END_MIN, float(orbit_end))
+    ceiling = max(FIT_GROW_STEP, _amplitude_ceiling(size))
+    if amplitude_cap is not None:
+        ceiling = min(ceiling, max(FIT_GROW_STEP, float(amplitude_cap)))
+    rungs = [round(FIT_GROW_STEP * step, 3)
+             for step in range(1, int(ceiling / FIT_GROW_STEP) + 1)]
+    rungs = [rung for rung in rungs if rung <= ceiling + 1e-9] or []
+    if not rungs or rungs[-1] < ceiling - 1e-9:
+        rungs.append(ceiling)              # unrounded: the ladder never exceeds the view limit
+    # Auto Orbit Size is the *floor* for the visit's width: the fit only ever grows it (a wider O
+    # shortens the orbit, so it pays for itself), and when the speed cap cannot even pay for the
+    # floor's own loop, the floor gives way - reported - rather than the cap.
+    floor = min(ceiling, max(FIT_GROW_STEP, float(size)))
+    preferred = [rung for rung in rungs if rung >= floor - 1e-9] or list(rungs)
+
+    def scan(candidates, key="end"):
+        """(best, closest): inside the cap the largest `key` wins - the orbit's end, the O's width
+        or the area between the two (the fallback's trade), else the smallest overshoot."""
+        winner = None
+        fallback = None
+        for scale in candidates:
+            candidate = _orbit_candidate(pool, surface, frames, pivot, radius, scale, size, end,
+                                         direction, cap_px)
+            if candidate[2] <= cap_px + 1e-9:
+                if key == "width":
+                    score = candidate[0]
+                elif key == "area":
+                    score = candidate[4]["front_yaw"] * candidate[4]["orbit_end"]
+                else:
+                    score = candidate[4]["orbit_end"]
+                if winner is None or score >= score_of(winner, key) - 1e-6:
+                    winner = candidate
+            elif fallback is None or candidate[2] < fallback[2] - 1e-9 or (
+                    abs(candidate[2] - fallback[2]) <= 1e-9
+                    and candidate[4]["orbit_end"] > fallback[4]["orbit_end"] + 1e-6):
+                fallback = candidate
+        return winner, fallback
+
+    def score_of(candidate, key):
+        if key == "width":
+            return candidate[0]
+        if key == "area":
+            return candidate[4]["front_yaw"] * candidate[4]["orbit_end"]
+        return candidate[4]["orbit_end"]
+
+    best, closest = scan(preferred)
+    if best is None and floor > rungs[0] + 1e-9:
+        # The floor's own loop is unpayable (too few frames for this subject), so the fit has to
+        # trade width against reach. Neither extreme works - the largest end answers "+/-3 deg and a
+        # 351 deg orbit" (the first QC run caught exactly that: the most azimuth, nothing to see),
+        # and the widest rung answers "1.0x and a 170 deg orbit" (the front, but the back never
+        # comes). The fallback maximises their *product* instead: the front's width times the
+        # azimuth the path covers - the compromise that keeps a readable front arc and still takes
+        # the camera past the subject's back.
+        best, closest = scan(rungs, "area")
+    chosen = best if best is not None else closest
+    chosen[4]["front_floor"] = floor
+    return chosen
+
+
+def _fit_orbit_world(frames, pivot, radius, surface, size, budget, orbit_end=None,
+                     direction=ORBIT_DIRECTION_DEFAULT):
+    """(scale, samples, travel, info) - the world-unit fit for the orbit, speed cap first.
+
+    The fallback when no pixel cap is available (no framing, direct calls): the same amplitude
+    ladder, but the budget is `max_speed` in world units. The concluding orbit is cut to the budget
+    with the same analytic step the pixel fit uses, so the orbit never runs faster than the
+    parameter allows; only the coverage gives way, and the caller reports it.
+    """
+    end = ORBIT_END_DEFAULT if orbit_end is None else max(ORBIT_END_MIN, float(orbit_end))
+    samples_of = lambda scale: subject_samples(frames, pivot, radius, scale, size, end, direction)
+    scale, samples, travel = _fit_amplitude(samples_of, budget)
+    if travel > budget:
+        yaw_amplitude = front_amplitudes(scale, size)[0]
+        span = max(0.0, end - yaw_amplitude)
+        if span > 1e-9:
+            end = yaw_amplitude + span * max(0.0, min(1.0, budget / max(1e-9, travel)))
+            cut_samples = subject_samples(frames, pivot, radius, scale, size, end, direction)
+            cut_travel = _largest_step(cut_samples)
+            if cut_travel < travel:
+                samples, travel = cut_samples, cut_travel
+    yaw_amplitude = front_amplitudes(scale, size)[0]
+    info = {"front_yaw": yaw_amplitude, "orbit_end": end,
+            "front_share": balanced_front_share(yaw_amplitude, max(0.0, end - yaw_amplitude))}
+    return scale, samples, travel, info
+
+
+def scene_coverage(surface, radius, content_radius, frames, orbit_size=1.0,
+                   budget_per_frame=None):
+    """The plan behind the scene survey: rows, their spacing, their sweep and their heights.
+
+    Rows are spaced like drone mapping flight lines. The frame's horizontal footprint at the survey
+    distance (`2 * radius * tan(hfov / 2)`, with hfov from Meridian's 55 deg vertical FOV and the
+    still's aspect ratio) is overlapped by SCENE_LATERAL_OVERLAP between neighbouring rows - the
+    70-80 % side-lap the mapping guides prescribe - so a viewer standing between two rows always
+    has a render basis that already saw that surface from an angle. The rows span the *scene's own
+    width* (plus SCENE_COVERAGE_MARGIN, times the Auto Orbit Size) instead of a full circle: a
+    depth reprojection cannot invent the far side of a scene, and side parallax is what a walk-in
+    viewer looks along.
+
+    The count is bounded by SCENE_MIN/MAX_LANES, by the frame budget (SCENE_FRAMES_PER_LANE per
+    row) and - when `budget_per_frame` (the speed cap in units) is given - by what the camera may
+    actually travel: a row costs its lateral sweep plus its climb, so a short frame budget buys
+    *fewer rows with the full sweep* instead of many rows crammed into a short one. The outermost
+    row never swings past SCENE_YAW_LIMIT; a scene wider than that is the case for a larger Auto
+    Orbit Distance (the drone rule: fly higher for a bigger area, and the console line says so).
+    Both heights follow the Auto Orbit Size as well, so the whole envelope grows and shrinks with
+    it. Returns the plan plus the numbers behind it, which the console summary prints.
+    """
+    size = max(1e-3, _finite(orbit_size, "Orbit size"))
+    radius = max(1e-6, float(radius))
+    content_radius = max(1e-6, float(content_radius))
+    surface = surface or {}
+    fallback_aspect = 16.0 / 9.0                     # no surface (tests): a normal wide still
+    aspect = float(surface.get("aspect") or fallback_aspect)
+    hfov = float(surface.get("hfov") or 2.0 * math.degrees(math.atan(
+        math.tan(math.radians(fast_depth.VFOV_DEGREES) / 2.0) * aspect)))
+    half_width = max(1e-6, float(surface.get("lateral_half_width") or content_radius))
+    half_width *= SCENE_COVERAGE_MARGIN * size
+    half_yaw = max(5.0, min(SCENE_YAW_LIMIT * size, math.degrees(math.asin(
+        min(1.0, half_width / radius)))))
+    footprint = 2.0 * radius * math.tan(math.radians(hfov) / 2.0)
+    lateral_span = 2.0 * radius * math.sin(math.radians(half_yaw))
+    low = SCENE_ELEVATION_LOW * size
+    high = SCENE_ELEVATION_HIGH * size
+    climb = radius * abs(math.sin(math.radians(high)) - math.sin(math.radians(low)))
+    row_travel = lateral_span + climb
+    rows = int(math.ceil(lateral_span / max(1e-6, footprint * (1.0 - SCENE_LATERAL_OVERLAP)))) + 1
+    rows = min(SCENE_MAX_LANES, rows)
+    if budget_per_frame:
+        affordable = int(int(frames) * float(budget_per_frame) / max(1e-6, row_travel))
+        rows = min(rows, max(1, affordable))
+    rows = max(SCENE_MIN_LANES, min(rows, int(frames) // SCENE_FRAMES_PER_LANE))
+    step = lateral_span / max(1, rows - 1)
+    return {
+        "rows": rows, "half_yaw": half_yaw, "lateral_span": lateral_span, "lane_step": step,
+        "lane_overlap": max(0.0, min(1.0, 1.0 - step / max(1e-6, footprint))),
+        "half_width": half_width, "hfov": hfov, "footprint": footprint, "row_travel": row_travel,
+        "low_elevation": low, "high_elevation": high,
+    }
+
+
+def scene_survey_fill(surface, size, height=CANVAS_HEIGHT):
+    """(fill, metrics) - the stand-off that makes the rows reach the scene *and* fill the frame.
+
+    The built-in SCENE_FILL is a sane default, but it cannot know the scene: a wide scene's outermost
+    row never reaches its edge (its azimuth would have to swing past the view limit) and a narrow one
+    leaves most of every frame empty. The ratio is therefore solved from the scene's own width:
+
+    * **reach** - the outermost row's lateral reach is `radius * sin(yaw_limit)`, so the radius has to
+      be at least `half_width / sin(yaw_limit)`: the drone rule "fly higher for a bigger area". This
+      is a hard lower bound, coverage beats detail.
+    * **fill** - the frame's footprint is `2 * radius * tan(hfov / 2)`. If that already spans the whole
+      scene, one row would cover everything and every frame would be mostly empty, so the radius is
+      pulled in until the footprint is about `scene_width / SCENE_MIN_LANES` - never closer than
+      `SCENE_FILL_MIN` content radii (the collision guard's own floor).
+
+    Returns the fill ratio (in content radii) plus the numbers behind it, which the console prints.
+    """
+    size = max(1e-3, float(size))
+    content_radius = max(1e-6, float(surface["content_radius"]))
+    aspect = float(surface.get("aspect") or (16.0 / 9.0))
+    hfov = float(surface.get("hfov") or 2.0 * math.degrees(math.atan(
+        math.tan(math.radians(fast_depth.VFOV_DEGREES) / 2.0) * aspect)))
+    half_width = max(1e-6, float(surface.get("lateral_half_width") or content_radius))
+    half_width *= SCENE_COVERAGE_MARGIN * size
+    yaw_limit = max(5.0, min(SCENE_YAW_LIMIT * size, 85.0))
+    reach_fill = half_width / max(1e-6, math.sin(math.radians(yaw_limit))) / content_radius
+    footprint_max = 2.0 * half_width / max(1.0, float(SCENE_MIN_LANES))
+    fill_cap = footprint_max / max(1e-6, 2.0 * math.tan(math.radians(hfov) / 2.0)) / content_radius
+    # reach is a hard lower bound (coverage beats detail), the frame-fill preference is soft: the
+    # ratio is the built-in stand-off, capped by the footprint rule, but never below the reach - and
+    # finally clamped into the orbit bounds.
+    ratio = min(SCENE_FILL_MAX, max(SCENE_FILL_MIN, reach_fill,
+                                    min(SCENE_FILL, max(SCENE_FILL_MIN, fill_cap))))
+    radius = ratio * content_radius
+    reach = radius * math.sin(math.radians(yaw_limit)) / max(1e-6, half_width)
+    return ratio, {
+        "fill": ratio, "reach_fill": reach_fill, "fill_cap": fill_cap,
+        "yaw_limit": yaw_limit, "half_width": half_width,
+        "footprint": 2.0 * radius * math.tan(math.radians(hfov) / 2.0),
+        "reach": reach, "radius": radius,
+    }
+
+
+def subject_share_curve(points, positions, pivot, surface, height=CANVAS_HEIGHT):
+    """Per pose: (area share of the picture, is the whole subject inside, does it show at all).
+
+    What a scene survey needs to know about the subject inside it: how big it appears and whether a
+    frame shows it *completely*. A lateral survey sweeps past the subject, so "shows at all" and
+    "completely" are different questions - the console reports the median share and how many frames
+    hold the subject whole.
+    """
+    width = float(height) * float(surface.get("aspect") or (16.0 / 9.0))
+    canvas_area = float(height) * width
+    curve = []
+    for position in positions:
+        u, v, z = project_points(points, position, pivot, surface, height)
+        visible = z > 1e-4
+        if int(visible.sum()) < 8:
+            curve.append((0.0, False, False))
+            continue
+        u, v = u[visible], v[visible]
+        low_u = _percentile(u, FRAMING_PERCENTILE_LOW / 100.0)
+        high_u = _percentile(u, FRAMING_PERCENTILE_HIGH / 100.0)
+        low_v = _percentile(v, FRAMING_PERCENTILE_LOW / 100.0)
+        high_v = _percentile(v, FRAMING_PERCENTILE_HIGH / 100.0)
+        centre_u, centre_v = (low_u + high_u) / 2.0, (low_v + high_v) / 2.0
+        shown = 0.0 <= centre_u <= width and 0.0 <= centre_v <= float(height)
+        whole = low_u >= 0.0 and high_u <= width and low_v >= 0.0 and high_v <= float(height)
+        share = max(0.0, (high_u - low_u)) * max(0.0, (high_v - low_v)) / canvas_area
+        curve.append((share if shown else 0.0, whole, shown))
+    return curve
+
+
+def scene_samples(frames, pivot, radius, plan, scale=1.0):
+    """Per-frame positions of the scene survey: boustrophedon rows across the scene's width.
+
+    Each row sweeps the azimuth from one end of the survey to the other while the elevation
+    travels from the plan's low to its high (or the other way round), and the next row runs back
+    with the elevation reversed - a raster scan of the (azimuth, elevation) envelope, so every
+    lateral station is seen from below and from above, consecutive rows continue each other
+    instead of jumping, and the turns stay gentle (cosine easing). `scale` is the speed-fit
+    amplitude: it shortens the sweep and the height range when the frame count cannot pay for the
+    full one.
     """
     frames = int(frames)
-    span = SCENE_SPAN * scale
-    low = SCENE_ELEVATION_LOW * scale
-    high = SCENE_ELEVATION_HIGH * scale
+    rows = max(1, int(plan["rows"]))
+    half_yaw = max(0.0, float(plan["half_yaw"])) * scale
+    low = float(plan["low_elevation"]) * scale
+    high = float(plan["high_elevation"]) * scale
+    span = max(1, frames - 1)
     positions = []
     for index in range(frames):
-        phase = index / max(1, frames - 1)
-        yaw = span * phase
-        elevation = low + (high - low) * (1.0 - math.cos(math.pi * phase)) / 2.0
+        phase = index / span                            # 0..1 over the whole survey
+        row = min(rows - 1, int(phase * rows))
+        inner = min(1.0, max(0.0, phase * rows - row))
+        eased = (1.0 - math.cos(math.pi * inner)) / 2.0     # eases out of and into every turn
+        outbound = row % 2 == 0
+        yaw = (-half_yaw + 2.0 * half_yaw * eased) if outbound else (half_yaw - 2.0 * half_yaw * eased)
+        elevation = (low + (high - low) * eased) if outbound else (high - (high - low) * eased)
         positions.append(_place(pivot, radius, yaw, elevation))
     return positions
 
 
-def automatic_keys(frames, pivot, radius, content_radius, target, max_speed=DEFAULT_MAX_SPEED):
-    """(keys, info) for the automatic path of `target`: subject composite or scene oval.
+def automatic_keys(frames, pivot, radius, content_radius, target, max_speed=DEFAULT_MAX_SPEED,
+                   orbit_size=1.0, surface=None, cap_px=None, amplitude_cap=None, orbit_end=None,
+                   direction=ORBIT_DIRECTION_DEFAULT):
+    """(keys, info) for the automatic path of `target`: subject orbit or scene lateral survey.
 
-    The path is fitted to the speed budget by scaling its amplitudes; the keys are the
-    Catmull-Rom control points the Geometry node samples (evenly spaced, whole frame indices).
+    The keys are the Catmull-Rom control points the Geometry node samples (evenly spaced, whole
+    frame indices). `radius` is the camera-to-pivot distance (Auto Subject Fill framing or the Auto
+    Orbit Distance widget) and `orbit_size` the user's O-orbit size.
+
+    Two budgets decide the amplitudes. The **subject** path is fitted in *pixels* whenever `cap_px`
+    is given (the framing computes it from the subject's apparent size): the path runs as far around
+    as `orbit_end` asks for (`ORBIT_END_DEFAULT` = 360 deg, i.e. back to the start point) as long as
+    the subject's own per-frame drift stays inside the cap - when the *max camera speed* cannot pay
+    for the requested end, the concluding orbit is cut there and the console names the levers, so the
+    user's speed parameter is never silently exceeded. The frames are split between the O and the lap
+    so that both run at the same drift (`balanced_front_share`), which is the cheapest way to honour
+    the cap. `amplitude_cap` is the visibility pass's ceiling on the O ("a swing this wide would clip
+    the subject"), the **scene** survey is fitted in world units against `max_speed x content
+    radius` - the same fit that also backs the subject path when no pixel cap is available (unit
+    tests, direct calls). The returned `info` carries `front_yaw` (the O's swing), `orbit_end` (the
+    end the path achieved), `front_share` (the frames the O got) and `orbit_coverage` (how much
+    azimuth the path covers around the subject).
     """
     frames = validate_frames(frames)
     budget = max(1e-6, _finite(max_speed, "Max camera speed")) * max(1e-6, content_radius)
+    orbit_size = max(1e-3, _finite(orbit_size, "Orbit size"))
+    plan = None
+    drift = typical = None
+    meta = {}
     if str(target).strip().lower() == SUBJECT_TARGET:
-        samples_of = lambda scale: subject_samples(frames, pivot, radius, scale)
-        style = "front O-orbit + height lap"
+        style = "front O-orbit + closing orbit"
+        fitted = _fit_subject_amplitude(frames, pivot, radius, surface, orbit_size, cap_px,
+                                        amplitude_cap, orbit_end, direction)
+        if fitted is None:
+            fit_name = "world travel"
+            scale, samples, travel, meta = _fit_orbit_world(frames, pivot, radius, surface,
+                                                            orbit_size, budget, orbit_end,
+                                                            direction)
+        else:
+            fit_name = "subject pixels"
+            scale, samples, drift, typical, meta = fitted
+            travel = _largest_step(samples)
     else:
-        samples_of = lambda scale: scene_samples(frames, pivot, radius, scale)
-        style = "big scene oval"
-    scale, samples, travel = _fit_amplitude(samples_of, budget)
+        style = "lateral survey rows"
+        fit_name = "world travel"
+        plan = scene_coverage(surface, radius, content_radius, frames, orbit_size, budget)
+        samples_of = lambda scale: scene_samples(frames, pivot, radius, plan, scale)
+        scale, samples, travel = _fit_amplitude(samples_of, budget)
     keys = [{
         "pos": [round(value, 6) for value in samples[tick]],
         "look": [round(float(value), 6) for value in pivot],
@@ -311,7 +1567,22 @@ def automatic_keys(frames, pivot, radius, content_radius, target, max_speed=DEFA
         "t": int(tick),
     } for tick in _key_frames(frames)]
     info = {"style": style, "amplitude_scale": scale, "travel_per_frame": travel,
-            "budget_per_frame": budget, "keys": len(keys)}
+            "budget_per_frame": budget, "keys": len(keys), "fit": fit_name}
+    if drift is not None:
+        info.update({"drift_px": drift, "drift_typical_px": typical,
+                     "drift_cap_px": float(cap_px)})
+    if plan is not None:
+        info.update(plan)
+    else:
+        # the subject orbit: how wide the O swings, how far round the lap got and who got which frames
+        requested = ORBIT_END_DEFAULT if orbit_end is None else max(ORBIT_END_MIN, float(orbit_end))
+        span = max(0.0, meta["orbit_end"] - meta["front_yaw"])
+        info.update({"front_yaw": meta["front_yaw"], "lap_span": span,
+                     "orbit_end": meta["orbit_end"], "orbit_end_requested": requested,
+                     "front_share": meta["front_share"], "orbit_direction": str(direction),
+                     "front_floor": meta.get("front_floor"),
+                     "orbit_coverage": min(FULL_CIRCLE, meta["front_yaw"]
+                                           + max(meta["front_yaw"], meta["orbit_end"]))})
     return keys, info
 
 
@@ -346,9 +1617,35 @@ def probe_surface(reference, target=SUBJECT_TARGET, subject_mask=None, model_siz
         points, source_label = subject_points(depth, mask=subject_mask)
         pivot, extents = geometric_pivot(points)
         radius = pivot_radius(points, pivot)
+        subject_cloud, subject_pivot = points, [float(value) for value in pivot]
+        subject_radius, subject_source = float(radius), source_label
     else:
         points, source_label = cloud, "whole surface (scene)"
         pivot, extents, radius = scene_pivot, scene_extents, scene_radius
+        # The *subject inside the scene*: the same near-layer/mask heuristic the subject target
+        # uses. A survey cannot keep it in frame while it sweeps away, but it can report how big
+        # the subject appears and which part of the survey shows it - and the console line warns
+        # when it is too small to read.
+        subject_cloud, subject_pivot, subject_radius, subject_source = None, list(scene_pivot), \
+            float(scene_radius), "none"
+        try:
+            candidate, candidate_source = subject_points(depth, mask=subject_mask)
+        except ValueError:
+            candidate, candidate_source = None, "none"
+        if candidate is not None and candidate_source != NO_SUBJECT_SOURCE:
+            candidate_pivot, _ = geometric_pivot(candidate)
+            subject_cloud = candidate
+            subject_pivot = [float(value) for value in candidate_pivot]
+            subject_radius = float(pivot_radius(candidate, candidate_pivot))
+            subject_source = candidate_source
+    grid = depth[0] if depth.ndim == 3 else depth
+    aspect = float(grid.shape[-1]) / max(1.0, float(grid.shape[-2]))
+    hfov = 2.0 * math.degrees(math.atan(
+        math.tan(math.radians(fast_depth.VFOV_DEGREES) / 2.0) * aspect))
+    # The renderer scales a camera path by the cloud's median depth (`zm` in the fast-depth
+    # backend, `--pivot`'s third number): the emitted keys are relative to it, like the manual
+    # Camera Path Configurator's ("median-depth units").
+    median_depth = float(cloud[:, 2].median()) if cloud.shape[0] else 1.0
     return {
         "target": target, "source": source_label,
         "scene_points": cloud, "scene_radius": float(scene_radius),
@@ -359,6 +1656,14 @@ def probe_surface(reference, target=SUBJECT_TARGET, subject_mask=None, model_siz
         "pivot": [float(value) for value in pivot],
         "extents": [float(value) for value in extents],
         "content_radius": float(radius),
+        "content_cloud": points,
+        "subject_cloud": subject_cloud,
+        "subject_pivot": subject_pivot,
+        "subject_radius": subject_radius,
+        "subject_source": subject_source,
+        "median_depth": max(1e-6, median_depth),
+        "aspect": aspect, "hfov": hfov,
+        "lateral_half_width": float(scene_extents[0]) / 2.0,
     }
 
 
@@ -416,16 +1721,36 @@ def guard_collisions(keys, surface, margin=COLLISION_MARGIN):
 
 def estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DEFAULT_MAX_SPEED,
                          subject_mask=None, model_size="", depth_res=AUTO_DEPTH_RES,
-                         device=None, depth_fn=None, pivot_offset=(0.0, 0.0, 0.0)):
+                         device=None, depth_fn=None, pivot_offset=(0.0, 0.0, 0.0),
+                         orbit_distance=None, orbit_size=None, subject_fill=None, orbit_end=None,
+                         direction=ORBIT_DIRECTION_DEFAULT):
     """(signal JSON, summary) for one still: geometric pivot, automatic path, collision guard.
 
-    The pivot is the *geometric midpoint* of the target's depth profile - the robust bounding-box
-    midpoint, so the depth of the subject is what places it, not the picture centre - optionally
-    shifted by `pivot_offset` (in content radii). The path is the subject composite (front
-    O-orbit + height lap) or the scene's big oval, fitted to the speed budget; the camera never
-    comes closer to the scene than COLLISION_MARGIN x the content radius. The summary carries every
-    number behind the decision, for the node's console line. `depth_fn` injects a depth map
-    instead of running a depth model (tests).
+    The pivot is the target's **cylindrical centre**: a robust vertical-cylinder fit of the depth
+    profile (`fit_subject_cylinder` - 2.5 %/97.5 % trim plus the CYLINDER_COVERAGE radial percentile,
+    so ~90-95 % of the surface sits inside and lances or depth spikes are ignored). For a framed
+    subject the pivot is *also the aim* - the whole path then keeps the subject exactly in the
+    horizontal picture centre and the camera-to-pivot distance is one constant for every frame. The
+    Auto Pivot offsets (`pivot_offset`, in content radii) are applied to the finished path last -
+    positions *and* aim translate - so no solve can cancel the user's nudge. The path is the subject
+    composite (the front
+    O-orbit plus the concluding orbit that runs `orbit_end` degrees around, back to the start point
+    by default) or the scene's lateral survey (rows across the scene's width, side-lapped like drone
+    mapping flight lines), fitted to the speed budget; the camera never comes closer to the scene
+    than COLLISION_MARGIN x the content radius. The summary carries every number behind the decision,
+    for the node's console line. `depth_fn` injects a depth map instead of running a depth model
+    (tests).
+
+    Two shape knobs and one framing target ride on top of the estimate, all from the node's
+    automatic-path widgets: `subject_fill` (percent of the picture area, subject target only) frames
+    the subject by *solving* the distance, so the subject fills that share of the frame - and it is
+    the ONLY distance control for a subject now (`orbit_distance` is deprecated and ignored: whether
+    0 or a value, the fill decides, and a bigger fill means a closer camera); `orbit_size`
+    multiplies the path's swing amplitudes (None/1.0 keeps the built-in swing; the subject fit
+    searches *up* from there to the view limits, the scene fit can shrink it). `orbit_end` (deg, 360
+    = back to the start point) and `direction` ('counter-clockwise'/'clockwise') shape the subject's
+    concluding orbit; both are honoured as far as the max camera speed allows, and the summary
+    reports what was achieved.
     """
     frames = validate_frames(frames)
     surface = probe_surface(reference, target=target, subject_mask=subject_mask,
@@ -433,39 +1758,402 @@ def estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DEF
                             depth_fn=depth_fn)
     target = surface["target"]
     max_speed = _finite(max_speed, "Max camera speed")
-    pivot = offset_pivot(surface, pivot_offset)
     content_radius = max(1e-6, float(surface["content_radius"]))
-    fill = SUBJECT_FILL if target == SUBJECT_TARGET else SCENE_FILL
-    orbit_radius = max(fill * content_radius, MIN_ORBIT_RADIUS)
-    keys, info = automatic_keys(frames, pivot, orbit_radius, content_radius, target, max_speed)
+    size = ORBIT_SIZE_DEFAULT if orbit_size is None else max(1e-3, _finite(orbit_size, "Orbit size"))
+    framing = None
+    fill = None
+    scene_framing = None
+    wants_framing = (target == SUBJECT_TARGET and subject_fill is not None
+                     and _finite(subject_fill, "Subject fill") > SUBJECT_FILL_MIN)
+    framed_pool = None
+    if wants_framing:
+        # Framing first: it solves the distance and hands back the *cylinder centre* as the pivot -
+        # which is also the aim, so the subject stays in the horizontal picture centre and the camera
+        # keeps one constant distance to it. The pixel cap for the speed fit follows from the
+        # subject's apparent size, and the trimmed 95 % cloud it returns feeds the visibility pass.
+        distance, framing_pivot, framing = subject_framing(surface, subject_fill, size,
+                                                           orbit_end=orbit_end,
+                                                           direction=direction)
+        framed_pool = framing.get("pool")
+        orbit_radius = max(distance, MIN_ORBIT_RADIUS)
+        pivot = list(framing_pivot)
+    elif target == SCENE_TARGET:
+        # The survey solves its own stand-off: far enough that the outermost row reaches the scene's
+        # edge, close enough that the frames are not mostly empty (see scene_survey_fill).
+        fill, scene_framing = scene_survey_fill(surface, size)
+        orbit_radius = max(fill * content_radius, MIN_ORBIT_RADIUS)
+        pivot = [float(value) for value in surface["pivot"]]
+    else:
+        # No framing requested (Auto Subject Fill 0): the built-in stand-off. Auto Orbit Distance is
+        # DEPRECATED and ignored - the distance follows Auto Subject Fill (more fill = closer).
+        fill = SUBJECT_FILL if target == SUBJECT_TARGET else SCENE_FILL
+        orbit_radius = max(fill * content_radius, MIN_ORBIT_RADIUS)
+        pivot = [float(value) for value in surface["pivot"]]
+    cap_px = max_speed * framing["radius_px"] if framing else None
+    keys, info = automatic_keys(frames, pivot, orbit_radius, content_radius, target, max_speed,
+                                size, surface, cap_px, orbit_end=orbit_end, direction=direction)
+    scene_subject = None
+    if target == SCENE_TARGET and info.get("rows") and surface.get("subject_cloud") is not None:
+        # How well the subject inside the scene is framed: a survey sweeps past it, so the numbers
+        # are "how big does it appear" and "how many frames show it whole" (see subject_share_curve).
+        positions = scene_samples(frames, pivot, orbit_radius, info, info["amplitude_scale"])
+        curve = subject_share_curve(surface["subject_cloud"], positions, pivot, surface)
+        shown = sorted(share for share, _whole, shows in curve if shows)
+        scene_subject = {
+            "source": surface["subject_source"],
+            "share_median": shown[len(shown) // 2] if shown else 0.0,
+            "share_max": max((share for share, _w, _s in curve), default=0.0),
+            "frames": len(shown),
+            "whole_frames": sum(1 for _s, whole, _shows in curve if whole),
+            "total_frames": len(curve),
+        }
+    visibility = None
+    if framing is not None and info.get("fit") == "subject pixels":
+        # The fill solve frames the front pose and keeps the *area* centred; only this pass can
+        # promise that the whole subject stays inside every frame. It works like a second budget on
+        # top of the drift ladder: the swing may be *shrunk* (free - the front framing stays) and, if
+        # even the smallest swing crops, the camera is pulled back (expensive - it costs fill). A
+        # pull-back raises the pixel cap, which lets the ladder climb again, so the pass repeats and
+        # every round only ever pulls the camera further back.
+        start_radius = orbit_radius
+        cropped_before = 0
+        amplitude_before = info["amplitude_scale"]
+        for attempt in range(VISIBILITY_PASSES):
+            fitted = min(_amplitude_ceiling(size), info["amplitude_scale"])
+            end_used = info.get("orbit_end", orbit_end)   # the speed cap may have cut the orbit
+            distance, pivot, visibility = enforce_subject_visibility(
+                surface, pivot, orbit_radius, fitted, size, frames, orbit_end=end_used,
+                direction=direction, pool=framed_pool, recentre=False)
+            if attempt == 0:
+                cropped_before = visibility["cropped"]
+            cap_next = min(fitted, visibility["amplitude_cap"])
+            moved = (visibility["scale"] > 1.0 + 1e-6
+                     or max(abs(value) for value in visibility["shift"]) > 1e-9
+                     or cap_next < info["amplitude_scale"] - 1e-9)
+            orbit_radius = max(distance, MIN_ORBIT_RADIUS)
+            if not moved:
+                break
+            if visibility["radius_px"]:
+                cap_px = max_speed * visibility["radius_px"]
+            keys, info = automatic_keys(frames, pivot, orbit_radius, content_radius, target,
+                                        max_speed, size, surface, cap_px,
+                                        amplitude_cap=cap_next, orbit_end=end_used,
+                                        direction=direction)
+        # report the *total* pull-back of the whole pass and the frames that were cropped before it
+        visibility["scale"] = orbit_radius / max(1e-9, start_radius)
+        visibility["cropped"] = cropped_before
+        visibility["amplitude_before"] = float(amplitude_before)
+        framing.update({
+            "pivot_shift": [framing["pivot_shift"][axis] + visibility["shift"][axis]
+                            for axis in range(3)],
+        })
+        framing.update({key: value for key, value in (
+            ("area", visibility["area"]), ("fill_min", visibility["fill_min"]),
+            ("fill_max", visibility["fill_max"]), ("width_px", visibility["width_px"]),
+            ("height_px", visibility["height_px"]), ("radius_px", visibility["radius_px"]))
+            if value is not None})
+    # The cylinder framing already keeps the orbit centre ON the subject - and therefore on the aim -
+    # so the pivot equaliser is not used here: moving the orbit centre away from the aim is exactly
+    # what the exact horizontal centring forbids. `equalize_pivot` stays available as a standalone
+    # utility for callers that aim off-centre on purpose.
+    equalizer = None
+    offset_values = [_finite(pivot_offset[axis], "Pivot offset") for axis in range(3)]
+    # The equaliser's move and the user's Auto Pivot offset are applied to the emitted path *last*,
+    # so nothing that runs before (framing, visibility, amplitude fit) can eat them - that is what
+    # makes the three widgets dependable. They differ in what they move:
+    #   * the equaliser moves the ORBIT CENTRE only (the camera positions): the subject's apparent
+    #     size then holds around the path while the aim - and with it the front composition - stays
+    #     exactly where the framing solved it;
+    #   * the Auto Pivot offset translates the whole rig (positions *and* aim): the subject shifts
+    #     in the picture, which is the composition nudge the widgets promise.
+    orbit_shift = list(equalizer["move"]) if equalizer else [0.0, 0.0, 0.0]
+    look_shift = [offset_values[axis] * content_radius for axis in range(3)]
+    pos_shift = [orbit_shift[axis] + look_shift[axis] for axis in range(3)]
+    orbit_centre = [pivot[axis] + pos_shift[axis] for axis in range(3)]
+    if any(abs(value) > 1e-9 for value in pos_shift):
+        keys = [{"pos": [round(key["pos"][axis] + pos_shift[axis], 6) for axis in range(3)],
+                 "look": [round(key["look"][axis] + look_shift[axis], 6) for axis in range(3)],
+                 "src": key["src"], "t": key["t"]} for key in keys]
+        pivot = [pivot[axis] + look_shift[axis] for axis in range(3)]
     keys, fixed, worst_before, worst_after = guard_collisions(keys, surface)
+    # Everything above works in absolute depth units; the *emitted* document is in median-depth
+    # units, exactly like the Camera Path Configurator's paths - the fast-depth backend multiplies
+    # the keys by the cloud's median depth (`zm`), so absolute keys would be scaled a second time.
+    depth_unit = max(1e-6, float(surface["median_depth"]))
+    emitted = [{
+        "pos": [round(value / depth_unit, 6) for value in key["pos"]],
+        "look": [round(value / depth_unit, 6) for value in key["look"]],
+        "src": key["src"], "t": key["t"],
+    } for key in keys]
+    if framing:
+        cylinder = framing.get("cylinder") or {}
+        framing_text = (
+            f"the subject is approximated by a vertical cylinder (centre "
+            f"[{pivot[0]:+.3g}, {pivot[1]:+.3g}, {pivot[2]:+.3g}], radius "
+            f"{cylinder.get('radius', 0.0):.3g} units, "
+            f"{cylinder.get('coverage', 0.0) * 100:.0f} % of the surface inside) whose axis is both "
+            f"the pivot and the aim - so the subject stays in the horizontal picture centre and the "
+            f"camera keeps one constant distance all along the path - framed to "
+            f"{framing['area'] * 100:.0f} % of the picture area at the front pose, "
+            f"{framing['fill_min'] * 100:.0f}-{framing['fill_max'] * 100:.0f} % along the path "
+            f"({framing['width_px']:.0f} x {framing['height_px']:.0f} px on a "
+            f"{CANVAS_HEIGHT * float(surface['aspect']):.0f} x {CANVAS_HEIGHT:.0f} canvas)"
+        )
+        distance_text = f"distance {orbit_radius:.3g} units solved by Auto Subject Fill"
+    visibility_text = ""
+    if visibility:
+        visibility_text = (
+            f"the whole subject box ({visibility['box_extents'][0]:.3g} x "
+            f"{visibility['box_extents'][1]:.3g} x {visibility['box_extents'][2]:.3g} units) stays "
+            f"inside every frame (worst border clearance {visibility['clearance_px']:.0f} of "
+            f"{CANVAS_HEIGHT:.0f} px at frame {visibility['worst_frame']} = "
+            f"{visibility['worst_pct'] * 100:.0f} % of the path"
+            + (f", pulled back {visibility['scale']:.2f}x for it" if visibility["scale"] > 1.005
+               else "")
+            + ")"
+        )
+    else:
+        framing_text = ""
+        distance_text = f"distance {fill:g} x content radius (built-in stand-off)"
+    if info.get("fit") == "subject pixels":
+        speed_text = (f"subject drift {info['drift_px']:.3g} px/frame, typical "
+                      f"{info['drift_typical_px']:.3g} px, cap {info['drift_cap_px']:.3g} px "
+                      f"({max_speed * 100:.0f} % of the subject's apparent radius "
+                      f"{framing['radius_px']:.0f} px) - the background is not part of it")
+    else:
+        speed_text = (f"{info['travel_per_frame']:.3g} units per frame, budget "
+                      f"{max_speed * 100:.0f} % of the content radius per frame")
+    closed_round = False
+    if info.get("orbit_end") is not None:
+        wrapped = info["orbit_end"] % FULL_CIRCLE
+        closed_round = bool(info.get("orbit_coverage")) and min(wrapped, FULL_CIRCLE - wrapped) < 0.5
     description = (
         f"Estimated from the still's surface ({surface['source']}): pivot "
-        f"[{pivot[0]:.3g}, {pivot[1]:.3g}, {pivot[2]:.3g}] is the geometric midpoint of the "
+        f"[{pivot[0]:.3g}, {pivot[1]:.3g}, {pivot[2]:.3g}] is the cylindrical centre of the "
         f"depth profile ({surface['extents'][0]:.3g} x {surface['extents'][1]:.3g} x "
-        f"{surface['extents'][2]:.3g} units), {info['style']} at {fill:g}x the content radius "
-        f"({orbit_radius:.3g} vs {content_radius:.3g} units), amplitudes at "
-        f"{info['amplitude_scale']:.2f} of full ({info['travel_per_frame']:.3g} units per frame, "
-        f"budget {max_speed * 100:.0f} % of the content radius per frame)"
+        f"{surface['extents'][2]:.3g} units), {info['style']} at {distance_text}"
+        + (f", {framing_text}" if framing_text else "")
+        + (f", {visibility_text}" if visibility_text else "")
+        + f", amplitudes at {info['amplitude_scale']:.2f} of the built-in swing ({speed_text}), "
+        + f"orbit size {size:g}x"
+        + (f", the orbit centre equalised for a steady subject size"
+           f" ({equalizer['spread_before'] * 100:.0f}"
+           f" % -> {equalizer['spread_after'] * 100:.0f} % path distance spread"
+           + (f", scaled to {equalizer['factor']:.2f} for the visibility guarantee"
+              if equalizer['factor'] < 0.999 else "") + "; the aim stays on the framing)"
+           if equalizer and equalizer["applied"] else "")
+        + (f", the Auto Pivot offset ({offset_values[0]:g}, {offset_values[1]:g}, "
+           f"{offset_values[2]:g}) content radii shifted the final aim"
+           if any(abs(value) > 1e-9 for value in offset_values) else "")
+        + (f", the front O (+/-{info['front_yaw']:.0f} deg) and the {info['lap_span']:.0f} deg "
+           f"concluding orbit run {direction_label(info['orbit_direction'])} and end at "
+           f"{info['orbit_end']:.0f} deg"
+           + ("" if info["orbit_end"] >= info["orbit_end_requested"] - 0.5
+              else f" of the requested {info['orbit_end_requested']:.0f} deg (speed cap)")
+           + (", back at the start point" if closed_round else "")
+           + f", covering {info['orbit_coverage']:.0f} deg around the subject"
+           if info.get("orbit_coverage") else "")
+        + (f"; survey {info['rows']} rows across +/-{info['half_yaw']:.0f} deg "
+           f"({info['lane_overlap'] * 100:.0f} % side overlap, {info['lane_step']:.3g} units "
+           f"between rows)"
+           + (f", stand-off solved at {scene_framing['fill']:.2f} x content radius for "
+              f"{scene_framing['reach'] * 100:.0f} % of the scene's half width" if scene_framing
+              else "")
+           + (f", the subject inside it ({scene_subject['source']}) covers "
+              f"{scene_subject['share_median'] * 100:.1f} % of the picture in "
+              f"{scene_subject['frames']} of {scene_subject['total_frames']} frames "
+              f"({scene_subject['whole_frames']} whole)"
+              if scene_subject else "")
+           if info.get("rows") else "")
         + (f"; {fixed} key(s) pushed clear of the scene geometry" if fixed else "")
-        + ". Non-front views are synthetic depth reprojections, not observed geometry."
+        + f". Keys are in median-depth units ({depth_unit:.3g} units = 1.0), like the manual path. "
+        + "Non-front views are synthetic depth reprojections, not observed geometry."
     )
-    document = document_from_keys(frames, keys, f"Auto {info['style']} ({frames} frames)",
+    document = document_from_keys(frames, emitted, f"Auto {info['style']} ({frames} frames)",
                                   description)
+    hint = ""
+    if info.get("fit") == "subject pixels":
+        ceiling = _amplitude_ceiling(size)
+        if info["amplitude_scale"] < ceiling * 0.99:
+            hint = (f"the subject-drift budget stops the front loop at "
+                    f"{info['amplitude_scale']:.2f}x of its {ceiling:.2f}x view limit "
+                    f"({info['drift_px']:.3g} px/frame vs {info['drift_cap_px']:.3g} px cap) - raise "
+                    f"Auto Max Speed or Output Frames for a bigger O, or shorten Auto Orbit End "
+                    f"(the frames it frees go to the front loop)")
+        floor = info.get("front_floor")
+        if floor is not None and info["amplitude_scale"] < floor - 1e-9:
+            shrink = (f"the cap could not even pay for Auto Orbit Size {floor:.2f}x, so the front O "
+                      f"had to shrink below it to {info['amplitude_scale']:.2f}x - more Output "
+                      f"Frames or a higher Auto Max Speed give it back")
+            hint = f"{hint}; {shrink}" if hint else shrink
+        # The fill request can be *capped by the room the orbit needs*: at a very close distance a
+        # pose of the swing (the elevation extremes in practice) would crop the subject, so the
+        # camera stays back and the fill stays below the request. Say it, or the user turns the fill
+        # up and nothing happens.
+        if framing and framing.get("room_distance") and framing.get("distance_fill"):
+            room = float(framing["room_distance"])
+            wanted = float(framing["distance_fill"])
+            if room > wanted * 1.02:
+                room_note = (f"Auto Subject Fill would frame {float(subject_fill or 0):.0f} % but "
+                             f"wants {wanted:.3g} units - the orbit's room (the whole subject inside "
+                             f"every frame, including the O and lap extremes) keeps the camera at "
+                             f"{room:.3g} units ({room / max(1e-9, wanted):.2f}x back). Lower Auto "
+                             f"Orbit Size or Auto Orbit End, or mask the subject tighter, to come closer")
+                hint = f"{hint}; {room_note}" if hint else room_note
+    if visibility and not visibility["ok"]:
+        hint = (f"the whole subject does not fit the picture even at "
+                f"{VISIBILITY_MAX_SCALE:.0f}x the fill distance - narrow the subject (a MASK from "
+                f"e.g. RMBG) or frame it with more room around it")
+    else:
+        parts = []
+        if (info.get("orbit_end") is not None
+                and info["orbit_end"] < info["orbit_end_requested"] - 0.5):
+            parts.append(f"the max camera speed ends the orbit at {info['orbit_end']:.0f} deg of the "
+                         f"requested {info['orbit_end_requested']:.0f} deg - more Output Frames, a "
+                         f"higher Auto Max Speed or a shorter Auto Orbit End balance the round")
+        if info.get("drift_px") and info["drift_px"] > info["drift_cap_px"] + 1e-9:
+            parts.append(f"the orbit already runs at the smallest drift these frames allow "
+                         f"({info['drift_px']:.3g} px/frame vs the {info['drift_cap_px']:.3g} px cap) "
+                         f"- more Output Frames or a higher Auto Max Speed, a shorter Auto Orbit End "
+                         f"or a tighter MASK (it shrinks what moves) take the rest")
+        elif (info.get("fit") == "world travel" and info.get("orbit_coverage")
+              and info["travel_per_frame"] > info["budget_per_frame"] + 1e-12):
+            parts.append(f"the orbit costs {info['travel_per_frame']:.3g} units/frame at "
+                         f"{info['amplitude_scale']:.2f}x of the built-in swing (budget "
+                         f"{info['budget_per_frame']:.3g}) - raise Auto Max Speed or Output Frames, "
+                         f"or set Auto Subject Fill so the budget is measured in subject pixels")
+        if visibility and visibility["amplitude_before"] > visibility["amplitude_cap"] + 1e-6:
+            parts.append(f"the front O was shortened to {visibility['amplitude_cap']:.2f}x (from "
+                         f"{visibility['amplitude_before']:.2f}x) so the whole subject stays in the "
+                         f"picture - the concluding orbit keeps its own end, so the round still goes "
+                         f"where it should; Auto Max Speed, Output Frames or a tighter MASK buy back "
+                         f"the viewing angles")
+        if visibility and visibility["scale"] > 1.005:
+            parts.append(f"the camera pulled back {visibility['scale']:.2f}x from the fill distance "
+                         f"so neither the O nor the concluding orbit leaves the picture "
+                         f"({visibility['cropped']} of {visibility['frames']} frames were cropped "
+                         f"before)")
+        if parts:
+            extra = "; ".join(parts)
+            hint = f"{hint}; {extra}" if hint else extra
+    if info.get("rows"):
+        parts = []
+        reach = orbit_radius * math.sin(math.radians(info["half_yaw"] * info["amplitude_scale"]))
+        if reach < info["half_width"] - 1e-9:
+            shortfall = 1.0 - reach / max(1e-9, info["half_width"])
+            if info["amplitude_scale"] < 0.99:
+                # the stand-off is right, the *speed fit* shortened the sweep: more frames per row
+                # (or a bigger budget) buy the width back, the distance cannot
+                parts.append(f"the sweep was cut to {info['amplitude_scale']:.2f}x by the speed "
+                             f"budget, so the rows reach {reach:.3g} of the scene's "
+                             f"{info['half_width']:.3g} half width ({shortfall * 100:.0f} % short) - "
+                             f"raise Auto Max Speed or Output Frames, a bigger Auto Orbit Size widens "
+                             f"the frame (trading side overlap)")
+            else:
+                parts.append(f"the rows reach {reach:.3g} units of the scene's "
+                             f"{info['half_width']:.3g} half width - raise Auto Orbit Distance (fly "
+                             f"further out), Auto Orbit Size or Auto Max Speed to cover the rest")
+        if info.get("lane_overlap", 1.0) < SCENE_LANE_OVERLAP_WARN:
+            # coverage needs overlap: rows further apart than the frame's footprint leave strips of
+            # the scene out of every row - more frames buy rows, Auto Orbit Size buys breadth per row
+            parts.append(f"the rows sit {info['lane_step']:.3g} units apart "
+                         f"({info['lane_overlap'] * 100:.0f} % side overlap, the drone rule wants "
+                         f"70 %) - more Output Frames or Auto Max Speed add rows, Auto Orbit Size "
+                         f"widens each row's footprint")
+        if scene_subject:
+            if scene_subject["frames"] == 0:
+                parts.append(f"the survey never shows the subject ({scene_subject['source']}) - "
+                             f"raise Auto Orbit Size or a lower Auto Orbit Distance make the rows "
+                             f"pass it")
+            elif scene_subject["share_median"] < SCENE_SUBJECT_SHARE_MIN:
+                parts.append(f"the subject ({scene_subject['source']}) covers only "
+                             f"{scene_subject['share_median'] * 100:.1f} % of the picture in the "
+                             f"survey - a lower Auto Orbit Distance brings the rows closer, a "
+                             f"smaller Auto Orbit Size narrows them onto the subject")
+            elif scene_subject["share_median"] > 1.0:
+                parts.append(f"the subject ({scene_subject['source']}) is bigger than the frame at "
+                             f"{scene_subject['share_median'] * 100:.0f} % of the picture - raise "
+                             f"Auto Orbit Distance for a wider survey, or treat it as the subject "
+                             f"target instead of the scene")
+        extra = "; ".join(parts)
+        if extra:
+            hint = f"{hint}; {extra}" if hint else extra
     summary = {
         "target": target, "frames": frames, "source": surface["source"],
         "points": surface["points"], "content_points": surface["content_points"],
         "pivot": pivot, "extents": surface["extents"],
+        "median_depth": float(depth_unit),
         "pivot_offset": [float(value) for value in pivot_offset],
         "content_radius": content_radius, "orbit_radius": float(orbit_radius),
-        "style": info["style"], "amplitude_scale": info["amplitude_scale"],
+        "orbit_fill": float(fill) if fill is not None else None, "orbit_size": float(size),
+        "fit": info["fit"], "amplitude_scale": info["amplitude_scale"],
         "travel_per_frame": info["travel_per_frame"],
         "budget_per_frame": info["budget_per_frame"], "keys": info["keys"],
         "max_speed": max_speed, "scene_radius": float(surface["scene_radius"]),
         "scene_pivot": surface["scene_pivot"], "collision_fixes": fixed,
         "collision_margin": COLLISION_MARGIN, "clearance_before": worst_before,
         "clearance_after": worst_after,
+        "pivot_equalizer": equalizer, "pivot_shift_final": look_shift,
+        "orbit_centre": orbit_centre, "orbit_shift": orbit_shift,
+        "hfov": float(surface["hfov"]), "hint": hint,
+        "style": info["style"],
+        "front_yaw_deg": info.get("front_yaw"), "lap_span_deg": info.get("lap_span"),
+        "orbit_coverage_deg": info.get("orbit_coverage"),
+        "orbit_end_deg": info.get("orbit_end"),
+        "orbit_end_requested_deg": info.get("orbit_end_requested"),
+        "orbit_direction": info.get("orbit_direction"), "front_share": info.get("front_share"),
     }
+    if info.get("fit") == "subject pixels":
+        summary.update({"drift_px": info["drift_px"], "drift_typical_px": info["drift_typical_px"],
+                        "drift_cap_px": info["drift_cap_px"]})
+    if visibility:
+        summary.update({"visibility_ok": visibility["ok"],
+                        "visibility_scale": visibility["scale"],
+                        "visibility_clearance_px": visibility["clearance_px"],
+                        "visibility_margin_px": visibility["margin_px"],
+                        "visibility_cropped": visibility["cropped"],
+                        "visibility_frames": visibility["frames"],
+                        "visibility_quarters_px": visibility["quarters_px"],
+                        "visibility_worst_frame": visibility["worst_frame"],
+                        "visibility_worst_pct": visibility["worst_pct"],
+                        "visibility_amplitude_cap": visibility["amplitude_cap"],
+                        "visibility_amplitude_before": visibility["amplitude_before"],
+                        "visibility_shift": visibility["shift"],
+                        "subject_box_units": visibility["box_extents"]})
+    if framing:
+        summary.update({"subject_fill_area": framing["area"],
+                        "subject_fill_min": framing["fill_min"],
+                        "subject_fill_max": framing["fill_max"],
+                        "subject_width_px": framing["width_px"],
+                        "subject_height_px": framing["height_px"],
+                        "subject_radius_px": framing["radius_px"],
+                        "distance_from_fill": framing.get("distance_fill"),
+                        "room_distance": framing.get("room_distance"),
+                        "subject_depth": framing["depth"],
+                        "pivot_shift": framing["pivot_shift"],
+                        "framing_points": framing["points"],
+                        "cylinder_radius": (framing.get("cylinder") or {}).get("radius"),
+                        "cylinder_coverage": (framing.get("cylinder") or {}).get("coverage"),
+                        "canvas_height": CANVAS_HEIGHT})
+    if info.get("rows"):
+        summary.update({"rows": info["rows"], "scene_half_yaw": info["half_yaw"],
+                        "lane_step": info["lane_step"], "lane_overlap": info["lane_overlap"],
+                        "scene_half_width": info["half_width"],
+                        "scene_low_elevation": info["low_elevation"],
+                        "scene_high_elevation": info["high_elevation"]})
+    if scene_framing:
+        summary.update({"scene_fill_solved": scene_framing["fill"],
+                        "scene_reach": scene_framing["reach"],
+                        "scene_footprint": scene_framing["footprint"],
+                        "scene_yaw_limit": scene_framing["yaw_limit"],
+                        "scene_reach_fill": scene_framing["reach_fill"],
+                        "scene_fill_cap": scene_framing["fill_cap"]})
+    if scene_subject:
+        summary.update({"subject_source": scene_subject["source"],
+                        "scene_subject_share": scene_subject["share_median"],
+                        "scene_subject_share_max": scene_subject["share_max"],
+                        "scene_subject_frames": scene_subject["frames"],
+                        "scene_subject_whole_frames": scene_subject["whole_frames"]})
     return document, summary
 
 
@@ -506,16 +2194,73 @@ def depth_from_reference(reference, model_size="", depth_res=AUTO_DEPTH_RES, dev
 
 def format_summary(summary):
     """One console-friendly line describing an estimate (used by the node)."""
-    line = (
+    parts = [
         f"auto camera: {summary['style']} around "
         f"[{summary['pivot'][0]:.3g}, {summary['pivot'][1]:.3g}, {summary['pivot'][2]:.3g}] "
-        f"- the geometric midpoint of the {summary['target']} depth profile "
+        f"- the cylindrical centre of the {summary['target']} depth profile "
         f"({summary['extents'][0]:.3g} x {summary['extents'][1]:.3g} x "
-        f"{summary['extents'][2]:.3g} units, {summary['source']}), radius "
-        f"{summary['orbit_radius']:.3g} over {summary['frames']} frames "
-        f"({summary['travel_per_frame']:.3g} units/frame at {summary['amplitude_scale']:.2f}x "
-        f"amplitude, budget {summary['max_speed'] * 100:.0f} %/frame, {summary['keys']} keys)"
-    )
+        f"{summary['extents'][2]:.3g} units, {summary['source']})",
+    ]
+    if summary.get("subject_fill_area"):
+        parts.append(
+            f"subject {summary['subject_fill_area'] * 100:.0f} % of the frame at the front pose "
+            f"({summary.get('subject_fill_min', summary['subject_fill_area']) * 100:.0f}-"
+            f"{summary.get('subject_fill_max', summary['subject_fill_area']) * 100:.0f} % along "
+            f"the path, {summary['subject_width_px']:.0f} x {summary['subject_height_px']:.0f} px) "
+            f"at radius {summary['orbit_radius']:.3g} units; the pivot is the cylinder axis and the "
+            f"aim, so the subject stays in the horizontal picture centre and the camera keeps that "
+            f"one distance all along the path"
+            + (f" (cylinder radius {summary['cylinder_radius']:.3g} units, "
+               f"{summary.get('cylinder_coverage', 0.0) * 100:.0f} % of the surface inside)"
+               if summary.get("cylinder_radius") else "")
+        )
+    else:
+        parts.append(f"radius {summary['orbit_radius']:.3g} "
+                     f"({summary['orbit_fill']:g} x content radius)")
+    if summary.get("visibility_scale") is not None:
+        parts.append(
+            f"the whole subject box stays inside every frame (border clearance "
+            f"{summary['visibility_clearance_px']:.0f} px at worst, "
+            f"{summary['visibility_margin_px']:.0f} px kept free"
+            + (f", pulled back {summary['visibility_scale']:.2f}x for it"
+               if summary["visibility_scale"] > 1.005 else "")
+            + ")"
+        )
+    parts.append(f"orbit size {summary['orbit_size']:g}x over {summary['frames']} frames")
+    if summary.get("drift_px") is not None:
+        parts.append(
+            f"({summary['drift_px']:.3g} px/frame subject drift, typical "
+            f"{summary['drift_typical_px']:.3g} px, cap {summary['drift_cap_px']:.3g} px, "
+            f"{summary['amplitude_scale']:.2f}x amplitude, {summary['keys']} keys"
+            + (f", O +/-{summary['front_yaw_deg']:.0f} deg {summary.get('orbit_direction', '')} "
+               f"+ {summary['lap_span_deg']:.0f} deg lap to {summary['orbit_end_deg']:.0f} deg "
+               f"= {summary['orbit_coverage_deg']:.0f} deg around"
+               if summary.get("orbit_coverage_deg") else "")
+            + ")"
+        )
+    else:
+        parts.append(
+            f"({summary['travel_per_frame']:.3g} units/frame at "
+            f"{summary['amplitude_scale']:.2f}x amplitude, budget "
+            f"{summary['max_speed'] * 100:.0f} %/frame, {summary['keys']} keys)"
+        )
+    line = ", ".join(parts)
+    if summary.get("rows"):
+        line += (f" - survey: {summary['rows']} rows across +/-{summary['scene_half_yaw']:.0f} deg "
+                 f"over {summary['scene_half_width'] * 2:.3g} units of scene width "
+                 f"({summary['lane_overlap'] * 100:.0f} % side-lap, {summary['lane_step']:.3g} units "
+                 f"between rows, elevations "
+                 f"{summary['scene_low_elevation']:.0f} -> {summary['scene_high_elevation']:.0f} deg)")
+        if summary.get("scene_reach") is not None:
+            line += (f", stand-off solved at {summary.get('scene_fill_solved', 0.0):.2f} x content "
+                     f"radius for {summary['scene_reach'] * 100:.0f} % of the scene's half width "
+                     f"(footprint {summary.get('scene_footprint', 0.0):.3g} units)")
+        if summary.get("scene_subject_share") is not None:
+            line += (f", the subject inside it covers {summary['scene_subject_share'] * 100:.1f} % "
+                     f"of the picture in {summary['scene_subject_frames']} of "
+                     f"{summary['frames']} frames ({summary['scene_subject_whole_frames']} whole)")
+    if summary.get("hint"):
+        line += f" - {summary['hint']}"
     if summary["collision_fixes"]:
         line += (f" - {summary['collision_fixes']} key(s) pushed out of the scene "
                  f"(closest approach {summary['clearance_before'] * 100:.1f} % -> "

@@ -11,8 +11,20 @@ configurator. `camera_mode` decides where the path on `custom_camera` comes from
                 profile, so the depth decides where the camera looks, not the picture centre. The
                 pivot is what `auto_pivot_*` offsets, and `auto_path_mode` then picks how to fly:
 
-                  Automatic   a big front O orbit followed by a height lap around the rest (or a
-                              big oval over the whole scene), fitted to the camera-speed budget
+                  Automatic   a big front O orbit followed by a concluding orbit around the rest -
+                              or, for a scene, lateral survey rows across the scene's width - fitted
+                              to the camera-speed budget.
+                              Auto Orbit End sets where that orbit stops (360 deg = the full round,
+                              back at the start point = the middle of the O; 0 deg = the front O
+                              alone) and Auto Orbit Direction whether it runs counter-clockwise
+                              (the default) or clockwise. The max camera speed is a *hard* limit:
+                              when the budget cannot pay for the requested end, the orbit is cut
+                              there and the console line names the levers (more frames, a higher
+                              Auto Max Speed, a shorter end).
+                              Auto Orbit Distance sets the camera-to-pivot distance (content
+                              radii, the estimate's fill is the default) and Auto Orbit Size the
+                              O-orbit's swing amplitudes, so the flight envelope is under the
+                              user's control on top of the estimate
                   Manual      the manual path widgets below, aimed at the estimated pivot instead
                               of the absolute look-pivot
 
@@ -36,6 +48,20 @@ from enndee_meridian_auto_camera import (
     AUTO_TARGETS,
     COLLISION_MARGIN,
     DEFAULT_MAX_SPEED,
+    ORBIT_DIRECTION_DEFAULT,
+    ORBIT_DIRECTIONS,
+    ORBIT_DISTANCE_MAX,
+    ORBIT_END_DEFAULT,
+    ORBIT_END_MAX,
+    ORBIT_END_MIN,
+    ORBIT_SIZE_DEFAULT,
+    ORBIT_SIZE_MAX,
+    ORBIT_SIZE_MIN,
+    SCENE_FILL,
+    SUBJECT_FILL,
+    SUBJECT_FILL_DEFAULT,
+    SUBJECT_FILL_MAX,
+    SUBJECT_FILL_MIN,
     SUBJECT_TARGET,
     document_from_keys,
     estimate_camera_path,
@@ -94,8 +120,9 @@ PATH_WIDGET_NAMES = (
     "path_spiral_end_elevation",
     "path_dolly",
 )
-AUTO_WIDGET_NAMES = ("auto_target", "auto_max_speed", "auto_path_mode",
-                     "auto_pivot_x", "auto_pivot_y", "auto_pivot_z")
+AUTO_WIDGET_NAMES = ("auto_target", "auto_max_speed", "auto_path_mode", "auto_subject_fill",
+                     "auto_orbit_distance", "auto_orbit_size", "auto_orbit_end",
+                     "auto_orbit_direction", "auto_pivot_x", "auto_pivot_y", "auto_pivot_z")
 
 
 def build_meridian_arguments(output_frames):
@@ -139,23 +166,73 @@ class MeridianParametersAndCamera:
                 }),
                 "auto_max_speed": ("FLOAT", {
                     "default": round(DEFAULT_MAX_SPEED * 100.0, 1), "min": 1.0, "max": 50.0, "step": 0.5,
-                    "tooltip": "Automatic camera: speed cap in percent of the content radius per frame (12 % = the camera may travel 12 % of the subject/scene radius each frame). Lower is safer - too much new surface per frame is what makes the reprojections smear. If the frame count cannot cover the path at this speed, its amplitudes are scaled down automatically and the console line reports the factor.",
+                    "tooltip": "Automatic camera: speed cap. Subject target: percent of the subject's *apparent* radius per frame - only the subject's own pixels count, the node measures the true pixel drift of its reprojected surface and the background never limits the camera. Scene target: percent of the content radius per frame. 12 % is the default; lower is safer (less new surface per frame, less smear), higher is faster. The node always reports the measured value in the console line.",
                 }),
                 "auto_path_mode": (list(AUTO_PATH_MODES), {
                     "default": AUTOMATIC_PATH,
-                    "tooltip": "Automatic camera: how to fly around the estimated pivot. 'Automatic' builds the estimated path - a big front O orbit that emphasises the front, then a height lap around the rest of the subject (or one big oval over the whole scene), fitted to the speed budget. 'Manual' flies the manual path widgets below - same styles, same settings - but aimed at the estimated pivot instead of the absolute look-pivot. Either way the collision guard keeps the camera out of the scene geometry.",
+                    "tooltip": "Automatic camera: how to fly around the estimated pivot. 'Automatic' builds the estimated path - for a subject a big front O orbit that emphasises the front, then the concluding orbit that runs around the rest until it is Auto Orbit End degrees out (360 = back at the start point, so the clip loops) and always under the Auto Max Speed cap; for a scene lateral survey rows across the scene's width, so every side has parallax basis instead of spending frames on a surround. 'Manual' flies the manual path widgets below - same styles, same settings - but aimed at the estimated pivot instead of the absolute look-pivot. Either way the collision guard keeps the camera out of the scene geometry.",
+                }),
+                "auto_subject_fill": ("FLOAT", {
+                    "default": round(SUBJECT_FILL_DEFAULT, 1),
+                    "min": SUBJECT_FILL_MIN, "max": SUBJECT_FILL_MAX, "step": 5.0,
+                    "tooltip": (
+                        f"Automatic camera, subject target: the share of the picture *area* the subject "
+                        f"should fill - and the ONLY distance control for a subject (Auto Orbit Distance "
+                        f"is deprecated). The node fits a vertical cylinder to the subject (~90-95 % of "
+                        f"the surface, so a lance or a depth spike cannot decide the shape), solves the "
+                        f"camera distance for this fill and puts the pivot on the cylinder axis, which "
+                        f"it also aims at: the subject then stays in the horizontal picture centre the "
+                        f"whole way round and the camera keeps one constant distance to the pivot. A "
+                        f"*bigger* value therefore means a *closer* camera / a bigger subject. 30-50 % "
+                        f"is the sweet spot for depth reprojections: less wastes resolution, more leaves "
+                        f"no room for the orbit. 0 switches the framing off and uses the built-in "
+                        f"stand-off ({SUBJECT_FILL:g} x the subject radius)."
+                    ),
+                }),
+                "auto_orbit_distance": ("FLOAT", {
+                    "default": 0.0,
+                    "min": 0.0, "max": ORBIT_DISTANCE_MAX, "step": 0.05,
+                    "tooltip": (
+                        "DEPRECATED - ignored. The camera-to-pivot distance is derived from Auto "
+                        "Subject Fill now (subject) or from the survey solve (scene); a fixed stand-off "
+                        "used to fight the fill request. Raise Auto Subject Fill to come closer, lower "
+                        "it to pull back."
+                    ),
+                }),
+                "auto_orbit_size": ("FLOAT", {
+                    "default": round(ORBIT_SIZE_DEFAULT, 2),
+                    "min": ORBIT_SIZE_MIN, "max": ORBIT_SIZE_MAX, "step": 0.05,
+                    "tooltip": (
+                        f"Automatic camera: size of the O-orbit, i.e. a multiplier on the path's swing "
+                        f"amplitudes. 1 is the built-in swing: the loop opens on the framed front pose, rises "
+                        f"to the top of the O, swings around to the subject's side (see Auto Orbit Direction) "
+                        f"and the concluding orbit carries on from there around the back to Auto Orbit End. "
+                        f"For a subject this is a *floor*: the fit only ever grows the loop above it "
+                        f"towards the view limits (+/-85 deg azimuth, +/-60 deg elevation) - a wider O keeps "
+                        f"the front's angle variety and shortens the orbit - and when the Auto Max Speed "
+                        f"budget cannot pay for the requested Auto Orbit End at this width, the *orbit* is "
+                        f"cut there (the console says so), not the front. Only if the cap cannot even pay for "
+                        f"the loop itself does the O shrink below this value - and then the fit keeps the "
+                        f"*widest* loop it can pay for and shortens the orbit further, so the front stays the "
+                        f"front (reported too). Values below 1 "
+                        f"keep the whole visit deliberately tight; the frames are split between O and orbit so "
+                        f"both run at the same drift. "
+                        f"For a scene the survey's sweep and heights "
+                        f"follow it. The scene budget may still scale the amplitudes down; the subject budget "
+                        f"stops the growth instead, and the console line reports both."
+                    ),
                 }),
                 "auto_pivot_x": ("FLOAT", {
                     "default": 0.0, "min": -1.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "Automatic camera: pivot offset X in content radii (frame-0 camera axes, 0 = image centre). The estimate already puts the pivot in the middle of the subject's depth profile - this nudges it, e.g. -0.3 moves the look target a third of the subject radius to the left.",
+                    "tooltip": "Automatic camera: pivot offset X in content radii (frame-0 camera axes, 0 = image centre). The estimate puts the pivot on the subject's centre and the equaliser keeps the subject's box size steady around the path; this offset then shifts the *final* aim (applied last, so the solves cannot cancel it), e.g. -0.3 moves the look target a third of the subject radius to the left.",
                 }),
                 "auto_pivot_y": ("FLOAT", {
                     "default": 0.0, "min": -1.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "Automatic camera: pivot offset Y in content radii (positive is down). Raise or lower the framing midpoint the camera keeps looking at.",
+                    "tooltip": "Automatic camera: pivot offset Y in content radii (positive is down). Raise or lower the framing midpoint the camera keeps looking at - applied to the final aim, on top of the equalised pivot, so the solves never cancel it.",
                 }),
                 "auto_pivot_z": ("FLOAT", {
                     "default": 0.0, "min": -1.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "Automatic camera: pivot offset Z in content radii along the view axis (positive is farther away). Negative pulls the look target toward the source camera, positive pushes it into the subject - useful when the depth profile's middle sits inside a hollow subject.",
+                    "tooltip": "Automatic camera: pivot offset Z in content radii along the view axis (positive is farther away). Negative pulls the look target toward the source camera, positive pushes it into the subject - useful when the depth profile's middle sits inside a hollow subject. Applied to the final aim, so the solves never cancel it.",
                 }),
                 "path_orbit_front": ("BOOLEAN", {
                     "default": True,
@@ -249,6 +326,39 @@ class MeridianParametersAndCamera:
                     "default": 0.0, "min": -0.5, "max": 3.0, "step": 0.05,
                     "tooltip": "Camera path: shifts the whole path along the view axis, in median-depth units. Positive values pull the camera back (zoom out a bit), negative push it closer. Applies to every path style - the sweeps orbit at the new distance and the O loops keep their diameter on the shifted sphere.",
                 }),
+                # The two Automatic-orbit shape widgets sit at the end of the input list on purpose:
+                # inserting them next to the other `auto_*` widgets would shift every widget below
+                # them, and ComfyUI stores a workflow's widget values by position. The JS panel
+                # hides/shows them with the rest of the automatic group either way.
+                "auto_orbit_end": ("FLOAT", {
+                    "default": round(ORBIT_END_DEFAULT, 1),
+                    "min": ORBIT_END_MIN, "max": ORBIT_END_MAX, "step": 5.0,
+                    "tooltip": (
+                        f"Automatic camera (subject target): where the concluding orbit ends, in degrees "
+                        f"around the subject measured from the start - the *middle of the O*, the framed "
+                        f"front pose. {ORBIT_END_DEFAULT:g} (the default) is the complete round: the orbit "
+                        f"runs around the back and arrives back at the start point, and its height arc "
+                        f"lands back on the start height, so the last frame sits on the first one and the "
+                        f"clip loops. Smaller values stop earlier (180 = the subject's back, "
+                        f"{360.0 / 2:g} = its side), 0 skips the concluding orbit entirely and flies the "
+                        f"front O alone. Larger values keep going (up to "
+                        f"{ORBIT_END_MAX:g} = two rounds). The auto fit never exceeds Auto Max "
+                        f"Speed: when the budget cannot pay for the requested end, the orbit is cut "
+                        f"there and the console line reports it (more Output Frames, a higher Auto Max "
+                        f"Speed or a shorter end balance the round)."
+                    ),
+                }),
+                "auto_orbit_direction": (list(ORBIT_DIRECTIONS), {
+                    "default": ORBIT_DIRECTION_DEFAULT,
+                    "tooltip": (
+                        f"Automatic camera (subject target): which way the orbit turns. "
+                        f"'{ORBIT_DIRECTIONS[0]}' (the default) opens the O on the front pose, rises to "
+                        f"12 o'clock and swings 12 -> 9 -> 6 -> 3 o'clock before the concluding orbit "
+                        f"carries on; '{ORBIT_DIRECTIONS[1]}' mirrors the whole path (12 -> 3 -> 6 -> 9 "
+                        f"o'clock and the orbit runs the other way round). Same swing, same end, same "
+                        f"speed - only the side the camera travels towards first changes."
+                    ),
+                }),
             },
             "optional": {
                 "reference_image": ("IMAGE", {
@@ -274,8 +384,11 @@ class MeridianParametersAndCamera:
         "camera path. Camera Mode picks between a hand-authored path (vertical O orbits at named "
         "stations, an alternating-height pendulum, or a monotone spiral sweep) and an automatic "
         "mode that estimates the *geometric pivot* of the subject - or of the whole scene - from "
-        "the reference image's depth profile, then flies either the estimated path (a big front O "
-        "orbit plus a height lap around the rest, or one big oval over the scene) or the manual "
+        "the reference image's depth profile, then flies either the estimated path (a front O "
+        "orbit that opens on the framed front pose plus a concluding orbit that runs Auto Orbit End "
+        "degrees around the subject, counter-clockwise or clockwise, back at the start point for "
+        "the default 360 deg - or lateral "
+        "survey rows across a scene's width) or the manual "
         "path around that pivot, always fitted to a camera-speed budget and guarded against "
         "colliding with the scene geometry. VGGT is gone: Meridian Geometry runs its in-process "
         "fast-depth backend only."
@@ -318,6 +431,13 @@ class MeridianParametersAndCamera:
                 reference_image, int(kwargs["output_frames"]), target=target,
                 max_speed=float(kwargs["auto_max_speed"]) / 100.0,
                 subject_mask=subject_mask, device=device, pivot_offset=offset,
+                # Auto Orbit Distance is deprecated and ignored: the camera-to-pivot distance now
+                # always follows Auto Subject Fill (a bigger fill = a closer camera).
+                orbit_distance=None,
+                orbit_size=float(kwargs["auto_orbit_size"]),
+                subject_fill=float(kwargs["auto_subject_fill"]),
+                orbit_end=float(kwargs["auto_orbit_end"]),
+                direction=kwargs["auto_orbit_direction"],
             )
             print(f"[Enndee] Meridian {format_summary(summary)}", flush=True)
             return signal
