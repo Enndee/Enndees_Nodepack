@@ -5,8 +5,12 @@ with upload button, ``resize`` toggle, width/height, repeat, keep_proportion,
 divisible_by, mask_channel, background_color). Additionally it offers the
 ``original_image`` output, the nine resize types of ComfyUI core's
 ``ResizeImageMaskNode`` (see ``enndee_resize_modes``), a ``match`` input for
-the "match size" type and a ``megapixels_in`` float socket that overrides the
-``megapixels`` widget when a link is connected (forceInput, no widget).
+the "match size" type and the ``megapixels`` slider parameter (FLOAT widget
+whose input slot accepts float links - e.g. a primitive float as source).
+The frontend extension keeps the parameter healthy on load: it re-applies
+saved widget values by name (the frontend's positional restore can shift
+them and once re-typed the slot as Boolean), removes legacy ``megapixels_in``
+sockets and forces the slot's FLOAT input format.
 """
 
 import hashlib
@@ -143,7 +147,7 @@ class ImageLoaderResizeEnndee:
                 }),
                 "megapixels": ("FLOAT", {
                     "default": 1.0, "min": 0.01, "max": 16.0, "step": 0.01,
-                    "tooltip": "'scale total pixels': target megapixels (1.0 is about 1024x1024).",
+                    "tooltip": "'scale total pixels': target megapixels (1.0 is about 1024x1024). Slider plus FLOAT input slot - drop a primitive float signal onto the parameter to drive it.",
                 }),
                 "multiple": ("INT", {
                     "default": 8, "min": 1, "max": 512, "step": 1,
@@ -162,17 +166,13 @@ class ImageLoaderResizeEnndee:
                 "match": ("IMAGE", {
                     "tooltip": "Reference image for the 'match size' resize type.",
                 }),
-                "megapixels_in": ("FLOAT", {
-                    "default": 1.0, "min": 0.01, "max": 16.0, "step": 0.01,
-                    "forceInput": True,
-                    "tooltip": "Float signal for 'scale total pixels': when connected, this value replaces the 'megapixels' widget (clamped to 0.01 - 16.0).",
-                }),
             },
         }
 
 
-    RETURN_TYPES = ("IMAGE", "IMAGE", "MASK", "INT", "INT", "STRING")
-    RETURN_NAMES = ("image", "original_image", "mask", "width", "height", "image_path")
+    RETURN_TYPES = ("IMAGE", "IMAGE", "MASK", "INT", "INT", "STRING", "FLOAT")
+    RETURN_NAMES = ("image", "original_image", "mask", "width", "height", "image_path",
+                    "megapixels")
     OUTPUT_TOOLTIPS = (
         "The loaded image, resized when 'resize' is enabled.",
         "The loaded image at its original file size, never resized.",
@@ -191,8 +191,8 @@ class ImageLoaderResizeEnndee:
 
     def load(self, image, resize, resize_type, width, height, repeat, keep_proportion,
              divisible_by, mask_channel, background_color, multiplier, longer_size,
-             shorter_size, megapixels, multiple, scale_method, no_upscale=False, match=None,
-             megapixels_in=None):
+             shorter_size, megapixels=1.0, multiple=8, scale_method="lanczos",
+             no_upscale=False, match=None, megapixels_in=None):
         image_path = folder_paths.get_annotated_filepath(image)
         loaded, alpha = load_image_frames(image_path)
         mask = extract_mask(loaded, alpha, mask_channel)
@@ -200,10 +200,13 @@ class ImageLoaderResizeEnndee:
         result = loaded
 
         if megapixels_in is not None:
-            # Float signal socket (forceInput): a connected link wins over the
-            # widget. min/max mirror the widget spec so API links cannot leave
-            # the documented 0.01 - 16.0 range.
-            megapixels = min(16.0, max(0.01, float(megapixels_in)))
+            # Legacy alias: saves from the short-lived megapixels_in socket era
+            # can still carry a link to it (the frontend keeps such orphan
+            # inputs alive when loading). The real socket is "megapixels" now.
+            megapixels = float(megapixels_in)
+        # Clamp to the documented range whatever the source (socket, legacy
+        # alias or API prompt) - mirrors the old widget min/max.
+        megapixels = min(16.0, max(0.01, float(megapixels)))
 
         if resize:
             step = max(1, int(divisible_by))
@@ -253,7 +256,8 @@ class ImageLoaderResizeEnndee:
             original = original.repeat(repeat, 1, 1, 1)
             mask = mask.repeat(repeat, 1, 1)
 
-        return (result, original, mask, result.shape[2], result.shape[1], image_path)
+        return (result, original, mask, result.shape[2], result.shape[1], image_path,
+                float(megapixels))
 
     @classmethod
     def IS_CHANGED(cls, image, **kwargs):

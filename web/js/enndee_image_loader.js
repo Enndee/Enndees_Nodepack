@@ -133,6 +133,95 @@ function applyResizeVisibility(node) {
   finishVisibilityUpdate(node);
 }
 
+// ---------------------------------------------------------------------------
+// megapixels is a normal FLOAT slider parameter whose input slot accepts float
+// links (e.g. a primitive float as source). Two things attack this parameter:
+//  1. the frontend restores widget values POSITIONALLY (namedValuesRestore is
+//     off by default) and every widget-layout mismatch shifts them by one -
+//     the shifted save then re-types the slot as Boolean (a boolean value in
+//     a float widget). We re-apply the saved values BY NAME on load.
+//  2. legacy saves can still carry an orphan "megapixels_in" socket; linked
+//     ones are rewired to "megapixels", and the slot type is forced to FLOAT.
+// ---------------------------------------------------------------------------
+const LEGACY_WIDGET_ORDER = [
+  "image", "resize", "resize_type", "width", "height", "repeat",
+  "keep_proportion", "divisible_by", "mask_channel", "background_color",
+  "multiplier", "longer_size", "shorter_size", "megapixels", "multiple",
+  "scale_method", "no_upscale", "upload",
+];
+
+function namedValuesFrom(info) {
+  if (info?.widgets_values_named) return info.widgets_values_named;
+  if (Array.isArray(info?.widgets_values)) {
+    return Object.fromEntries(
+      info.widgets_values
+        .map((value, index) => [LEGACY_WIDGET_ORDER[index], value])
+        .filter(([name]) => name),
+    );
+  }
+  return null;
+}
+
+function repairWidgetValuesByName(node, info) {
+  const named = namedValuesFrom(info);
+  if (!named) return null;
+  for (const [name, value] of Object.entries(named)) {
+    if (value == null) continue;
+    const widget = node.widgets?.find((candidate) => candidate.name === name);
+    if (widget && widget.value !== value) {
+      widget.value = value;
+      widget.callback?.(value);
+    }
+  }
+  return named;
+}
+
+function normalizeMegapixelsInput(node, info) {
+  // 1. name-keyed values beat the positional restore (the shift poison).
+  repairWidgetValuesByName(node, info);
+  const findSlot = (name) =>
+    node.inputs?.findIndex((input) => input.name === name) ?? -1;
+  // Deferred until after onGraphConfigured() finished its input cleanup.
+  setTimeout(() => {
+    try {
+      const graph = node.graph ?? app.graph;
+      if (!graph) return;
+      // 3. orphan megapixels_in sockets are gone; live links move over.
+      const legacySlot = findSlot("megapixels_in");
+      if (legacySlot >= 0) {
+        const link = node.inputs[legacySlot].link != null
+          ? node.getInputLink(legacySlot)
+          : null;
+        node.removeInput(legacySlot);
+        const origin = link && graph.getNodeById(link.origin_id);
+        if (origin) {
+          let target = findSlot("megapixels");
+          if (target < 0) {
+            node.addInput("megapixels", "FLOAT");
+            target = findSlot("megapixels");
+          }
+          if (target >= 0 && node.inputs[target].link == null) {
+            origin.connect(link.origin_slot, node, target);
+          }
+        }
+      }
+      let slot = findSlot("megapixels");
+      if (slot < 0) {
+        node.addInput("megapixels", "FLOAT");
+        slot = findSlot("megapixels");
+      }
+      // 2. the declared input format is FLOAT - correct any stale slot type
+      //    (the "Boolean" ghost this parameter has shown in the UI).
+      const megapixels = node.inputs?.find(
+        (input) => input.name === "megapixels",
+      );
+      if (megapixels && megapixels.type !== "FLOAT") megapixels.type = "FLOAT";
+    } catch (error) {
+      console.warn("[Enndee] megapixels input cleanup failed:", error);
+    }
+  }, 0);
+}
+
 app.registerExtension({
   name: "EnndeeImageLoader.ResizeVisibility",
 
@@ -185,10 +274,13 @@ app.registerExtension({
         return result;
       };
 
-      // Refresh after loading a saved workflow or pasting the node.
+      // Refresh after loading a saved workflow or pasting the node; also
+      // repair the widget values by name and keep the megapixels slot clean
+      // (FLOAT format, legacy megapixels_in sockets removed, links rewired).
       const onConfigure = this.onConfigure;
       this.onConfigure = function () {
         const result = onConfigure?.apply(this, arguments);
+        normalizeMegapixelsInput(this, arguments[0]);
         setTimeout(refresh, 0);
         return result;
       };

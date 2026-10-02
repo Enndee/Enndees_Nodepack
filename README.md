@@ -678,7 +678,7 @@ socket (the source size with `resize` off). `keep_proportion` pads with
 | `background_color` | STRING | `#000000` | fill color for the `keep_proportion` padding |
 | `multiplier` | FLOAT | 1.0 | `scale by multiplier` factor |
 | `longer_size` / `shorter_size` | INT | 512 | `scale longer/shorter dimension` targets |
-| `megapixels` | FLOAT | 1.0 | `scale total pixels` target (1.0 ~ 1024x1024) |
+| `megapixels` | FLOAT | 1.0 | `scale total pixels` target (1.0 ~ 1024x1024). Slider with a FLOAT input slot - drop a primitive float signal onto the parameter to drive it (the slot's input format is FLOAT) |
 | `multiple` | INT | 8 | `scale to multiple` step (cover-resize + center crop) |
 | `scale_method` | COMBO | `lanczos` | `nearest-exact`, `bilinear`, `area`, `bicubic`, `lanczos` |
 | `no_upscale` | BOOLEAN | false | never enlarge: larger targets keep the source size (padding still fills the canvas) |
@@ -688,7 +688,6 @@ socket (the source size with `resize` off). `keep_proportion` pads with
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `match` | IMAGE | reference image for the `match size` resize type |
-| `megapixels_in` | FLOAT | `forceInput` socket: when a float link is connected, this value replaces the `megapixels` widget for `scale total pixels` (clamped to 0.01 - 16.0) |
 
 ### Outputs
 
@@ -699,6 +698,7 @@ socket (the source size with `resize` off). `keep_proportion` pads with
 | `mask` | MASK | mask from `mask_channel`, resized with the image |
 | `width` / `height` | INT | final image size |
 | `image_path` | STRING | resolved path of the loaded file |
+| `megapixels` | FLOAT | echo of the effective `megapixels` value (socket → legacy `megapixels_in` → default 1.0, clamped 0.01 - 16.0) - chain it into other nodes |
 
 Animated images (WebP/GIF) load every same-size frame; `IS_CHANGED` hashes the
 file so edits re-trigger the graph.
