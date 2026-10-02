@@ -662,6 +662,19 @@ def render_depth_aligned(first, device, model_size="Depth-Anything-V2-Small-hf",
     depth_map = (DEPTH_NEAR + (DEPTH_FAR - DEPTH_NEAR)
                  * (depth_cloud - d_lo) / span).clamp(min=0.05)
 
+    def mapped_depth(raw):
+        """A raw model depth expressed in the *cloud's* gauge - the same map the cloud is built with.
+
+        The camera keys arrive in "median-depth units" (the Camera Path Configurator's and the
+        automatic estimator's contract: 1.0 = the cloud's median depth), so the scale that turns
+        them into world units must be the median of the *mapped* depth the rendered cloud uses.
+        Using the raw model median instead left the whole camera rig ~2.3x too close to the
+        origin: the orbit centre then sat well *in front of* the subject and the subject swung out
+        of the picture along the path (measured: pivot z 0.47 world vs the subject at 0.94-1.20).
+        """
+        return float(DEPTH_NEAR + (DEPTH_FAR - DEPTH_NEAR)
+                     * (float(raw) - float(d_lo)) / float(span))
+
     # --- pivot: median depth in the +-5 % window of the picked point, on the model's own grid ----
     # Depth-Anything-3 returns an aspect-preserving grid (the longest side is `process_res`), so
     # crop fractions map onto its own width/height instead of a single square side.
@@ -690,9 +703,10 @@ def render_depth_aligned(first, device, model_size="Depth-Anything-V2-Small-hf",
 
     pivot_frac, pivot_depth = picked_point(settings.get("pivot"), "--pivot")
     if pivot_depth is not None:
-        zm = pivot_depth
+        zm_raw = pivot_depth
     else:
-        zm = float(depth_low[keep_low].median()) if keep_low.any() else float(depth_low.median())
+        zm_raw = float(depth_low[keep_low].median()) if keep_low.any() else float(depth_low.median())
+    zm = mapped_depth(zm_raw)     # the gauge the cloud lives in; `zm_raw` is kept for the log
     piv = torch.tensor([0.0, 0.0, zm], device=device)
     if bool(settings.get("pivot_lock")) and pivot_frac is not None:  # orbit about the picked pixel
         fx, fy = pivot_frac
@@ -702,8 +716,9 @@ def render_depth_aligned(first, device, model_size="Depth-Anything-V2-Small-hf",
     aim_frac, aim_depth = picked_point(settings.get("pivot_to"), "--pivot-to")
     if aim_frac is not None and aim_depth is not None:   # --pivot-to: the aim target slides to it
         fx, fy = aim_frac
-        pivot_to = torch.tensor([(fx * cloud_w - cxc) / f_cloud * aim_depth,
-                                 (fy * cloud_h - cyc) / f_cloud * aim_depth, aim_depth], device=device)
+        aim_z = mapped_depth(aim_depth)
+        pivot_to = torch.tensor([(fx * cloud_w - cxc) / f_cloud * aim_z,
+                                 (fy * cloud_h - cyc) / f_cloud * aim_z, aim_z], device=device)
 
     # --- cloud: frame + depth unprojected in frame-0 camera coordinates (the source c2w is I) ----
     yy, xx = torch.meshgrid(torch.arange(cloud_h, device=device, dtype=torch.float32),
@@ -783,6 +798,7 @@ def render_depth_aligned(first, device, model_size="Depth-Anything-V2-Small-hf",
     source = source.repeat(num_frames, 1, 1, 1).clamp(0.0, 1.0).cpu()
     culled = ", back-face culled" if normals is not None else ""
     print(f"[Enndee] Meridian fast depth: {pts.shape[0]} points -> {out_w}x{out_h}, {num_frames} frames "
-          f"(zm {zm:.3f}, cloud {cloud_w}x{cloud_h}, depth {low_w}x{low_h}, {model_size}{culled})", flush=True)
+          f"(zm {zm:.3f} [raw {zm_raw:.3f}], cloud {cloud_w}x{cloud_h}, depth {low_w}x{low_h}, "
+          f"{model_size}{culled})", flush=True)
     return source, render, out_w, out_h, num_frames
 

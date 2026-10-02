@@ -16,6 +16,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -328,8 +329,10 @@ class MeridianFastDepthEngineTests(unittest.TestCase):
             source, render, width, height, length = self._generate(
                 model=step, camera=_camera("--pivot", "0.25,0.5"))
         text = buffer.getvalue()
-        self.assertIn("zm 0.2", text)      # 1/4.0 ~= 0.25: the near half is the pivot depth
-        self.assertNotIn("zm 4", text)     # a raw (uninverted) disparity would report 4.000
+        # `raw` is the model's own gauge - it says *which* depth the +-5 % window picked - while
+        # `zm` is that value re-gauged into the cloud's DEPTH_NEAR..DEPTH_FAR window.
+        self.assertIn("raw 0.250", text)   # 1/4.0 = 0.25: the near half is the pivot depth
+        self.assertNotIn("raw 4", text)    # a raw (uninverted) disparity would report 4.000
         self.assertEqual(length, 73)
 
     def test_back_face_cull_empties_a_flat_plane_viewed_from_behind(self):
@@ -362,8 +365,8 @@ class MeridianFastDepthEngineTests(unittest.TestCase):
                 model_size="Depth-Anything-3-Small", da3_depth=da3_depth,
                 camera=_camera("--pivot", "0.25,0.5"))
         text = buffer.getvalue()
-        self.assertIn("zm 0.250", text)     # the near half is the pivot depth, unconverted
-        self.assertNotIn("zm 4", text)      # an inversion would report 4.000
+        self.assertIn("raw 0.250", text)    # the near half is the pivot depth, unconverted
+        self.assertNotIn("raw 4", text)     # an inversion would report 4.000
         self.assertEqual((width, height, length), (112, 64, 73))
         self.assertEqual(tuple(source.shape), (73, 64, 112, 3))
         self.assertEqual(tuple(render.shape), (73, 64, 112, 3))
@@ -371,15 +374,33 @@ class MeridianFastDepthEngineTests(unittest.TestCase):
     def test_da3_pivot_window_maps_onto_the_grid_height(self):
         # A 7x21 grid whose value is the row index + 1. The +-5 % window around fy=0.75 covers
         # rows 4..5; torch.median takes the lower middle value, so the raw pivot depth prints as
-        # 5.000. A square-grid mapping (the old `res = shape[-1]`) would read rows past the end,
-        # fall back to the global median and print 4.000 instead. The 3x3 edge rule is off
-        # because a 2-step row jump exceeds EDGE_RTOL and would cull every non-last row.
+        # `raw 5.000`. A square-grid mapping (the old `res = shape[-1]`) would read rows past the
+        # end, fall back to the global median and print `raw 4.000` instead. The 3x3 edge rule is
+        # off because a 2-step row jump exceeds EDGE_RTOL and would cull every non-last row.
         rows = torch.arange(1.0, 8.0).view(7, 1).expand(7, 21).contiguous()
         buffer = io.StringIO()
         with contextlib.redirect_stdout(buffer):
             self._generate(model_size="Depth-Anything-3-Small", da3_depth=rows, edge_cull=False,
                            camera=_camera("--pivot", "0.5,0.75"))
-        self.assertIn("zm 5.000", buffer.getvalue())
+        self.assertIn("raw 5.000", buffer.getvalue())
+
+    def test_zm_is_the_cloud_gauge_not_the_raw_model_depth(self):
+        # The camera keys arrive in "median-depth units" (1.0 = the cloud's median depth), so the
+        # scale that turns them into world coordinates has to be the median of the *rendered*
+        # cloud - the DEPTH_NEAR..DEPTH_FAR map - and not the raw model depth. Scaling by the raw
+        # median left the whole rig ~2x too close to the origin: the orbit centre then sat in
+        # front of the subject and the subject swung out of the picture along the path.
+        columns = torch.linspace(0.0, 1.0, 21).view(1, 21).expand(7, 21)
+        da3_depth = torch.where(columns < 0.5, torch.tensor(0.25), torch.tensor(4.0))
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            self._generate(model_size="Depth-Anything-3-Small", da3_depth=da3_depth)
+        match = re.search(r"zm ([0-9.]+) \[raw ([0-9.]+)\]", buffer.getvalue())
+        self.assertIsNotNone(match, buffer.getvalue())
+        zm, raw = (float(value) for value in match.groups())
+        self.assertNotEqual(zm, raw)                                  # the two gauges differ
+        self.assertGreaterEqual(zm, fast_depth.DEPTH_NEAR - 1e-6)     # cloud gauge, not raw
+        self.assertLessEqual(zm, fast_depth.DEPTH_FAR + 1e-6)
 
     def test_da3_depth_resolution_reaches_the_model_with_the_stills_own_side(self):
         # render_depth_aligned forwards `depth_res` as the exact DA3 `process_res`, except for 0,
