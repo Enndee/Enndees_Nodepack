@@ -228,22 +228,45 @@ ORBIT_DIRECTION_DEFAULT = ORBIT_DIRECTIONS[0]
 # the winding alone decides *where* in the picture's plane the last frame looks from: with the
 # default 840 deg it is `cos(840 deg) = -0.5`, i.e. a side view 30 deg BELOW the pivot; 810 deg
 # would end level on the side (`cos 810 deg = 0`). The console/summary reports the end pose so the
-# number can be dialled in. The frames themselves follow the *measured* subject motion
-# (`_spiral_motion_samples`) instead of the linear parameter, which is what keeps the per-frame
-# picture motion as even as the path allows: the coil's steep passes over/under the subject turn the
-# picture several times faster than a step at 3/9 o'clock.
+# number can be dialled in. The frames themselves are spaced evenly ALONG the spiral (a constant
+# camera speed, see `_spiral_samples`) - that is what keeps the path itself steady in every view -
+# and only give way where the picture would move faster than the speed cap allows.
 SPIRAL_END_ARC = 90.0             # deg, where the arc ends - the picture's own plane (side view)
 SPIRAL_END_DEFAULT = 840.0        # deg, the winding around the view axis (2 1/3 rounds)
 SPIRAL_END_MIN = 0.0              # deg, no winding: a plain meridian arc from front to side
 SPIRAL_END_MAX = 3600.0           # deg, ten rounds - beyond that it is a splat set, not a clip
 SPIRAL_ELEVATION_CEILING = 88.0   # deg: the coil passes over the top - keep the up vector sane
-# The coil's frames follow the *measured* subject motion instead of a linear clock (see
-# `_spiral_motion_samples`): passing over (or under) the subject turns the picture several times
-# faster than a step at 3/9 o'clock, so a linear clock spends the whole speed budget on a handful of
-# steep frames.
-SPIRAL_MOTION_SAMPLES = 6         # dense coil samples per frame for that motion measurement
+# The spiral's CENTRAL AXIS may be tilted (the node's "Spiral Center Slope" widget, which is the
+# Auto Orbit Angle in Spiral mode): 0 = horizontal (the view axis itself, so the first frame is the
+# framed frontal view), +90 = vertical pointing up ("from straight above": the first frame is
+# straight above the subject and the arc then runs down to a level orbit), -90 = "from straight
+# below". The tilt is applied in the vertical plane through the view axis, so the pivot, the
+# distance and the aim are untouched - only the *axis* the spiral winds around moves.
+SPIRAL_SLOPE_DEFAULT = 0.0        # deg, the built-in horizontal axis (the view axis)
+SPIRAL_SLOPE_MIN = -90.0          # deg, the axis points straight down
+SPIRAL_SLOPE_MAX = 90.0           # deg, the axis points straight up
+# The coil's frames are spaced evenly ALONG the spiral - a constant camera speed - and only give way
+# where the picture would move faster than the speed cap allows (see `_spiral_samples`). The older
+# split chased the *subject's* pixel motion instead, which raced the camera around the axis near the
+# pole (a roll is cheap in pixels) and crawled where the picture was sensitive: measured on the
+# 175 frame x 720 deg example, the per-frame camera travel swung 0.64 .. 11.06 deg (17x) and the
+# first frames jumped 91 deg of clock each, so the path read as a jagged polygon. Even arc length
+# puts the travel within 1.6x of constant and keeps every view steady - the frontal projection of a
+# spiral with a wide winding *is* its arc length.
+SPIRAL_MOTION_SAMPLES = 6         # dense coil samples per frame for that spacing
 SPIRAL_MOTION_DENSE_MIN = 240     # ... and never fewer than this many
-SPIRAL_MOTION_POOL = 240          # subject points used for it (relative weights only - cheap)
+SPIRAL_MOTION_POOL = 240          # subject points used for the speed cap (relative weights - cheap)
+SPIRAL_SPEED_BISECTIONS = 40      # steps of the constant-speed solve against the pixel cap
+SPIRAL_CAP_MARGIN = 0.05          # of the cap: headroom for the dense-step drift measurement
+SPIRAL_SPEED_ROUNDS = 3           # drift calibration rounds against the pool the console reports
+# The keys the renderer splines through are *not* an even frame list for the spiral: it turns
+# fastest right after the pole (the clock races while the camera opens the coil - ~130 deg of
+# heading change over the first ten frames on the 175 frame example), and an even list cuts that
+# corner. Measured on that example (17 evenly spaced keys): the renderer's spline missed the
+# intended path by 16 % of the orbit radius at frame 4 and its per-frame travel swung 3.1x. A key
+# per SPIRAL_KEY_TURN degrees of *turning* instead keeps the keys where the path bends (dense after
+# the pole, sparse on the long outer sweep): 35 keys, a 1.1 % gap and a 1.07x travel spread.
+SPIRAL_KEY_TURN = 20.0            # deg of camera turning one spiral key span may cover
 
 # The node's "Spiral End" widget travels the same way as the O Orbit Angle: one module global, set
 # and restored around the estimate by `estimate_camera_path`.
@@ -264,6 +287,27 @@ def resolve_spiral_end(degrees=None):
     if degrees is None:
         return SPIRAL_END_DEFAULT
     return max(SPIRAL_END_MIN, min(SPIRAL_END_MAX, _finite(degrees, "Spiral end")))
+
+
+# The spiral's central axis tilt travels exactly like the winding: the node's "Spiral Center Slope"
+# widget (the Auto Orbit Angle in Spiral mode) sets it for one estimate.
+_ACTIVE_SPIRAL_SLOPE = SPIRAL_SLOPE_DEFAULT
+
+
+def spiral_slope():
+    """The spiral's central axis tilt (deg) in effect for the estimate being built."""
+    return _ACTIVE_SPIRAL_SLOPE
+
+
+def resolve_spiral_slope(degrees=None):
+    """Clamp a Spiral Center Slope widget value; None keeps the built-in horizontal axis (0 deg).
+
+    0 is the view axis itself (the spiral starts on the framed frontal view), +90 the vertical axis
+    ("from straight above": the spiral opens straight above the subject), -90 the one below it.
+    """
+    if degrees is None:
+        return SPIRAL_SLOPE_DEFAULT
+    return max(SPIRAL_SLOPE_MIN, min(SPIRAL_SLOPE_MAX, _finite(degrees, "Spiral slope")))
 
 # Scene target: a lateral survey instead of a lap around the scene. Meridian's scene renders are
 # depth reprojections, so what a walk-in VR viewer needs is *side* coverage: rows of viewpoints
@@ -1398,33 +1442,68 @@ def _back_orbit_point(progress, centre, amplitude, mirror):
     return centre + mirror * amplitude * math.cos(angle), amplitude * math.sin(angle)
 
 
-def spiral_pose(phi_degrees, psi_degrees):
+def _spiral_offset(yaw_degrees, elevation_degrees):
+    """The unit camera offset `_place` builds from a (yaw, elevation) pair (x right, -y up, -z out).
+
+    The source camera sits on the -z side of the pivot looking at it, so this is the pose's place on
+    the unit sphere around the pivot, in the same convention the rest of the module uses.
+    """
+    yaw = math.radians(float(yaw_degrees))
+    elevation = math.radians(float(elevation_degrees))
+    return (math.cos(elevation) * math.sin(yaw),
+            -math.sin(elevation),
+            -math.cos(elevation) * math.cos(yaw))
+
+
+def _spiral_tilt(offset, slope_degrees):
+    """Lean an offset in the vertical plane through the view axis by the spiral's axis slope.
+
+    The world's x (the subject's right) is the hinge, so the view axis itself stays the reference:
+    slope 0 leaves the offset alone, +90 lifts the axis straight up (and -90 pushes it down). The
+    transform is a rotation, so lengths, the pivot and the aim are untouched - and `_spiral_tilt`
+    with the opposite slope undoes it.
+    """
+    slope = math.radians(float(slope_degrees))
+    if abs(slope) <= 1e-12:
+        return offset
+    cos_s, sin_s = math.cos(slope), math.sin(slope)
+    x, y, z = offset
+    return (x, y * cos_s + z * sin_s, -y * sin_s + z * cos_s)
+
+
+def spiral_pose(phi_degrees, psi_degrees, slope_degrees=0.0):
     """(yaw, elevation) of the point whose arc from the view axis is `phi` at clock `psi`.
 
     `phi` 0 = the camera ON the view axis (the frontal view, the middle of the picture), 90 = the
     picture's own plane; `psi` is the clock angle around that axis (12 = up, 3 = the subject's
-    right, 6 = down, 9 = left). The camera keeps its distance and always aims at the pivot, so the
-    subject keeps its place in the frame.
+    right, 6 = down, 9 = left). `slope_degrees` leans that axis in the vertical plane through the
+    view axis - 0 keeps the view axis itself, +90 stands the spiral on the vertical axis ("from
+    straight above": `phi` = 0 opens straight above the subject), -90 hangs it below. The camera
+    keeps its distance and always aims at the pivot, so the subject keeps its place in the frame.
     """
     phi = math.radians(float(phi_degrees))
     psi = math.radians(float(psi_degrees))
-    horizontal = math.sin(phi) * math.sin(psi)      # the picture's horizontal (y in the sketch)
-    vertical = math.sin(phi) * math.cos(psi)        # the picture's vertical (z, up)
-    elevation = math.degrees(math.asin(max(-1.0, min(1.0, vertical))))
-    return math.degrees(math.atan2(horizontal, math.cos(phi))), elevation
+    # the offset in the axis' own frame, i.e. the pose `_place` builds from (yaw, elevation)
+    offset = (math.sin(phi) * math.sin(psi),
+              -math.sin(phi) * math.cos(psi),
+              -math.cos(phi))
+    offset = _spiral_tilt(offset, slope_degrees)
+    return (math.degrees(math.atan2(offset[0], -offset[2])),
+            math.degrees(math.asin(max(-1.0, min(1.0, -offset[1])))))
 
 
-def spiral_arc(yaw_degrees, elevation_degrees):
-    """The arc between a (yaw, elevation) pose and the view axis, in degrees (inverse of above)."""
-    return math.degrees(math.acos(max(-1.0, min(1.0,
-        math.cos(math.radians(elevation_degrees)) * math.cos(math.radians(yaw_degrees))))))
+def spiral_arc(yaw_degrees, elevation_degrees, slope_degrees=0.0):
+    """The arc between a (yaw, elevation) pose and the (tilted) spiral axis, in degrees."""
+    offset = _spiral_tilt(_spiral_offset(yaw_degrees, elevation_degrees), -slope_degrees)
+    return math.degrees(math.acos(max(-1.0, min(1.0, -offset[2]))))
 
 
-def spiral_clock(yaw_degrees, elevation_degrees):
-    """The clock angle of a (yaw, elevation) pose around the view axis (12 = up, 3 = right)."""
-    elevation = math.radians(elevation_degrees)
-    yaw = math.radians(yaw_degrees)
-    return math.degrees(math.atan2(math.cos(elevation) * math.sin(yaw), math.sin(elevation)))
+def spiral_clock(yaw_degrees, elevation_degrees, slope_degrees=0.0):
+    """The clock angle of a (yaw, elevation) pose around the (tilted) axis (12 = up, 3 = right)."""
+    offset = _spiral_tilt(_spiral_offset(yaw_degrees, elevation_degrees), -slope_degrees)
+    if math.hypot(offset[0], offset[1]) <= 1e-9:
+        return 0.0                     # the axis itself: the clock angle is undefined, so it reads 0
+    return math.degrees(math.atan2(offset[0], -offset[1]))
 
 
 def _spiral_sweep():
@@ -1432,99 +1511,224 @@ def _spiral_sweep():
     return float(_ACTIVE_SPIRAL_END)
 
 
-def _spiral_geometry(centre, mirror):
+def _spiral_geometry(centre, mirror, slope=None):
     """(axis_yaw, end_yaw, sweep, end_arc) of the Spiral coverage.
 
     The path starts ON the sphere's axis (the framed frontal view, `phi` = 0) and unwinds
     `_spiral_sweep()` degrees around it (`psi`, the winding the node's Spiral End widget asks for)
-    while the arc climbs to `SPIRAL_END_ARC` - the picture's own plane, the side view.
+    while the arc climbs to `SPIRAL_END_ARC` - the picture's own plane, the side view. `slope` is
+    the axis' own lean (`_spiral_slope`): 0 keeps the view axis, +90 stands it up.
     """
-    end_yaw, _end_elevation = _spiral_point(1.0, centre, mirror)
+    end_yaw, _end_elevation = _spiral_point(1.0, centre, mirror, slope)
     return float(centre), end_yaw, _spiral_sweep(), SPIRAL_END_ARC
 
 
-def _spiral_point(progress, centre, mirror=1.0):
+def _spiral_point(progress, centre, mirror=1.0, slope=None):
     """(yaw, elevation) at `progress` 0..1 along the spiral: frontal view -> side view.
 
     The camera travels on a sphere whose centre is the pivot (constant distance, always aiming at
-    it, so the subject keeps its place in the frame). `phi` - the arc between the camera and the view
-    axis - runs linearly 0 -> `SPIRAL_END_ARC`, so the FIRST frame sits ON that axis (the middle of
-    the picture, looking straight at it) and the LAST one is in the picture's own plane, the side
-    view. `psi` - the clock angle around that axis - runs linearly 0 -> the *Spiral End* parameter
-    (`_spiral_sweep`, default `SPIRAL_END_DEFAULT` = 840 deg), and that winding is the only thing
-    deciding where in the plane the last frame looks from. `mirror` flips the winding (the Auto
-    Orbit Direction widget) and `centre` is the azimuth of the sphere's axis (the Auto Orbit View
-    Angle: a yaw rotation, so the arc from the axis is unchanged). The *frames* are placed by
-    `_spiral_motion_samples` (same path, even subject motion), not by `progress` alone.
+    it, so the subject keeps its place in the frame). `phi` - the arc between the camera and the
+    spiral's axis - runs linearly 0 -> `SPIRAL_END_ARC`, so the FIRST frame sits ON that axis (the
+    middle of the picture, looking straight at it) and the LAST one is in the picture's own plane,
+    the side view. `psi` - the clock angle around that axis - runs linearly 0 -> the *Spiral End*
+    parameter (`_spiral_sweep`, default `SPIRAL_END_DEFAULT` = 840 deg), and that winding is the
+    only thing deciding where in the plane the last frame looks from. `mirror` flips the winding
+    (the Auto Orbit Direction widget), `centre` is the azimuth of the axis (the Auto Orbit View
+    Angle: a yaw rotation, so the arc from the axis is unchanged) and `slope` leans the axis itself
+    (`_spiral_slope`, the Spiral Center Slope widget: 0 = the view axis, +90 = straight above). The
+    *frames* are spaced along this path by `_spiral_samples`, not by `progress` alone.
     """
     progress = min(1.0, max(0.0, float(progress)))
     wind = -1.0 if mirror >= 0.0 else 1.0          # counter-clockwise = the clock angle falls
     phi = SPIRAL_END_ARC * progress
     psi = wind * _spiral_sweep() * progress
-    yaw, elevation = spiral_pose(phi, psi)
+    yaw, elevation = spiral_pose(phi, psi, spiral_slope() if slope is None else slope)
     # the coil passes over the top on its way round; keep the up vector well defined there
     return (yaw + centre,
             max(-SPIRAL_ELEVATION_CEILING, min(SPIRAL_ELEVATION_CEILING, elevation)))
 
 
 def _spiral_info(view_angle=None, direction=ORBIT_DIRECTION_DEFAULT):
-    """The `info` fields the Spiral coverage reports: winding, end arc and the end pose itself."""
+    """The `info` fields the Spiral coverage reports: winding, slope, end arc and the end pose."""
     centre = ORBIT_VIEW_ANGLE_DEFAULT if view_angle is None else float(view_angle)
     mirror = direction_mirror(direction)
+    slope = spiral_slope()
     _axis_yaw, end_yaw, sweep, end_arc = _spiral_geometry(centre, mirror)
     end_elevation = _spiral_point(1.0, centre, mirror)[1]
     return {"front_yaw": 0.0, "orbit_end": sweep, "front_share": 1.0,
             "back_span": 0.0, "back_orbit": False,
             "spiral_end": sweep, "spiral_end_arc": end_arc,
             "spiral_end_elevation": end_elevation,
-            "spiral_end_clock": spiral_clock(end_yaw - centre, end_elevation) % 360.0,
+            "spiral_slope": slope,
+            "spiral_end_clock": spiral_clock(end_yaw - centre, end_elevation, slope) % 360.0,
             "orbit_coverage": min(FULL_CIRCLE, sweep),
             "view_angle": None if view_angle is None else float(view_angle)}
 
 
-def _spiral_motion_samples(frames, pivot, radius, centre, mirror, pool, surface):
-    """The spiral's per-frame positions, spaced by the *subject's own pixel motion*.
+def _spiral_speed(arc, drift, cap_px, frames):
+    """The constant camera speed (world units per frame) whose drift never exceeds `cap_px`.
 
-    Same path, same ends - the first frame on the view axis (the framed frontal pose), the last one
-    at the end of the spiral - only the frame *timing* along it changes: the coil passes over (or
-    under) the subject, and there a small step turns the picture several times faster than a step at
-    3/9 o'clock, so a linear parameter would spend the whole speed budget on a handful of steep
-    frames. This measures the subject's motion along a dense sampling of the path, accumulates it and
-    places the frames at equal motion instead.
+    The frames cover the whole path in `frames - 1` steps of equal cost, so the speed is the one
+    that makes `sum(max(step / speed, pixels / cap))` come out at exactly `frames - 1`: the camera
+    flies at a *constant* speed and only gives way where the picture is more sensitive than that.
+    The cap is an upper bound, never a target - chasing it is what used to race the camera around
+    the axis near the pole. A cap too tight to pay for the path at any speed leaves the sum above
+    the target at the speed ceiling; that is the drift-even split the older sampler used, and the
+    console names the overshoot.
+    """
+    target = max(1, frames - 1)
+    ceiling = 1e12
 
-    Falls back to the linear parameter when there is no surface to measure (or no visible motion).
+    def cost(speed):
+        return sum(max(step / speed, pixels / cap_px) for step, pixels in zip(arc, drift))
+
+    if cost(ceiling) >= target:                  # the cap binds on every step: nothing to solve
+        return ceiling
+    # `cost` falls as the speed rises: at the geometric speed the arc terms alone sum to the target,
+    # and every step whose drift/cap is larger is a step the cap has to slow down. Bracket the
+    # solution between that geometric floor and the first speed at which the cap stops binding.
+    low = sum(arc) / target
+    high = low
+    while high < ceiling and cost(high) > target:
+        high = min(ceiling, high * 2.0)
+    for _ in range(SPIRAL_SPEED_BISECTIONS):
+        middle = 0.5 * (low + high)
+        if cost(middle) > target:
+            low = middle
+        else:
+            high = middle
+    return 0.5 * (low + high)
+
+
+def _spiral_samples(frames, pivot, radius, centre, mirror, slope=None, pool=None, surface=None,
+                    cap_px=None):
+    """The spiral's per-frame positions: spaced evenly ALONG the path, never over the speed cap.
+
+    The frames are placed by the camera's own travel - a *constant speed* along the spiral - and not
+    by the subject's pixel motion, because that is what makes the path itself steady: a spiral's
+    frontal projection is essentially its arc length, so even steps here are even spacing in every
+    view (and the emitted keys are evenly spread for the renderer's spline as well). The older
+    drift-even split instead raced the camera around the axis near the pole - a roll is cheap in
+    pixels - and crawled where the picture was sensitive: measured on the 175 frame x 720 deg
+    example, the per-frame camera travel swung 0.64 .. 11.06 deg (17x) and the opening frames jumped
+    ~91 deg of clock each, so the path read as a jagged polygon until the keys got dense.
+
+    The speed cap still has the last word, in the honest direction: the constant speed is solved
+    (`_spiral_speed`) so that no step's measured subject drift exceeds `cap_px`, i.e. the path runs a
+    little slower where the picture is sensitive, never faster than the geometry allows. Without a
+    surface or a cap the geometric constant speed is used. Both ends stay pinned to the path's ends.
     """
     def linear():
         return [_place(pivot, radius,
-                       *_spiral_point(index / max(1, frames - 1), centre, mirror))
+                       *_spiral_point(index / max(1, frames - 1), centre, mirror, slope))
                 for index in range(frames)]
 
     if frames < 2:
         return linear()
     dense = max(SPIRAL_MOTION_DENSE_MIN, frames * SPIRAL_MOTION_SAMPLES)
-    coil = [_place(pivot, radius, *_spiral_point(index / dense, centre, mirror))
+    coil = [_place(pivot, radius, *_spiral_point(index / dense, centre, mirror, slope))
             for index in range(dense + 1)]
-    p95, _p50, counts = _pair_motion(_decimate(pool, SPIRAL_MOTION_POOL), coil, pivot, surface, None)
-    if p95 is None:
+    arc = [math.dist(coil[index - 1], coil[index]) for index in range(1, dense + 1)]
+    total = sum(arc)
+    if total <= 1e-12:
         return linear()
-    motion = torch.where(counts >= 8, p95, p95.new_full((), 0.0)).to(torch.float64)
-    # The cumulative-motion bookkeeping is a few thousand numbers, so it runs on the *CPU*: the
-    # pool - and with it `p95`/`counts` - lives on the GPU whenever the depth map came from a CUDA
-    # model, while `torch.linspace` always builds on the CPU. Mixing them is a hard RuntimeError in
-    # `torch.searchsorted` ("got self is on cpu, different from other tensors on cuda:0" - `self` is
-    # ATen's name for the *values* argument, i.e. the CPU `targets`).
-    cumulative = torch.cumsum(motion.detach().cpu(), dim=0)
-    total = float(cumulative[-1])
-    if total <= 1e-9:
+
+    def place(cost):
+        """The frames at equal cost along the dense coil (interpolated, so the spacing is smooth).
+
+        The bookkeeping is a few thousand numbers, so it runs on the *CPU*: the pool - and with it
+        `p95`/`counts` - lives on the GPU whenever the depth map came from a CUDA model, while
+        `torch.linspace` always builds on the CPU. Mixing them is a hard RuntimeError in
+        `torch.searchsorted` ("got self is on cpu, different from other tensors on cuda:0" - `self`
+        is ATen's name for the *values* argument, i.e. the CPU `targets`).
+        """
+        cumulative = torch.cumsum(torch.tensor(cost, dtype=torch.float64), dim=0)
+        total_cost = float(cumulative[-1])
+        if total_cost <= 1e-12:
+            return None
+        targets = torch.linspace(0.0, total_cost, frames, dtype=cumulative.dtype)
+        # `right=True`: the index is the *number of steps* whose cumulative cost the target has
+        # passed, so the last target (== the total) lands on the last step, not one short of it. The
+        # step's own fraction is interpolated, so the spacing is smooth instead of snapped to the
+        # dense grid.
+        index = torch.searchsorted(cumulative, targets, right=True).clamp(max=dense - 1)
+        lower = cumulative.gather(0, (index - 1).clamp(min=0))
+        span = (cumulative.gather(0, index) - lower).clamp(min=1e-12)
+        fraction = ((targets - lower) / span).clamp(0.0, 1.0)
+        ticks = (index.to(torch.float64) + fraction) / dense
+        return [_place(pivot, radius, *_spiral_point(float(tick), centre, mirror, slope))
+                for tick in ticks]
+
+    # The constant-speed baseline: one even arc step per frame. The speed cap then stretches the
+    # steps where the picture would move faster than it allows - `cost` is the path's own clock, so
+    # equal-cost placement *is* a constant camera speed within the budget.
+    speed = total / max(1, frames - 1)
+    cost = [step / speed for step in arc]
+    if pool is not None and surface is not None and cap_px and float(cap_px) > 0.0:
+        cap = float(cap_px)
+        p95, _p50, counts = _pair_motion(_decimate(pool, SPIRAL_MOTION_POOL), coil, pivot, surface,
+                                         None)
+        if p95 is not None:
+            limit = cap * (1.0 - SPIRAL_CAP_MARGIN)
+            drift = [0.0 if int(count) < 8 else max(0.0, float(value))
+                     for value, count in zip(p95, counts)]
+            speed = _spiral_speed(arc, drift, limit, frames)
+            cost = [max(step / speed, pixels / limit) for step, pixels in zip(arc, drift)]
+            # The dense steps measure the drift a fraction of a frame at a time, while the frames
+            # spend it over their own spans - and the p95 of a *sum* of steps can sit above the sum
+            # of the per-step p95s. So the placed frames are checked with the very pool the console
+            # reports, and the drift profile is scaled to what they really show until they fit.
+            for _ in range(SPIRAL_SPEED_ROUNDS):
+                poses = place(cost)
+                if poses is None:
+                    break
+                measured = subject_drift(pool, poses, pivot, surface)[0]
+                if measured <= limit * 1.02 or measured <= 0.0:
+                    break
+                scale = measured / limit
+                drift = [value * scale for value in drift]
+                speed = _spiral_speed(arc, drift, limit, frames)
+                cost = [max(step / speed, pixels / limit) for step, pixels in zip(arc, drift)]
+    poses = place(cost)
+    if poses is None:
         return linear()
-    targets = torch.linspace(0.0, total, frames + 1, dtype=cumulative.dtype)[1:]
-    # `right=True`: the pose index is the *number of steps* whose cumulative motion the target has
-    # passed - so the last target (== total) lands on the last pose, not one step short of it.
-    indices = torch.searchsorted(cumulative, targets, right=True).clamp(max=dense)
-    poses = [coil[int(index)] for index in indices]
-    poses[0] = coil[0]                  # frame 0 is the view axis itself (phi = 0) ...
+    poses[0] = coil[0]                  # frame 0 is the axis itself (phi = 0) ...
     poses[-1] = coil[dense]             # ... and the last frame is the end of the spiral (phi = 90)
     return poses
+
+
+def _spiral_key_frames(samples, frames, turn=SPIRAL_KEY_TURN):
+    """Frame indices of the spiral's keys: by how far the camera TURNS, not by frame index.
+
+    The Geometry node splines the keys, so a key list that is evenly spaced in *frames* cuts the
+    corner wherever the path turns faster than the spline can follow. The spiral turns fastest
+    right after the pole - the clock races while the camera opens the coil - so this walks the
+    samples and takes a key whenever the camera's heading has moved `turn` degrees since the last
+    one, plus the first and last frame. The keys then follow the path everywhere (a straight-ish
+    stretch simply gets fewer of them) instead of missing it by 16 % of the orbit radius at frame 4.
+    """
+    frames = int(frames)
+    if frames < 3:
+        return list(range(max(1, frames)))
+    headings = []
+    for index in range(1, frames):
+        step = [samples[index][axis] - samples[index - 1][axis] for axis in range(3)]
+        length = math.sqrt(sum(value * value for value in step))
+        headings.append([value / length for value in step] if length > 1e-12 else None)
+    ticks = [0]
+    turned = 0.0
+    for index in range(1, frames - 1):
+        previous, current = headings[index - 1], headings[index]
+        if previous is None or current is None:
+            continue                        # a hold: no heading to measure between the frames
+        cosine = max(-1.0, min(1.0, sum(left * right for left, right in zip(previous, current))))
+        turned += math.degrees(math.acos(cosine))
+        if turned >= turn:
+            ticks.append(index)
+            turned = 0.0
+    if ticks[-1] != frames - 1:
+        ticks.append(frames - 1)
+    return ticks
 
 
 def _legacy_samples(frames, pivot, radius, scale=1.0, size=1.0, orbit_end=None,
@@ -1572,7 +1776,8 @@ def _legacy_samples(frames, pivot, radius, scale=1.0, size=1.0, orbit_end=None,
 
 def subject_samples(frames, pivot, radius, scale=1.0, size=1.0, orbit_end=None,
                     direction=ORBIT_DIRECTION_DEFAULT, share=None, view_angle=None,
-                    coverage=None, back_span=None, motion_pool=None, motion_surface=None):
+                    coverage=None, back_span=None, motion_pool=None, motion_surface=None,
+                    motion_cap=None, spiral_slope=None):
     """Per-frame positions of the subject path: the front O, then (optionally) the back O.
 
     **The front O** is a *circle* (`front_amplitudes`: one radius both ways) centred on the azimuth
@@ -1615,15 +1820,12 @@ def subject_samples(frames, pivot, radius, scale=1.0, size=1.0, orbit_end=None,
         mode = coverage_for_end(orbit_end)
     if mode == SPIRAL_COVERAGE:
         # A spherical spiral: one continuous phase, so every frame is a step along it. The winding
-        # is the node's Spiral End parameter (phi still runs 0 -> 90 over the whole path), and the
-        # frames follow the *measured* subject motion when a surface is at hand
-        # (`_spiral_motion_samples`) - the coil's steep passes over/under the subject would otherwise
-        # eat the speed budget.
-        if motion_pool is not None and motion_surface is not None:
-            return _spiral_motion_samples(frames, pivot, radius, centre, mirror,
-                                          motion_pool, motion_surface)
-        return [_place(pivot, radius, *_spiral_point(index / max(1, frames - 1), centre, mirror))
-                for index in range(frames)]
+        # is the node's Spiral End parameter (phi still runs 0 -> 90 over the whole path) and the
+        # axis' lean is the Spiral Center Slope widget; the frames are spaced evenly ALONG the path
+        # (`_spiral_samples`) - a constant camera speed, which is what keeps the path itself steady -
+        # and only give way where the speed cap says the picture would move too fast.
+        return _spiral_samples(frames, pivot, radius, centre, mirror, slope=spiral_slope,
+                               pool=motion_pool, surface=motion_surface, cap_px=motion_cap)
     back = mode == ORBIT_COVERAGES[1]
     # The level connection ends where the back orbit begins: its near edge, one O radius (half the
     # circle's span) short of the back circle's middle. That is the shortest way to reach the back
@@ -1834,11 +2036,11 @@ def _orbit_candidate(pool, surface, frames, pivot, radius, scale, size, end, dir
         return scale, samples, drift, typical, info
     if str(coverage) == SPIRAL_COVERAGE:
         # Nothing to cut here: the winding is the node's Spiral End parameter, so one sample run and
-        # one drift measurement describe the whole path. The samples are the motion-even ones
-        # (`_spiral_motion_samples`) - they are what the emitted keys come from, so the fit and the
-        # keys must never disagree about where a frame sits.
+        # one drift measurement describe the whole path. The samples are the constant-speed ones
+        # (`_spiral_samples`, spaced along the path and held to `cap_px`) - they are what the emitted
+        # keys come from, so the fit and the keys must never disagree about where a frame sits.
         samples = subject_samples(frames, pivot, radius, scale, size, None, direction,
-                                  motion_pool=pool, motion_surface=surface,
+                                  motion_pool=pool, motion_surface=surface, motion_cap=cap_px,
                                   **path_options(view_angle, coverage))
         drift, typical = subject_drift(pool, samples, pivot, surface)
         return scale, samples, drift, typical, _spiral_info(view_angle, direction)
@@ -2215,7 +2417,8 @@ def automatic_keys(frames, pivot, radius, content_radius, target, max_speed=DEFA
     drift = typical = None
     meta = {}
     if str(target).strip().lower() == SUBJECT_TARGET:
-        style = "front O-orbit + closing orbit"
+        style = ("spherical spiral" if str(coverage) == SPIRAL_COVERAGE
+                 else "front O-orbit + closing orbit")
         fitted = _fit_subject_amplitude(frames, pivot, radius, surface, orbit_size, cap_px,
                                         amplitude_cap, orbit_end, direction, view_angle, coverage)
         if fitted is None:
@@ -2233,12 +2436,17 @@ def automatic_keys(frames, pivot, radius, content_radius, target, max_speed=DEFA
         plan = scene_coverage(surface, radius, content_radius, frames, orbit_size, budget)
         samples_of = lambda scale: scene_samples(frames, pivot, radius, plan, scale)
         scale, samples, travel = _fit_amplitude(samples_of, budget)
+    # The spiral's keys follow its own turning (`_spiral_key_frames`): its fastest heading change is
+    # right after the pole, where an evenly spaced key list would cut the corner the renderer's
+    # spline then follows. Every other path keeps the even frame list.
+    ticks = (_spiral_key_frames(samples, frames) if str(coverage) == SPIRAL_COVERAGE
+             else _key_frames(frames))
     keys = [{
         "pos": [round(value, 6) for value in samples[tick]],
         "look": [round(float(value), 6) for value in pivot],
         "src": int(tick),
         "t": int(tick),
-    } for tick in _key_frames(frames)]
+    } for tick in ticks]
     info = {"style": style, "amplitude_scale": scale, "travel_per_frame": travel,
             "budget_per_frame": budget, "keys": len(keys), "fit": fit_name}
     if drift is not None:
@@ -2271,6 +2479,7 @@ def automatic_keys(frames, pivot, radius, content_radius, target, max_speed=DEFA
                      "front_floor": meta.get("front_floor"),
                      "spiral_end": meta.get("spiral_end"),
                      "spiral_end_arc": meta.get("spiral_end_arc"),
+                     "spiral_slope": meta.get("spiral_slope"),
                      "spiral_end_clock": meta.get("spiral_end_clock"),
                      "spiral_end_elevation": meta.get("spiral_end_elevation"),
                      "orbit_coverage": min(FULL_CIRCLE, meta.get(
@@ -2431,26 +2640,32 @@ def estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DEF
                          device=None, depth_fn=None, pivot_offset=(0.0, 0.0, 0.0),
                          orbit_distance=None, orbit_size=None, subject_fill=None, orbit_end=None,
                          direction=ORBIT_DIRECTION_DEFAULT, view_angle=None, coverage=None,
-                         orbit_amplitude=None, spiral_end=None):
-    """(signal JSON, summary) for one still, with the node's O Orbit Angle and Spiral End applied.
+                         orbit_amplitude=None, spiral_end=None, spiral_slope=None):
+    """(signal JSON, summary) for one still, with the O Orbit Angle and the spiral widgets applied.
 
     `orbit_amplitude` (deg) is the front O's angular radius - the swing AND the rise, because the O
     is one circle. It is the node's "O Orbit Angle" widget: a smaller value keeps the automatic
     subject orbit flatter / less steep (and narrower), a larger one climbs higher and reaches
     further round. `None` keeps the built-in `FRONT_ORBIT_AMPLITUDE`; a value is clamped to
     `FRONT_ORBIT_ANGLE_MIN .. FRONT_ORBIT_LIMIT`. `spiral_end` (deg) is the *Spiral* coverage's
-    winding around the view axis: how many degrees the clock angle travels from the first frame to
-    the last while the arc between the camera and the view axis climbs from 0 to `SPIRAL_END_ARC`
+    winding around the spiral's axis: how many degrees the clock angle travels from the first frame
+    to the last while the arc between the camera and that axis climbs from 0 to `SPIRAL_END_ARC`
     (90 deg - the picture's own plane, so the clip ends with a side view). It is the node's "Spiral
     End" widget; `None` keeps `SPIRAL_END_DEFAULT` (840 deg = two and a third rounds) and 0 flies
-    the plain quarter circle. Everything else is documented on `_estimate_camera_path`, which does
-    the work.
+    the plain quarter circle. `spiral_slope` (deg) is the same widget slot's other meaning in Spiral
+    mode - the node's "Spiral Center Slope": the lean of that axis in the vertical plane through the
+    view axis, 0 = the view axis itself (the first frame is the framed frontal view), +90 = straight
+    up ("from straight above"), -90 = straight down; clamped to `SPIRAL_SLOPE_MIN .. SPIRAL_SLOPE_MAX`
+    and ignored by every other coverage. Everything else is documented on `_estimate_camera_path`,
+    which does the work.
     """
-    global _ACTIVE_FRONT_ORBIT_AMPLITUDE, _ACTIVE_SPIRAL_END
+    global _ACTIVE_FRONT_ORBIT_AMPLITUDE, _ACTIVE_SPIRAL_END, _ACTIVE_SPIRAL_SLOPE
     previous = _ACTIVE_FRONT_ORBIT_AMPLITUDE
     previous_end = _ACTIVE_SPIRAL_END
+    previous_slope = _ACTIVE_SPIRAL_SLOPE
     _ACTIVE_FRONT_ORBIT_AMPLITUDE = resolve_front_orbit_amplitude(orbit_amplitude)
     _ACTIVE_SPIRAL_END = resolve_spiral_end(spiral_end)
+    _ACTIVE_SPIRAL_SLOPE = resolve_spiral_slope(spiral_slope)
     try:
         return _estimate_camera_path(
             reference, frames, target=target, max_speed=max_speed, subject_mask=subject_mask,
@@ -2461,6 +2676,7 @@ def estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DEF
     finally:
         _ACTIVE_FRONT_ORBIT_AMPLITUDE = previous
         _ACTIVE_SPIRAL_END = previous_end
+        _ACTIVE_SPIRAL_SLOPE = previous_slope
 
 
 def _estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DEFAULT_MAX_SPEED,
@@ -2701,13 +2917,20 @@ def _estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DE
         elif info.get("coverage") == SPIRAL_COVERAGE:
             winding = float(info.get("spiral_end") or SPIRAL_END_DEFAULT)
             arc = float(info.get("spiral_end_arc") or SPIRAL_END_ARC)
+            slope = float(info.get("spiral_slope") or 0.0)
+            axis_text = (f"the view axis" if abs(slope) < 0.5
+                         else (f"the spiral's central axis, leaned {slope:.0f} deg out of the view "
+                               f"axis ({'from straight above' if slope > 0 else 'from straight below'}"
+                               f" at 90 deg)"))
             beyond = (f", then a spherical spiral {direction_label(info['orbit_direction'])} around "
-                      f"the view axis: the clock angle winds {winding:.0f} deg "
+                      f"{axis_text}: the clock angle winds {winding:.0f} deg "
                       f"({winding / 360.0:.2f} rounds) while the arc between the camera and that "
                       f"axis climbs to {arc:.0f} deg - the last frame is IN the picture's own "
                       f"plane, looking at the scene from the side (clock "
                       f"{info['spiral_end_clock']:.0f} deg, elevation "
-                      f"{info['spiral_end_elevation']:.0f} deg)")
+                      f"{info['spiral_end_elevation']:.0f} deg). The frames are spaced evenly along "
+                      f"the spiral (one constant camera speed, so the path itself is steady) and "
+                      f"slow down only where the speed cap says the picture would move too fast")
         elif info.get("coverage"):
             beyond = (f", the back visit giving way to the speed cap: the path ends at "
                       f"{info['orbit_end']:.0f} deg of the requested "
@@ -2726,7 +2949,7 @@ def _estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DE
     # `front_yaw` (the scene survey reports rows instead), hence the guard.
     opening = ""
     if info.get("orbit_coverage"):
-        opening = (f"the spherical spiral (+/-{info['spiral_end_arc']:.0f} deg arc out of the view "
+        opening = (f"the spherical spiral (+/-{info['spiral_end_arc']:.0f} deg arc out of the spiral's "
                    f"axis)" if info.get("coverage") == SPIRAL_COVERAGE
                    else f"the front O (+/-{info['front_yaw']:.0f} deg)")
     description = (
@@ -2922,11 +3145,13 @@ def _estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DE
         # None while the deprecated `orbit_end` path is in charge (saved callers).
         "view_angle_deg": info.get("view_angle"), "coverage": info.get("coverage"),
         "back_orbit": info.get("back_orbit"),
-        # Spiral coverage only: the winding the path flies (the node's Spiral End widget) and the
-        # pose the last frame looks from - the arc out of the view axis plus the clock/elevation it
-        # lands on in the picture's own plane.
+        # Spiral coverage only: the winding the path flies (the node's Spiral End widget), the lean
+        # of its central axis (the same widget slot in Spiral mode: the Spiral Center Slope) and the
+        # pose the last frame looks from - the arc out of the axis plus the clock/elevation it lands
+        # on in the picture's own plane.
         "spiral_end_deg": info.get("spiral_end"),
         "spiral_end_arc_deg": info.get("spiral_end_arc"),
+        "spiral_slope_deg": info.get("spiral_slope"),
         "spiral_end_clock_deg": info.get("spiral_end_clock"),
         "spiral_end_elevation_deg": info.get("spiral_end_elevation"),
     }
@@ -3092,33 +3317,43 @@ def format_summary(summary):
     # is the one azimuth that moves all of it.
     orbit = ""
     if summary.get("orbit_coverage_deg"):
+        spiral = summary.get("coverage") == SPIRAL_COVERAGE
         if summary.get("coverage") == ORBIT_COVERAGES[1]:
             beyond = (f"+ {summary['lap_span_deg']:.0f} deg level back connection"
                       + (", then the back O loop (9 -> 12 -> 3 -> 6 -> 8 o'clock)"
                          if summary.get("back_orbit")
                          else " (the speed cap could not pay for the back O loop, so the path ends "
                               "where the sweep stopped)"))
-        elif summary.get("coverage") == SPIRAL_COVERAGE:
+        elif spiral:
             winding = summary.get("spiral_end_deg") or SPIRAL_END_DEFAULT
             arc = summary.get("spiral_end_arc_deg") or SPIRAL_END_ARC
-            beyond = (f"spherical spiral, {winding:.0f} deg of winding ({winding / 360.0:.2f} "
-                      f"rounds) to {arc:.0f} deg off the view axis"
-                      + (f", ending clock {summary['spiral_end_clock_deg']:.0f} deg / elevation "
-                         f"{summary['spiral_end_elevation_deg']:.0f} deg"
-                         if summary.get("spiral_end_clock_deg") is not None else ""))
+            slope = summary.get("spiral_slope_deg") or 0.0
+            axis = ("the view axis" if abs(slope) < 0.5 else
+                    f"a central axis leaned {slope:.0f} deg out of the view axis"
+                    + (" (from straight above)" if slope > 0 else " (from straight below)"))
+            beyond = (f"{winding:.0f} deg of winding ({winding / 360.0:.2f} rounds) while the arc "
+                      f"out of it climbs to {arc:.0f} deg - the last frame is in the picture's own "
+                      f"plane")
+            if summary.get("spiral_end_clock_deg") is not None:
+                beyond += (f", ending clock {summary['spiral_end_clock_deg']:.0f} deg / elevation "
+                           f"{summary['spiral_end_elevation_deg']:.0f} deg")
         elif summary.get("coverage"):
             beyond = "front circle only"
         else:
             beyond = f"+ {summary['lap_span_deg']:.0f} deg lap"
-        shape = "spherical spiral" if summary.get("coverage") == SPIRAL_COVERAGE else "O"
-        arc_text = (f"{summary['spiral_end_arc_deg']:.0f} deg out of the view axis"
-                    if summary.get("coverage") == SPIRAL_COVERAGE
-                    else f"+/-{summary['front_yaw_deg']:.0f} deg")
-        orbit = (f", {shape} {arc_text} "
-                 f"{summary.get('orbit_direction', '')} "
-                 f"centred on {summary.get('view_angle_deg') or 0.0:.0f} deg {beyond} "
-                 f"to {summary['orbit_end_deg']:.0f} deg "
-                 f"= {summary['orbit_coverage_deg']:.0f} deg around")
+        if spiral:
+            # The spiral has no "deg around" azimuth to report: its coverage *is* the winding, and
+            # the view angle is the azimuth of the axis it winds around.
+            view = summary.get("view_angle_deg") or 0.0
+            centre = f" centred on {view:.0f} deg" if abs(view) >= 0.5 else ""
+            orbit = (f", spherical spiral {summary.get('orbit_direction', '')} around {axis}"
+                     f"{centre}: {beyond}")
+        else:
+            orbit = (f", O +/-{summary['front_yaw_deg']:.0f} deg "
+                     f"{summary.get('orbit_direction', '')} "
+                     f"centred on {summary.get('view_angle_deg') or 0.0:.0f} deg {beyond} "
+                     f"to {summary['orbit_end_deg']:.0f} deg "
+                     f"= {summary['orbit_coverage_deg']:.0f} deg around")
     if summary.get("drift_px") is not None:
         parts.append(
             f"({summary['drift_px']:.3g} px/frame subject drift, typical "

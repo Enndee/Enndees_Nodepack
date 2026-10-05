@@ -241,13 +241,13 @@ image the Geometry node receives. The estimator:
        the radius the fit found (the console names the cut).
      - `Spiral` - a **spherical spiral** around the pivot. The camera travels on a
        sphere whose centre is the pivot (constant distance, always aiming at it, so the
-       subject keeps its place in the frame) along a spiral that unwinds out of the view
-       axis (x = the depth of the source picture):
-       * `phi` - the arc between the camera and the view axis - starts at **0 at the
-         first frame** (the camera sits *on* the axis, looking straight at the picture:
-         the middle of the frame) and reaches **90 degrees at the end** of the path,
-         which puts the camera *in the picture's own plane* - the clip finishes with a
-         **side view** of the picture,
+       subject keeps its place in the frame) along a spiral that unwinds out of the
+       picture's view axis (x = the depth of the source picture):
+       * `phi` - the arc between the camera and the spiral's axis - starts at **0 at
+         the first frame** (the camera sits *on* the axis, looking straight at the
+         picture: the middle of the frame) and reaches **90 degrees at the end** of the
+         path, which puts the camera *in the picture's own plane* - the clip finishes
+         with a **side view** of the picture,
        * `psi` - the clock angle around that axis (12 = up, 3 = the subject's right,
          6 = down, 9 = left) - winds from 0 to the **Spiral End** widget
          (`spiral_end`, degrees, default **840** = two and a third rounds), in Auto
@@ -257,16 +257,33 @@ image the Geometry node receives. The estimator:
        *below* the pivot; **810 deg** ends level on the side (`cos 810 deg = 0`), and
        0 flies the plain quarter circle (front view -> straight up, the top of the
        plane). The console line and the path description name the end pose
-       (clock/elevation), so the number can be dialled in. The spiral's frames follow
-       the *measured* subject motion rather than the linear parameter - passing over
-       (or under) the subject turns the picture several times faster than a step at
-       3/9 o'clock - which is what keeps the per-frame picture motion as even as the
-       path allows. **The winding is your parameter, not the fit's**: Max Speed never
-       shortens it. When the frames x speed cap cannot pay for the path, the console
-       line reports the per-frame drift against the cap instead (more Output Frames or
-       a higher Auto Max Speed are the levers). Measured on the built-in fixture:
-       243 frames x 840 deg run at 18.6 px/frame against a 38.1 px cap - the requested
-       coil fits; 73 frames land at 67.9 px/frame, which the console names.
+       (clock/elevation), so the number can be dialled in.
+       **The axis itself leans with the `Spiral Center Slope`** - the Auto Orbit Angle
+       widget, renamed by the panel while this coverage is picked: the angle of the
+       spiral's central rotational axis in the vertical plane through the view axis,
+       **0 (the default) horizontal** = the view axis itself (the spiral opens on the
+       framed frontal view), **+90 "from straight above"** (it opens straight above the
+       subject and unwinds down to a level orbit), **-90 "from straight below"**.
+       Everything else - pivot, distance, aim - is untouched.
+       The frames are spaced **evenly along the path** (one constant camera speed),
+       which is what makes the *path* steady: a spiral's frontal projection is
+       essentially its arc length, so even steps there are even spacing in every view.
+       (The earlier split chased the *subject's* pixel motion instead - cheap for a roll
+       near the pole, expensive where the picture is sensitive - and raced the camera
+       around the axis at up to 11 deg/frame while crawling at 0.6, a 17x lurch that
+       read as a jagged polygon.) The **speed cap is an upper bound, not a target**: the
+       constant speed is solved so no frame's measured subject drift exceeds Auto Max
+       Speed, i.e. the path runs a little slower where the picture is sensitive and
+       never faster than the geometry allows. **The winding is your parameter, not the
+       fit's**: Max Speed never shortens it. When the frames x speed cap cannot pay for
+       the path at any speed (73 frames x 840 deg on the fixture, for instance), the
+       path falls back to the drift-even split and the console reports the overshoot
+       (more Output Frames or a higher Auto Max Speed are the levers).
+       The **keys** the Geometry node splines follow the spiral's own *turning* rather
+       than every Nth frame (dense right after the pole, sparse on the long outer
+       sweep): with an even key list the spline missed the intended path by 16 % of the
+       orbit radius at frame 4 and swung 3.1x in speed, where the turning-based list
+       holds it to 1.1 % and 1.07x.
    - **Manual** - the manual styles below, but aimed at the estimated pivot
      instead of the absolute look-pivot (the `path_pivot_*` widgets are ignored
      and hidden then; every other path widget applies as usual).

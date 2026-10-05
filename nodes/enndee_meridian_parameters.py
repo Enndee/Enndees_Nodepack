@@ -71,6 +71,9 @@ from enndee_meridian_auto_camera import (
     SPIRAL_END_DEFAULT,
     SPIRAL_END_MAX,
     SPIRAL_END_MIN,
+    SPIRAL_SLOPE_DEFAULT,
+    SPIRAL_SLOPE_MAX,
+    SPIRAL_SLOPE_MIN,
     SUBJECT_FILL,
     SUBJECT_FILL_DEFAULT,
     SUBJECT_FILL_MAX,
@@ -438,9 +441,14 @@ class MeridianParametersAndCamera:
                 # above): the O is ONE circle, so this is the swing AND the rise - a smaller value
                 # keeps the automatic subject orbit flatter / less steep. Hidden with the automatic
                 # group by the JS panel.
+                # One widget, two meanings - the JS panel renames it per coverage: the front O's
+                # angular radius outside the Spiral coverage, the spiral's central axis lean inside
+                # it. The slider range covers both (the backend clamps to the right window per
+                # mode), so switching coverage never strands a value.
                 "auto_orbit_angle": ("FLOAT", {
                     "default": round(FRONT_ORBIT_ANGLE_DEFAULT, 1),
-                    "min": FRONT_ORBIT_ANGLE_MIN, "max": FRONT_ORBIT_LIMIT, "step": 5.0,
+                    "min": min(FRONT_ORBIT_ANGLE_MIN, SPIRAL_SLOPE_MIN),
+                    "max": max(FRONT_ORBIT_LIMIT, SPIRAL_SLOPE_MAX), "step": 5.0,
                     "tooltip": (
                         f"Automatic camera (subject target): the front O-orbit's angular radius in "
                         f"degrees - its swing AND its rise, because the O is one circle "
@@ -451,7 +459,17 @@ class MeridianParametersAndCamera:
                         f"fit may still grow the loop a little above this when the budget allows "
                         f"(up to the gimbal-safe ceiling). Clamped to "
                         f"{FRONT_ORBIT_ANGLE_MIN:g}-{FRONT_ORBIT_LIMIT:g} deg. This is the live shape "
-                        f"control - Auto Orbit Size / End are deprecated."
+                        f"control - Auto Orbit Size / End are deprecated. "
+                        f"IN THE '{ORBIT_COVERAGES[2]}' COVERAGE THIS WIDGET IS THE SPIRAL CENTER "
+                        f"SLOPE instead (the JS panel renames it): the angle of the spiral's central "
+                        f"rotational axis, measured in the vertical plane through the view axis. "
+                        f"{SPIRAL_SLOPE_DEFAULT:g} (the default) leaves that axis horizontal - it is "
+                        f"the view axis itself, so the spiral opens on the framed frontal view; "
+                        f"{SPIRAL_SLOPE_MAX:g} stands the axis upright ('from straight above': the "
+                        f"spiral opens straight above the subject and unwinds down to a level "
+                        f"orbit); {SPIRAL_SLOPE_MIN:g} hangs it straight below. Everything else - "
+                        f"the pivot, the camera distance and the aim - is untouched, and the value "
+                        f"is clamped to {SPIRAL_SLOPE_MIN:g}..{SPIRAL_SLOPE_MAX:g} deg."
                     ),
                 }),
                 # The Spiral coverage's winding, appended after the O Orbit Angle (same reason: the
@@ -569,7 +587,11 @@ class MeridianParametersAndCamera:
                 view_angle=float(kwargs["auto_orbit_view_angle"]),
                 coverage=kwargs["auto_orbit_coverage"],
                 # O Orbit Angle: the front O's angular radius (swing AND rise). Smaller = flatter.
+                # In the Spiral coverage the same widget slot is the Spiral Center Slope, so its
+                # value also travels as `spiral_slope` - the backend clamps each meaning to its own
+                # window and only the coverage in charge reads it.
                 orbit_amplitude=float(kwargs["auto_orbit_angle"]),
+                spiral_slope=float(kwargs["auto_orbit_angle"]),
                 # Spiral End: the 'Spiral' coverage's winding around the view axis (deg). Phi still
                 # runs 0 -> SPIRAL_END_ARC over the same path, so this decides where the last frame
                 # looks from - and the fit never shortens it.

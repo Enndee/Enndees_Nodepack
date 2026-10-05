@@ -305,11 +305,26 @@ class MeridianAutomaticCameraTests(unittest.TestCase):
         required = NODE.INPUT_TYPES()["required"]
         angle = required["auto_orbit_angle"][1]
         self.assertAlmostEqual(angle["default"], parameters.FRONT_ORBIT_ANGLE_DEFAULT)
+        # The slider spans both meanings of the slot: the O's radius and the Spiral Center Slope
+        # (the backend clamps each to its own window, the JS panel narrows the range per coverage).
         self.assertEqual((angle["min"], angle["max"]),
-                         (parameters.FRONT_ORBIT_ANGLE_MIN, parameters.FRONT_ORBIT_LIMIT))
+                         (min(parameters.FRONT_ORBIT_ANGLE_MIN, parameters.SPIRAL_SLOPE_MIN),
+                          max(parameters.FRONT_ORBIT_LIMIT, parameters.SPIRAL_SLOPE_MAX)))
         self.assertIn("auto_orbit_angle", parameters.AUTO_WIDGET_NAMES)
         source = JS_PATH.read_text(encoding="utf-8")
         self.assertIn('"auto_orbit_angle"', source)
+        self.assertIn("Spiral Center Slope", source)         # the panel renames it in Spiral mode
+
+    def test_the_spiral_slope_rides_along_the_orbit_angle_widget(self):
+        """The shared widget reaches the estimator as both the O radius and the spiral's slope."""
+        fake, calls, _report = estimate_stub()
+        values = all_defaults()
+        values.update(camera_mode=parameters.AUTOMATIC_MODE, auto_orbit_angle=45.0)
+        with mock.patch.object(parameters, "estimate_camera_path", side_effect=fake):
+            NODE().build(reference_image=torch.zeros(1, 8, 8, 3), **values)
+        self.assertEqual(len(calls), 1)
+        self.assertAlmostEqual(calls[0]["orbit_amplitude"], 45.0)
+        self.assertAlmostEqual(calls[0]["spiral_slope"], 45.0)
 
     def test_a_scene_survey_still_uses_orbit_size(self):
         """Auto Orbit Size only lost its meaning for the subject; the rows still follow it."""

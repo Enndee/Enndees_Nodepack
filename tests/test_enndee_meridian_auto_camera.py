@@ -94,6 +94,7 @@ from enndee_meridian_auto_camera import (  # noqa: E402
     _place,
     _shrink_amplitude,
     _spiral_geometry,
+    _spiral_key_frames,
     _spiral_point,
     _spiral_sweep,
     SPIRAL_COVERAGE,
@@ -102,10 +103,14 @@ from enndee_meridian_auto_camera import (  # noqa: E402
     SPIRAL_END_DEFAULT,
     SPIRAL_END_MAX,
     SPIRAL_END_MIN,
+    SPIRAL_SLOPE_DEFAULT,
+    SPIRAL_SLOPE_MAX,
+    SPIRAL_SLOPE_MIN,
     spiral_arc,
     spiral_clock,
     spiral_pose,
     resolve_spiral_end,
+    resolve_spiral_slope,
 )
 import enndee_meridian_auto_camera as auto_camera  # noqa: E402  (module state: the active winding)
 
@@ -1722,6 +1727,55 @@ class AutoCameraSpiralCoverageTests(unittest.TestCase):
         self.assertEqual(resolve_spiral_end(840), 840.0)
         self.assertEqual(auto_camera.spiral_end(), SPIRAL_END_DEFAULT)
 
+    def test_resolve_spiral_slope_clamps(self):
+        self.assertEqual(resolve_spiral_slope(None), SPIRAL_SLOPE_DEFAULT)
+        self.assertEqual(resolve_spiral_slope(0), 0.0)
+        self.assertEqual(resolve_spiral_slope(45), 45.0)
+        self.assertEqual(resolve_spiral_slope(180), SPIRAL_SLOPE_MAX)
+        self.assertEqual(resolve_spiral_slope(-180), SPIRAL_SLOPE_MIN)
+        self.assertEqual(auto_camera.spiral_slope(), SPIRAL_SLOPE_DEFAULT)
+
+    def test_the_slope_leans_the_spiral_s_axis(self):
+        """0 = the view axis, +90 = straight above, -90 = straight below - the axis, not the aim."""
+        self.assertEqual(_spiral_point(0.0, 0.0, 1.0, SPIRAL_SLOPE_DEFAULT), (0.0, 0.0))
+        # the first frame of a +90 lean opens straight above the subject - the elevation ceiling
+        # holds it the last 2 deg short of the pole, so the arc out of the tilted axis reads 2 deg
+        above = _spiral_point(0.0, 0.0, 1.0, SPIRAL_SLOPE_MAX)
+        self.assertEqual(above, (0.0, SPIRAL_ELEVATION_CEILING))
+        self.assertAlmostEqual(spiral_arc(*above, slope_degrees=SPIRAL_SLOPE_MAX),
+                               SPIRAL_END_ARC - SPIRAL_ELEVATION_CEILING, places=6)
+        self.assertAlmostEqual(spiral_arc(*spiral_pose(0.0, 0.0, SPIRAL_SLOPE_MAX),
+                                          slope_degrees=SPIRAL_SLOPE_MAX), 0.0, places=6)
+        end = _spiral_point(1.0, 0.0, 1.0, SPIRAL_SLOPE_MAX)
+        self.assertAlmostEqual(spiral_arc(*end, slope_degrees=SPIRAL_SLOPE_MAX), SPIRAL_END_ARC,
+                               places=4)
+        below = _spiral_point(0.0, 0.0, 1.0, SPIRAL_SLOPE_MIN)
+        self.assertEqual(below, (0.0, -SPIRAL_ELEVATION_CEILING))
+        # ... and the round trip through the tilted axis holds for any slope
+        for slope in (-90.0, -45.0, 0.0, 30.0, 90.0):
+            for phi, psi in ((0.0, 0.0), (20.0, 120.0), (90.0, 200.0)):
+                with self.subTest(slope=slope, phi=phi, psi=psi):
+                    yaw, elevation = spiral_pose(phi, psi, slope)
+                    self.assertAlmostEqual(spiral_arc(yaw, elevation, slope), phi, places=6)
+                    delta = (spiral_clock(yaw, elevation, slope) - psi + 180.0) % 360.0 - 180.0
+                    self.assertAlmostEqual(delta, 0.0, places=6)
+
+    def test_a_leaned_spiral_keeps_the_distance_and_the_ends(self):
+        surface = probe_surface(_reference(), depth_fn=lambda reference: _depth_with_subject())
+        distance, pivot, _metrics = subject_framing(surface, 40.0)
+        previous = auto_camera._ACTIVE_SPIRAL_SLOPE
+        auto_camera._ACTIVE_SPIRAL_SLOPE = 60.0
+        self.addCleanup(setattr, auto_camera, "_ACTIVE_SPIRAL_SLOPE", previous)
+        samples = subject_samples(73, pivot, distance, 1.0, 1.0, None, ORBIT_DIRECTION_DEFAULT,
+                                  coverage=SPIRAL_COVERAGE)
+        for sample in samples:
+            self.assertAlmostEqual(math.dist(sample, pivot), distance, places=6)
+        self.assertAlmostEqual(samples[0][1], pivot[1] - distance * math.sin(math.radians(60.0)),
+                               places=4)                       # the opening frame is high above
+        self.assertAlmostEqual(
+            spiral_arc(*_orbit_angles(samples[-1], pivot), slope_degrees=60.0), SPIRAL_END_ARC,
+            places=4)
+
     def test_arc_rises_monotonically_and_the_clock_winds(self):
         steps = 60
         points = [_spiral_point(index / steps, 0.0) for index in range(steps + 1)]
@@ -1778,48 +1832,91 @@ class AutoCameraSpiralCoverageTests(unittest.TestCase):
         self.assertGreater(drift, 0.0)                 # measured, so the console can name the price
         self.assertGreater(drift, tiny)                # ... and it *is* over the cap: no silent cut
 
-    def test_the_motion_even_split_keeps_the_ends_and_costs_less_motion(self):
-        """Same spiral, same first/last pose - the frames just follow the subject's own motion."""
+    def test_the_frames_are_spaced_evenly_along_the_spiral(self):
+        """One constant camera speed along the path - that is what keeps the path itself steady."""
+        surface = probe_surface(_reference(), depth_fn=lambda reference: _depth_with_subject())
+        distance, pivot, metrics = subject_framing(surface, 40.0)
+        pool = _decimate(surface["content_cloud"], DRIFT_POOL)
+        cap = 0.5 * metrics["radius_px"]                 # a generous cap: the geometry is the limit
+        steady = subject_samples(73, pivot, distance, 1.0, 1.0, None, ORBIT_DIRECTION_DEFAULT,
+                                 coverage=SPIRAL_COVERAGE, motion_pool=pool, motion_surface=surface,
+                                 motion_cap=cap)
+        self.assertEqual(len(steady), 73)
+        for sample in steady:                            # every pose keeps the one distance
+            self.assertAlmostEqual(math.dist(sample, pivot), distance, places=6)
+        travel = [math.dist(steady[index - 1], steady[index]) for index in range(1, 73)]
+        frontal = [math.hypot(steady[index][0] - steady[index - 1][0],
+                              steady[index][1] - steady[index - 1][1]) for index in range(1, 73)]
+        # ... and the steps are even: the drift-even split this replaced swung 17x on the 175 frame
+        # example, which is what read as a jagged polygon (the 1.2 here is the *chord* of a curving
+        # path, not a speed difference)
+        self.assertLess(max(travel) / min(travel), 1.25)
+        self.assertLess(max(frontal) / min(frontal), 1.25)
+        # the *linear* parameter (phi and psi both linear) is the uneven one it has to beat
+        linear = [_place(pivot, distance, *_spiral_point(index / 72, 0.0))
+                  for index in range(73)]
+        linear_travel = [math.dist(linear[index - 1], linear[index]) for index in range(1, 73)]
+        self.assertLess(max(travel) / min(travel), max(linear_travel) / min(linear_travel) / 2.0)
+
+    def test_the_speed_cap_slows_the_path_where_the_picture_is_sensitive(self):
+        """The cap is an upper bound, not a target: the path slows down, it never races to hit it."""
+        surface = probe_surface(_reference(), depth_fn=lambda reference: _depth_with_subject())
+        distance, pivot, metrics = subject_framing(surface, 40.0)
+        pool = _decimate(surface["content_cloud"], DRIFT_POOL)
+        # 175 frames is a case the cap can pay for; 73 frames x 840 deg is over budget whatever the
+        # speed, and that path is *reported* (the console names the overshoot), not slowed down.
+        cap = 0.07 * metrics["radius_px"]
+        steady = subject_samples(175, pivot, distance, 1.0, 1.0, None, ORBIT_DIRECTION_DEFAULT,
+                                 coverage=SPIRAL_COVERAGE, motion_pool=pool, motion_surface=surface,
+                                 motion_cap=cap)
+        self.assertLessEqual(subject_drift(pool, steady, pivot, surface)[0], cap + 1e-6)
+        travel = [math.dist(steady[index - 1], steady[index]) for index in range(1, 175)]
+        self.assertGreater(max(travel) / min(travel), 1.05)     # it gives way where the picture is
+        # ... and the ends are the path's own ends either way
+        plain = subject_samples(175, pivot, distance, 1.0, 1.0, None, ORBIT_DIRECTION_DEFAULT,
+                                coverage=SPIRAL_COVERAGE)
+        for index in (0, -1):
+            for axis in range(3):
+                self.assertAlmostEqual(steady[index][axis], plain[index][axis], places=6)
+
+    def test_the_keys_follow_the_spiral_s_turning(self):
+        """The renderer splines the keys, so they sit where the path bends - not every Nth frame."""
         surface = probe_surface(_reference(), depth_fn=lambda reference: _depth_with_subject())
         distance, pivot, _metrics = subject_framing(surface, 40.0)
         pool = _decimate(surface["content_cloud"], DRIFT_POOL)
-        linear = subject_samples(73, pivot, distance, 1.0, 1.0, None, ORBIT_DIRECTION_DEFAULT,
-                                 coverage=SPIRAL_COVERAGE)
-        even = subject_samples(73, pivot, distance, 1.0, 1.0, None, ORBIT_DIRECTION_DEFAULT,
-                               coverage=SPIRAL_COVERAGE, motion_pool=pool, motion_surface=surface)
-        self.assertEqual(len(even), len(linear))
-        for index in (0, -1):                       # the framed opening pose and the 9 o'clock end
-            for axis in range(3):
-                self.assertAlmostEqual(linear[index][axis], even[index][axis], places=6)
-        for sample in even:                         # every pose keeps the one distance
-            self.assertAlmostEqual(math.dist(sample, pivot), distance, places=6)
-        linear_drift = subject_drift(pool, linear, pivot, surface)[0]
-        even_drift = subject_drift(pool, even, pivot, surface)[0]
-        self.assertLess(even_drift, linear_drift)
-        # ... and without a surface the linear clock stays the fallback (no motion to measure)
-        fallback = subject_samples(73, pivot, distance, 1.0, 1.0, None, ORBIT_DIRECTION_DEFAULT,
-                                   coverage=SPIRAL_COVERAGE)
-        self.assertEqual(len(fallback), 73)
+        samples = subject_samples(175, pivot, distance, 1.0, 1.0, None, ORBIT_DIRECTION_DEFAULT,
+                                  coverage=SPIRAL_COVERAGE, motion_pool=pool, motion_surface=surface,
+                                  motion_cap=0.5 * _metrics["radius_px"])
+        ticks = _spiral_key_frames(samples, 175)
+        self.assertEqual(ticks[0], 0)
+        self.assertEqual(ticks[-1], 174)
+        self.assertEqual(ticks, sorted(set(ticks)))            # strictly increasing, no repeats
+        self.assertGreater(len(ticks), 17)                     # denser than the even frame list ...
+        # ... and densest where the path turns fastest: right after the pole
+        first = [right - left for left, right in zip(ticks, ticks[1:])]
+        self.assertLess(first[0], max(first))
+        self.assertLess(sum(first[:4]), sum(first[-4:]))
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs a CUDA device")
-    def test_the_motion_even_split_survives_a_cuda_surface(self):
+    def test_the_spiral_spacing_survives_a_cuda_surface(self):
         """A depth model on the GPU hands us CUDA points - the sampler must not mix devices.
 
-        `torch.linspace` always builds on the CPU, while the pool (and with it the cumulative
-        motion) lives on `cuda:0` when the depth map came from a CUDA model. That combination is a
-        hard RuntimeError in `torch.searchsorted`: "got self is on cpu, different from other tensors
-        on cuda:0" (`self` is ATen's name for the *values* argument).
+        `torch.linspace` always builds on the CPU, while the pool (and with it the measured drift)
+        lives on `cuda:0` when the depth map came from a CUDA model. That combination is a hard
+        RuntimeError in `torch.searchsorted`: "got self is on cpu, different from other tensors on
+        cuda:0" (`self` is ATen's name for the *values* argument).
         """
         surface = probe_surface(_reference(), depth_fn=lambda reference: _depth_with_subject())
         surface = {key: value.cuda() if torch.is_tensor(value) else value
                    for key, value in surface.items()}
-        distance, pivot, _metrics = subject_framing(surface, 40.0)
+        distance, pivot, metrics = subject_framing(surface, 40.0)
         pool = _decimate(surface["content_cloud"], DRIFT_POOL)
         self.assertTrue(pool.is_cuda)                       # the fixture really is on the GPU
-        even = subject_samples(73, pivot, distance, 1.0, 1.0, None, ORBIT_DIRECTION_DEFAULT,
-                               coverage=SPIRAL_COVERAGE, motion_pool=pool, motion_surface=surface)
-        self.assertEqual(len(even), 73)
-        self.assertAlmostEqual(math.dist(even[-1], pivot), distance, places=6)
+        steady = subject_samples(73, pivot, distance, 1.0, 1.0, None, ORBIT_DIRECTION_DEFAULT,
+                                 coverage=SPIRAL_COVERAGE, motion_pool=pool, motion_surface=surface,
+                                 motion_cap=0.5 * metrics["radius_px"])
+        self.assertEqual(len(steady), 73)
+        self.assertAlmostEqual(math.dist(steady[-1], pivot), distance, places=6)
         # ... and the full entry point the node calls, with a CUDA image *and* a CUDA depth map
         depth = _depth_with_subject().cuda()
         signal, summary = estimate_camera_path(_reference().cuda(), 73, target=SUBJECT_TARGET,
@@ -1871,6 +1968,22 @@ class AutoCameraSpiralCoverageTests(unittest.TestCase):
         self.assertAlmostEqual(summary.get("spiral_end_deg"), SPIRAL_END_DEFAULT, places=6)
         self.assertAlmostEqual(summary.get("spiral_end_arc_deg"), SPIRAL_END_ARC, places=6)
         self.assertAlmostEqual(summary.get("spiral_end_elevation_deg"), -30.0, places=6)
+
+    def test_the_spiral_slope_widget_rides_through_the_entry_point(self):
+        """`estimate_camera_path(spiral_slope=...)` leans the axis for the whole estimate."""
+        _document, summary = _estimate(_depth_with_subject(), coverage=SPIRAL_COVERAGE,
+                                       spiral_slope=60.0)
+        self.assertAlmostEqual(summary.get("spiral_slope_deg"), 60.0, places=6)
+        self.assertEqual(auto_camera.spiral_slope(), SPIRAL_SLOPE_DEFAULT)   # restored afterwards
+        # 90 deg is "from straight above": the opening frame sits above the pivot
+        _document, summary = _estimate(_depth_with_subject(), coverage=SPIRAL_COVERAGE,
+                                       spiral_slope=90.0)
+        self.assertAlmostEqual(summary.get("spiral_slope_deg"), SPIRAL_SLOPE_MAX, places=6)
+        keys = json.loads(_document)["path"]
+        self.assertLess(keys[0]["pos"][1], keys[0]["look"][1])   # above the aim (world y is down)
+        # every other coverage ignores it
+        _document, summary = _estimate(_depth_with_subject(), coverage=ORBIT_COVERAGES[0])
+        self.assertIsNone(summary.get("spiral_slope_deg"))
 
     def test_the_spiral_end_widget_rides_through_the_entry_point(self):
         """`estimate_camera_path(spiral_end=...)` sets the winding for the whole estimate."""

@@ -91,6 +91,37 @@ function finishVisibilityUpdate(node) {
   app.graph?.setDirtyCanvas?.(true, true);
 }
 
+// The Auto Orbit Angle slot doubles as the Spiral Center Slope inside the Spiral coverage: the
+// label and the slider range follow the coverage, so the widget always reads as what it does right
+// now (the value itself is kept - the backend clamps each meaning to its own window). The ranges
+// must stay in sync with FRONT_ORBIT_ANGLE_MIN / FRONT_ORBIT_LIMIT and SPIRAL_SLOPE_MIN / _MAX in
+// enndee_meridian_auto_camera.py, the label with the widget's tooltip in
+// enndee_meridian_parameters.py.
+const SPIRAL_COVERAGE = "Spiral";
+const SHARED_ANGLE_WIDGET = "auto_orbit_angle";
+const ORBIT_ANGLE_LABEL = "O Orbit Angle";
+const ORBIT_ANGLE_RANGE = [5, 60];
+const SPIRAL_SLOPE_LABEL = "Spiral Center Slope";
+const SPIRAL_SLOPE_RANGE = [-90, 90];
+
+function setSharedAngleWidget(node, spiral) {
+  const widget = findWidget(node, SHARED_ANGLE_WIDGET);
+  if (!widget) return false;
+  const label = spiral ? SPIRAL_SLOPE_LABEL : ORBIT_ANGLE_LABEL;
+  const [low, high] = spiral ? SPIRAL_SLOPE_RANGE : ORBIT_ANGLE_RANGE;
+  let changed = false;
+  if (widget.label !== label) {
+    widget.label = label;
+    changed = true;
+  }
+  if (widget.options && (widget.options.min !== low || widget.options.max !== high)) {
+    widget.options.min = low;
+    widget.options.max = high;
+    changed = true;
+  }
+  return changed;
+}
+
 function applyVisibility(node) {
   const visible = new Set(["output_frames", "camera_mode"]);
   const cameraMode = String(findWidget(node, "camera_mode")?.value);
@@ -118,13 +149,19 @@ function applyVisibility(node) {
       changed = true;
     }
   }
+  // The shared angle widget reads as the Spiral Center Slope while the Spiral coverage is picked.
+  if (automatic && setSharedAngleWidget(
+        node, String(findWidget(node, "auto_orbit_coverage")?.value) === SPIRAL_COVERAGE)) {
+    changed = true;
+  }
 
   if (!changed) return;
   finishVisibilityUpdate(node);
 }
 
-// Widgets that change the visible set when their value changes.
-const WATCHED_WIDGETS = new Set(["camera_mode", "path_camera_mode", "auto_path_mode"]);
+// Widgets that change the visible set (or the shared widget's meaning) when their value changes.
+const WATCHED_WIDGETS = new Set(["camera_mode", "path_camera_mode", "auto_path_mode",
+                                 "auto_orbit_coverage"]);
 
 app.registerExtension({
   name: "EnndeeMeridianParameters.DependentVisibility",
