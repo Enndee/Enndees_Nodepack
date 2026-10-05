@@ -485,6 +485,16 @@ class NodeStatusTests(unittest.TestCase):
         status.set_stage("working")
         self.assertIn("working", status.text)
 
+    def test_percent_never_moves_backwards(self):
+        status = native.NodeStatus()
+        seen = []
+        status.pbar = types.SimpleNamespace(
+            update_absolute=lambda value, total=None, preview=None: seen.append(value))
+        status.set_percent(60.0)
+        status.set_percent(0.0)   # stage marker of the next stage
+        status.set_percent(90.0)
+        self.assertEqual(seen, [60, 60, 90])
+
     def test_progress_bar_is_driven_when_comfy_is_available(self):
         comfy = types.ModuleType("comfy")
         utils = types.ModuleType("comfy.utils")
