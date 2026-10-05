@@ -107,6 +107,27 @@ class MeridianFastDepthHelperTests(unittest.TestCase):
                 {"t": 20, "src": 20, "pos": [0.0, 0.0, 0.0], "look": [0.0, 0.0, 1.0]},
                 {"t": 72, "src": 72, "pos": [0.5, 0.0, 0.5], "look": [0.0, 0.0, 1.0]}]}))
 
+    def test_a_depth_model_mismatch_between_estimate_and_render_is_reported(self):
+        """The keys' scale comes from the estimating model; another render model moves the pivot.
+
+        The estimator writes the model that produced its depth map into the document; rendering
+        with a different one means the path is scaled by a map with another depth scale, so the
+        aim lands at the wrong depth (in the background) while the path itself looks fine.
+        """
+        path = {"depth_model": "Depth-Anything-3-Mono-Large"}
+        self.assertIsNone(fast_depth.warn_depth_model_mismatch(
+            path, "Depth-Anything-3-Mono-Large"))                  # matching nodes: quiet
+        warning = fast_depth.warn_depth_model_mismatch(path, "Depth-Anything-3-Small")
+        self.assertIsNotNone(warning)
+        self.assertIn("Depth-Anything-3-Mono-Large", warning)
+        self.assertIn("Depth-Anything-3-Small", warning)
+        self.assertIn("pivot", warning)
+        self.assertIsNone(fast_depth.warn_depth_model_mismatch({"path": []}, "any"))
+        self.assertIsNone(fast_depth.warn_depth_model_mismatch(path, ""))
+        # tests inject their own depth map: nothing to compare there
+        self.assertIsNone(fast_depth.warn_depth_model_mismatch(
+            {"depth_model": "(injected depth map)"}, "Depth-Anything-3-Small"))
+
     def test_parse_camera_settings_reads_values_flags_and_inline_forms(self):
         settings = _camera("--frames", "90", "--yaw-from", "-15", "--yaw", "15", "--truck=0.25",
                            "--boom", "-0.5", "--dolly", "0.8", "--zoom", "1.6", "--sweep",

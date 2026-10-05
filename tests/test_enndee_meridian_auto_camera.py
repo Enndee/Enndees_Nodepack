@@ -22,13 +22,21 @@ from enndee_meridian_auto_camera import (  # noqa: E402
     CANVAS_HEIGHT,
     COLLISION_MARGIN,
     DEFAULT_MAX_SPEED,
+    FIT_GROW_STEP,
     FRONT_ELEVATION,
     FRONT_ELEVATION_LIMIT,
+    FRONT_ORBIT_AMPLITUDE,
+    FRONT_ORBIT_ANGLE_MIN,
+    FRONT_ORBIT_LIMIT,
     FRONT_ORBIT_RISE,
     FRONT_YAW_AMPLITUDE,
     FRONT_YAW_LIMIT,
     FULL_CIRCLE,
+    NO_SUBJECT_SOURCE,
+    ORBIT_COVERAGE_DEGREES,
+    ORBIT_COVERAGES,
     ORBIT_DIRECTION_DEFAULT,
+    ORBIT_VIEW_ANGLE_DEFAULT,
     REST_ELEVATION_HIGH,
     SCENE_ELEVATION_HIGH,
     SCENE_ELEVATION_LOW,
@@ -47,6 +55,7 @@ from enndee_meridian_auto_camera import (  # noqa: E402
     balanced_front_share,
     direction_mirror,
     document_from_keys,
+    depth_from_reference,
     enforce_subject_visibility,
     equalize_pivot,
     estimate_camera_path,
@@ -54,6 +63,7 @@ from enndee_meridian_auto_camera import (  # noqa: E402
     format_summary,
     front_amplitudes,
     front_camera,
+    front_orbit_amplitude,
     geometric_pivot,
     guard_collisions,
     lap_span_for_end,
@@ -61,6 +71,7 @@ from enndee_meridian_auto_camera import (  # noqa: E402
     pivot_radius,
     probe_surface,
     project_points,
+    resolve_front_orbit_amplitude,
     scene_coverage,
     scene_samples,
     scene_survey_fill,
@@ -71,7 +82,13 @@ from enndee_meridian_auto_camera import (  # noqa: E402
     subject_share_curve,
     surface_points,
     visibility_clearances,
+    _envelope_angles,
+    _fit_orbit_world,
+    _front_travel_share,
+    _orbit_point,
+    _path_fits,
     _place,
+    _shrink_amplitude,
 )
 
 
@@ -137,6 +154,11 @@ def _front_split(frames, size=1.0, scale=1.0, end=FULL_CIRCLE):
     """Last frame index of the front O: the frame the balanced split hands over to the orbit."""
     yaw, _elevation = front_amplitudes(scale, size)
     return math.floor((frames - 1) * balanced_front_share(yaw, max(0.0, end - yaw)))
+
+
+def _travelled(samples):
+    """World length of the polyline through `samples` - how far the camera actually flies."""
+    return sum(math.dist(samples[index - 1], samples[index]) for index in range(1, len(samples)))
 
 
 class AutoCameraSurfaceTests(unittest.TestCase):
@@ -230,7 +252,9 @@ class AutoCameraPathTests(unittest.TestCase):
         # ... from where the camera rises straight up to 12 o'clock, the top of the O
         for index in range(rise + 1):
             self.assertAlmostEqual(angles[index][0], 0.0, delta=1e-4)
-        self.assertAlmostEqual(angles[rise][1], FRONT_ELEVATION, delta=0.05)
+        # the crane peaks exactly on 12 o'clock; the sampled frame before it sits a little lower now
+        # that the circle is 45 deg (the old 30 deg ellipse peaked closer to a whole frame index)
+        self.assertAlmostEqual(angles[rise][1], FRONT_ELEVATION, delta=0.5)
         # counter-clockwise 12 -> 9 -> 6 -> 3: the subject's left side first, the low point second,
         # the right side last - where the loop hands over to the lap, back at the framed height
         left = min(range(rise, split + 1), key=lambda index: angles[index][0])
@@ -726,6 +750,121 @@ class AutoCameraEstimateTests(unittest.TestCase):
         self.assertEqual(summary["content_points"], 16 * 16)
         self.assertGreater(summary["pivot"][2], 3.5)      # follows the mask, not the subject
 
+    def test_an_unusable_mask_raises_instead_of_orbiting_the_whole_surface(self):
+        """A connected mask decides - so a mask that selects nothing must FAIL, not fall back.
+
+        The old code silently swapped in the depth heuristic below `_minimum_subject_pixels`, and
+        `split_subject` answers "the whole surface" as soon as its Otsu cut collapses: the orbit
+        then circled the centre of the whole cloud (background included) while the path itself
+        looked perfectly fine. The RMBG node even answers its own exceptions with an all-zero
+        mask, so this is reachable from the workflow alone.
+        """
+        depth = _depth_with_subject()
+        mask = torch.zeros(64, 64)
+        mask[:2, :2] = 1.0                         # 4 pixels: no subject at all
+        with self.assertRaises(ValueError) as caught:
+            _estimate(depth, subject_mask=mask)
+        message = str(caught.exception)
+        self.assertIn("subject mask selects only 4", message)
+        self.assertIn("white = subject", message)
+
+    def test_the_pivot_reports_the_exact_points_it_was_built_from(self):
+        """The console line must say which points fed the pivot - the orbit can hide a bad one."""
+        depth = _depth_with_subject()
+        mask = torch.zeros(64, 64)
+        mask[:16, :16] = 1.0
+        document, summary = _estimate(depth, subject_mask=mask)
+        line = format_summary(summary)
+        self.assertIn("input mask", line)
+        self.assertIn(f"{summary['content_points']} of {summary['points']} points used", line)
+        self.assertIn("the pivot is computed from those and only those", line)
+        description = json.loads(document)["description"]
+        self.assertIn(f"built from {summary['content_points']} of {summary['points']} points",
+                      description)
+
+    def test_a_mask_that_covers_the_frame_is_named_in_the_hint(self):
+        """A mask selecting the whole frame segments nothing - say so, the pivot is the scene's."""
+        depth = _depth_with_subject()
+        _, summary = _estimate(depth, subject_mask=torch.ones(64, 64))
+        self.assertEqual(summary["content_points"], summary["points"])   # it IS the whole cloud
+        # the pivot is now the midpoint of the WHOLE profile: subject at z=1.0, background at
+        # z=4.0 -> 2.5, i.e. well behind the subject - exactly the reported symptom
+        self.assertGreater(summary["pivot"][2], 1.5)
+        self.assertLess(summary["pivot"][2], 3.5)
+        self.assertIn("covers 100 % of the frame", summary["hint"])
+        self.assertIn("white on the SUBJECT", summary["hint"])
+
+    def test_no_mask_and_no_near_layer_is_named_in_the_hint(self):
+        """Without a mask the depth split may collapse onto the whole surface: that has to be said."""
+        flat = _depth_with_subject(near=4.0, far=4.0, background=4.0)   # no layer to find
+        _, summary = _estimate(flat)
+        self.assertEqual(summary["source"], NO_SUBJECT_SOURCE)
+        self.assertIn("centre of the WHOLE surface (background included)", summary["hint"])
+        self.assertIn("connect a subject mask", summary["hint"])
+
+    def test_the_document_names_the_depth_model_that_produced_the_pivot(self):
+        """The keys are in THAT map's median units, so the renderer has to be able to check it.
+
+        Two depth models do not share a scale: a path estimated on one and rendered on another
+        puts the aim (the pivot) at a different depth than intended, and the orbit then circles a
+        point in the background while the path itself looks fine. The record travels with the
+        document; `warn_depth_model_mismatch` on the render side consumes it.
+        """
+        depth = _depth_with_subject()
+        document, _ = _estimate(depth)
+        self.assertEqual(json.loads(document)["depth_model"], "(injected depth map)")
+        with_model = json.loads(document_from_keys(
+            73, json.loads(document)["path"], "n", "d",
+            extra={"depth_model": "Depth-Anything-3-Mono-Large"}))
+        self.assertEqual(with_model["depth_model"], "Depth-Anything-3-Mono-Large")
+        plain = json.loads(document_from_keys(73, json.loads(document)["path"], "n", "d"))
+        self.assertNotIn("depth_model", plain)                    # other callers stay unchanged
+
+    def test_depth_from_reference_returns_depth_and_model_for_both_model_families(self):
+        """`probe_surface` unpacks (depth, model_name) - BOTH model families must honour that.
+
+        The DA3 branch goes through `fast_depth._predict_da3_depth`, which returns a bare (H, W)
+        tensor, while the V2 branch inlines its own inference. The tuple contract was only added
+        to the V2 branch, so the first real DA3 pick on the new Depth Model widget
+        (production: `Depth-Anything-3-Mono-Large`) died with
+        "too many values to unpack (expected 2)" - every test injects `depth_fn`, which is why
+        nothing caught it. Both branches run here against fakes, so no weights are needed.
+        """
+        reference = torch.zeros(1, 16, 16, 3)
+        sentinel = torch.full((6, 4), 2.5)                 # non-square, like a portrait DA3 grid
+        seen = {}
+
+        class _Prediction:
+            predicted_depth = torch.full((1, 4, 4), 0.4)
+
+        class _Model:
+            def __call__(self, pixel_values=None):
+                return _Prediction()
+
+        def fake_da3(model_name, first, device, process_res=0):
+            seen["da3"] = model_name
+            return sentinel
+
+        def fake_v2(model_name, device):
+            seen["v2"] = model_name
+            return _Model()
+
+        original_da3, original_v2 = fast_depth._predict_da3_depth, fast_depth._get_depth_model
+        fast_depth._predict_da3_depth, fast_depth._get_depth_model = fake_da3, fake_v2
+        try:
+            depth, name = depth_from_reference(reference,
+                                               model_size="Depth-Anything-3-Mono-Large")
+            self.assertIs(depth, sentinel)                  # the DA3 branch returns the bare tensor
+            self.assertEqual(name, "Depth-Anything-3-Mono-Large")   # ... plus its name now
+            depth, name = depth_from_reference(reference,
+                                               model_size="Depth-Anything-V2-Small-hf")
+            self.assertIsNotNone(depth)
+            self.assertEqual(name, "Depth-Anything-V2-Small-hf")
+            self.assertEqual(seen.get("da3"), "Depth-Anything-3-Mono-Large")
+            self.assertEqual(seen.get("v2"), "Depth-Anything-V2-Small-hf")
+        finally:
+            fast_depth._predict_da3_depth, fast_depth._get_depth_model = original_da3, original_v2
+
     def test_estimate_scales_with_the_depth_gauge(self):
         depth = _depth_with_subject()
         _, small = _estimate(depth)
@@ -786,12 +925,16 @@ class AutoCameraVisibilityTests(unittest.TestCase):
             self.assertGreater(extents[axis], 0.0)
         self.assertLess(float(corners.abs().max()), 5.0)      # ... the +/-9/99 spikes stay outside
 
-    def test_visibility_shrinks_the_swing_when_the_room_check_cannot_help(self):
-        """Standing too close for the fitted swing: the pass shortens the O instead of cropping it.
+    def test_visibility_keeps_the_swing_when_no_amplitude_fits(self):
+        """Standing too close for EVERY swing: keep the O and let the dolly fix the frame.
 
         The estimate makes room for the fitted path itself (`_room_distance` in the framing), so this
-        test hands the pass a deliberately close distance - the case a user hits by typing a small
-        Auto Orbit Distance - and checks that the pass shrinks the swing *and* still clears the frame.
+        test hands the pass a deliberately close distance - half the framed stand-off, where the
+        subject is too big for the frame at *any* viewing angle. Shrinking then buys nothing (the
+        offender is the distance, not the swing), so the pass keeps the incoming amplitude and pulls
+        the camera back instead. Returning the ladder's floor here - the old behaviour, justified by
+        "even the smallest loop does not fit: the dolly must help" - is what collapsed a wide front
+        O to +/-3 deg in production while the frame stayed exactly as cropped as before.
         """
         depth = _depth_with_subject(near=1.0, far=1.6)        # the wedge has real depth
         mask = torch.zeros(64, 64)
@@ -801,13 +944,44 @@ class AutoCameraVisibilityTests(unittest.TestCase):
         distance, pivot, metrics = subject_framing(surface, 40.0)
         close, pivot, visibility = enforce_subject_visibility(surface, pivot, distance * 0.5, 1.0,
                                                               1.0, 73)
-        self.assertLess(visibility["amplitude_cap"], 1.0)      # the swing had to shrink ...
+        self.assertAlmostEqual(visibility["amplitude_cap"], 1.0, places=9)   # no useless shrink
+        self.assertGreater(visibility["scale"], 1.0)          # ... the dolly did the work instead
         self.assertTrue(visibility["ok"])
         self.assertGreaterEqual(visibility["clearance_px"], 0.0)
         self.assertGreaterEqual(metrics["area"], 0.0)
         positions = subject_samples(73, pivot, close, visibility["amplitude_cap"], 1.0)
         clearances = visibility_clearances(surface["content_cloud"], positions, pivot, surface)
-        self.assertGreaterEqual(min(clearances), -1e-6)        # ... and the path really fits
+        self.assertGreaterEqual(min(clearances), -1e-6)       # ... and the path really fits
+
+    def test_visibility_shrinks_the_swing_when_that_buys_room(self):
+        """A wide swing that clips while a narrow one fits: shorten the O - that is the cheap fix.
+
+        Shrink must stay available when it genuinely helps (the front pose - and with it the fill -
+        does not move, only the viewing angles narrow), so this drives `_shrink_amplitude` straight
+        at the framed distance with a 100 px border: measured on this fixture the 1.0x swing clips
+        and 0.05x clears, i.e. there is a real answer between the two. The returned amplitude has to
+        keep the frame inside - a shrink that crops is worth nothing.
+        """
+        depth = _depth_with_subject(near=1.0, far=1.6)
+        mask = torch.zeros(64, 64)
+        mask[20:44, 20:44] = 1.0
+        surface = probe_surface(_reference(), subject_mask=mask,
+                                depth_fn=lambda reference: depth)
+        distance, pivot, _ = subject_framing(surface, 40.0)
+        _, _, _coverage, keep = fit_subject_cylinder(surface)
+        pool = surface["content_cloud"][keep]
+        margin = 0.10 * CANVAS_HEIGHT
+        end, direction = 0.0, ORBIT_DIRECTION_DEFAULT         # no lap: narrowing only buys room
+        self.assertFalse(_path_fits(pool, surface, pivot, distance, 1.0, 1.0, 73, CANVAS_HEIGHT,
+                                    margin, end, direction))
+        self.assertTrue(_path_fits(pool, surface, pivot, distance, FIT_GROW_STEP, 1.0, 73,
+                                   CANVAS_HEIGHT, margin, end, direction))
+        cap = _shrink_amplitude(pool, surface, pivot, distance, 1.0, 1.0, 73, CANVAS_HEIGHT,
+                                margin, end, direction)
+        self.assertGreater(cap, FIT_GROW_STEP)                # found a real width ...
+        self.assertLess(cap, 1.0)                             # ... smaller than the fitting swing
+        self.assertTrue(_path_fits(pool, surface, pivot, distance, cap, 1.0, 73, CANVAS_HEIGHT,
+                                   margin, end, direction))
 
     def test_visibility_estimate_stays_visible_without_losing_the_fill(self):
         """The estimate's own result: visible everywhere, the requested fill kept, the trade named."""
@@ -868,8 +1042,9 @@ class AutoCameraVisibilityTests(unittest.TestCase):
         angles = [_orbit_angles(sample, pivot) for sample in samples]
         split = _front_split(73, 1.0, 1.0, 180.0)
         front = [value for value, _ in angles[:split + 1]]
-        self.assertAlmostEqual(max(front), FRONT_YAW_AMPLITUDE, delta=0.1)       # the O is untouched
-        self.assertAlmostEqual(min(front), -FRONT_YAW_AMPLITUDE, delta=0.1)
+        # the circle is 45 deg now, so the discrete frames sit a little inside 3/9 o'clock
+        self.assertAlmostEqual(max(front), FRONT_YAW_AMPLITUDE, delta=0.5)       # the O is untouched
+        self.assertAlmostEqual(min(front), -FRONT_YAW_AMPLITUDE, delta=0.5)
         rest = _unwrapped([value for value, _ in angles[split + 1:]])
         self.assertEqual(rest, sorted(rest))
         self.assertGreater(rest[0], FRONT_YAW_AMPLITUDE)                        # starts on the side
@@ -883,6 +1058,66 @@ class AutoCameraVisibilityTests(unittest.TestCase):
         self.assertEqual(len(o_only), 73)
         yaws = [abs(_orbit_angles(sample, pivot)[0]) for sample in o_only]
         self.assertAlmostEqual(max(yaws), FRONT_YAW_AMPLITUDE, delta=1e-3)
+
+    def test_no_lap_path_is_the_front_alone_ending_on_three_oclock(self):
+        """`orbit_end` 0 = "the front O alone": every frame the O's, no tail, no phantom crane.
+
+        The tail the 0.92 share used to leave for a lap with *no azimuth left* still ran that lap's
+        elevation arc: a 38 deg crane crammed into the last ~6 frames. Measured on the real subject
+        that cost ~56 px/frame against a 14 px cap at EVERY rung of the amplitude ladder, so the
+        cap could never be met, the fit chose its winner off a flat 55-60 px curve (1.15x by noise)
+        and the clip ended on a crank instead of on 3 o'clock.
+        """
+        pivot = [0.0, 0.0, 0.0]
+        samples = subject_samples(73, pivot, 5.0, 1.0, 1.0, 0.0, ORBIT_DIRECTION_DEFAULT)
+        self.assertEqual(len(samples), 73)                 # all frames belong to the O
+        angles = [_orbit_angles(sample, pivot) for sample in samples]
+        elevations = [value for _yaw, value in angles]
+        # the elevation stays inside the O's own envelope: no 38 deg lap arc hiding in the tail
+        self.assertLessEqual(max(elevations), FRONT_ELEVATION + 1e-6)
+        self.assertGreaterEqual(min(elevations), -FRONT_ELEVATION - 1e-6)
+        # frame 0 is the centre of the O, the path pans up to 12 o'clock first ...
+        self.assertAlmostEqual(angles[0][0], 0.0, places=6)
+        self.assertAlmostEqual(angles[0][1], 0.0, places=6)
+        self.assertAlmostEqual(max(elevations[:40]), FRONT_ELEVATION, delta=0.1)
+        # ... and the LAST frame sits on 3 o'clock at level elevation - the clip ends where the
+        # concluding orbit would take over from
+        self.assertAlmostEqual(angles[-1][0], FRONT_YAW_AMPLITUDE, places=4)
+        self.assertAlmostEqual(angles[-1][1], 0.0, places=4)
+        # the reported split says the same thing, and 'clockwise' mirrors the landing point
+        self.assertEqual(balanced_front_share(FRONT_YAW_AMPLITUDE, 0.0), 1.0)
+        mirrored = subject_samples(73, pivot, 5.0, 1.0, 1.0, 0.0, "clockwise")
+        self.assertAlmostEqual(_orbit_angles(mirrored[-1], pivot)[0], -FRONT_YAW_AMPLITUDE,
+                               places=4)
+
+    def test_zero_end_estimate_stays_under_the_cap_and_keeps_a_real_front_orbit(self):
+        """The production settings (v23: 73 frames, fill 25, speed 5 %, end 0): cap met, real O.
+
+        With the phantom tail the cap was unreachable (measured 55.6 px/frame vs a 14 px cap), so
+        no rung of the ladder could win and the front's width was effectively noise. The same
+        request must now land inside the cap with an orbit wide enough to read as one - and every
+        emitted key's aim must be the pivot itself, which is what puts the pivot in the middle of
+        the screen for every frame (all `look` values are identical, so the renderer's Catmull-Rom
+        interpolation of them is that same point).
+        """
+        depth = _depth_with_subject(near=1.0, far=1.6)
+        mask = torch.zeros(64, 64)
+        mask[20:44, 20:44] = 1.0
+        document, summary = _estimate(depth, subject_mask=mask, subject_fill=25.0,
+                                      max_speed=0.05, orbit_end=0.0)
+        self.assertTrue(summary["visibility_ok"])
+        self.assertLessEqual(summary["drift_px"], summary["drift_cap_px"] * 1.01)
+        self.assertEqual(summary["orbit_end_deg"], 0.0)
+        self.assertEqual(summary["front_share"], 1.0)          # every frame is the O's
+        self.assertGreaterEqual(summary["front_yaw_deg"], 15.0)  # an orbit, not a wobble
+        keys = json.loads(document)["path"]
+        aim = {tuple(key["look"]) for key in keys}
+        self.assertEqual(len(aim), 1)                          # one aim for the whole clip ...
+        unit = summary["median_depth"]
+        want = [value / unit for value in summary["pivot"]]
+        got = list(aim)[0]
+        for axis in range(3):                                  # ... and it is exactly the pivot
+            self.assertAlmostEqual(got[axis], want[axis], delta=2e-6)
 
     def test_orbit_direction_widget_mirrors_the_path(self):
         """'clockwise' mirrors the whole path: the O ends on the subject's left and the lap runs the
@@ -1041,6 +1276,363 @@ class AutoCameraSceneTests(unittest.TestCase):
                 for key in json.loads(document)["path"]]
         self.assertLessEqual(max(yaws), SCENE_YAW_LIMIT + 5.0)
         self.assertIn("survey", json.loads(document)["description"])
+
+
+class AutoCameraOrbitShapeTests(unittest.TestCase):
+    """Auto Orbit View Angle + Auto Orbit Coverage: where the fixed circle sits and what it adds.
+
+    The front O is a 45 deg circle on the pivot's sphere now (`FRONT_ORBIT_AMPLITUDE` both ways), so
+    "where do I stand" and "how much do I see" are two separate questions: the view angle turns the
+    whole choreography around the subject's vertical axis, the coverage picks between the O alone
+    ("Front only") and the O plus the shortest level connection to a mirrored O on the far side
+    ("Front and Back"). This is the balance the rework is about - the far side used to be reached by
+    a full 360 deg lap with its 38 deg crane, i.e. the long way round the subject.
+    """
+
+    def test_view_angle_offsets_the_whole_path(self):
+        """The O, the connection and the far O all move with the view angle - nothing else does."""
+        pivot = [0.0, 0.0, 0.0]
+        plain = subject_samples(73, pivot, 5.0, 1.0, 1.0, None, ORBIT_DIRECTION_DEFAULT,
+                                view_angle=0.0, coverage=ORBIT_COVERAGES[1])
+        turned = subject_samples(73, pivot, 5.0, 1.0, 1.0, None, ORBIT_DIRECTION_DEFAULT,
+                                 view_angle=90.0, coverage=ORBIT_COVERAGES[1])
+        for before, after in zip(plain, turned):
+            before_angles, after_angles = _orbit_angles(before, pivot), _orbit_angles(after, pivot)
+            self.assertAlmostEqual(_wrap_delta(after_angles[0], before_angles[0]), 90.0, places=4)
+            self.assertAlmostEqual(after_angles[1], before_angles[1], places=6)
+        # frame 0 is the middle of the O, so it sits exactly on the view angle
+        self.assertAlmostEqual(_orbit_angles(turned[0], pivot)[0], 90.0, places=6)
+        self.assertAlmostEqual(_orbit_angles(turned[0], pivot)[1], 0.0, places=6)
+        # the default view angle IS the frontal view the old path opened on
+        self.assertEqual(ORBIT_VIEW_ANGLE_DEFAULT, 0.0)
+
+    def test_the_front_circle_is_a_circle_on_the_pivots_sphere(self):
+        """45 deg swing and 45 deg rise, one radius: the camera keeps its distance to the pivot."""
+        pivot = [0.0, 0.0, 0.0]
+        amplitude, _ = front_amplitudes()
+        samples = subject_samples(73, pivot, 5.0, 1.0, 1.0, None, ORBIT_DIRECTION_DEFAULT,
+                                  view_angle=0.0, coverage=ORBIT_COVERAGES[0])
+        self.assertEqual(len(samples), 73)
+        for sample in samples:
+            self.assertAlmostEqual(math.dist(sample, pivot), 5.0, places=6)   # a circle, not an O
+        angles = [_orbit_angles(sample, pivot) for sample in samples]
+        azimuths = [value for value, _ in angles]
+        elevations = [value for _yaw, value in angles]
+        self.assertAlmostEqual(max(azimuths), amplitude, delta=0.5)
+        self.assertAlmostEqual(min(azimuths), -amplitude, delta=0.5)
+        self.assertAlmostEqual(max(elevations), amplitude, delta=0.5)
+        self.assertAlmostEqual(min(elevations), -amplitude, delta=0.5)
+
+    def test_front_only_coverage_is_the_circle_alone(self):
+        """'Front only' ships the O and nothing else: no connection, no far O, no tail."""
+        pivot = [0.0, 0.0, 0.0]
+        amplitude, _ = front_amplitudes()
+        samples = subject_samples(73, pivot, 5.0, 1.0, 1.0, None, ORBIT_DIRECTION_DEFAULT,
+                                  view_angle=0.0, coverage=ORBIT_COVERAGES[0])
+        angles = [_orbit_angles(sample, pivot) for sample in samples]
+        azimuths = [value for value, _ in angles]
+        self.assertLessEqual(max(azimuths), amplitude + 1e-6)   # never leaves the front sector
+        self.assertGreaterEqual(min(azimuths), -amplitude - 1e-6)
+        # ... and the front share says every frame belongs to the O
+        self.assertEqual(_front_travel_share(amplitude, 0.0, False), 1.0)
+
+    def test_the_front_o_begins_its_sweep_at_two_oclock(self):
+        """The crane from the middle now lands on 2 o'clock (it used to land on the top, 12) and
+        the sweep runs the REST of the circle from there - 330 deg of it - still landing on the
+        level side at 3, so the connection, the back part and the clip's end keep their poses.
+        'clockwise' mirrors the opening to 10 o'clock and the landing to 9."""
+        amplitude, _ = front_amplitudes()
+        middle = _orbit_point(0.0, 0.0, amplitude, 1.0)             # frame 0: the middle of the O
+        self.assertAlmostEqual(middle[0], 0.0, delta=1e-9)
+        self.assertAlmostEqual(middle[1], 0.0, delta=1e-9)
+        two = _orbit_point(FRONT_ORBIT_RISE, 0.0, amplitude, 1.0)    # the crane's landing pose
+        self.assertAlmostEqual(two[0], amplitude * math.cos(math.radians(30.0)), delta=1e-9)
+        self.assertAlmostEqual(two[1], amplitude * math.sin(math.radians(30.0)), delta=1e-9)
+        end = _orbit_point(1.0, 0.0, amplitude, 1.0)
+        self.assertAlmostEqual(end[0], amplitude, delta=1e-6)        # ... and still 3 o'clock,
+        self.assertAlmostEqual(end[1], 0.0, delta=1e-6)              #     level elevation
+        mirrored = _orbit_point(FRONT_ORBIT_RISE, 0.0, amplitude, -1.0)
+        self.assertAlmostEqual(mirrored[0], -amplitude * math.cos(math.radians(30.0)), delta=1e-9)
+        self.assertAlmostEqual(mirrored[1], amplitude * math.sin(math.radians(30.0)), delta=1e-9)
+        mirrored_end = _orbit_point(1.0, 0.0, amplitude, -1.0)
+        self.assertAlmostEqual(mirrored_end[0], -amplitude, delta=1e-6)
+        self.assertAlmostEqual(mirrored_end[1], 0.0, delta=1e-6)
+
+    def test_front_and_back_coverage_follows_the_back_clock(self):
+        """The front O, the shortest LEVEL connection, and the back orbit as a full clock loop.
+
+        The connection stops at the first point of the back orbit it can reach - the orbit's level
+        point on the arrival side, the back clock's "9 o'clock" - and the loop starts exactly there
+        and sweeps clockwise 9 -> 12 (over the back's head) -> 3 (the far level point) -> 6 (under
+        the back) -> 8, one hour short of its start so the closing frames never repeat the opening
+        pose - and a final glide from 8 in to the dial's CENTRE: the level pose straight behind the
+        subject, the mirror of the front O's own opening (its circle's middle).
+        """
+        pivot = [0.0, 0.0, 0.0]
+        amplitude, _ = front_amplitudes()
+        samples = subject_samples(73, pivot, 5.0, 1.0, 1.0, None, ORBIT_DIRECTION_DEFAULT,
+                                  view_angle=0.0, coverage=ORBIT_COVERAGES[1])
+        angles = [_orbit_angles(sample, pivot) for sample in samples]
+        azimuths = _unwrapped([value for value, _ in angles])
+        # it opens on the middle of the front O and visits one pass around the subject: -A, over the
+        # front, +A, level out to the back, then the full loop that reaches +A on the far side
+        self.assertAlmostEqual(azimuths[0], 0.0, delta=1e-6)
+        self.assertAlmostEqual(angles[0][1], 0.0, delta=1e-6)
+        self.assertAlmostEqual(min(azimuths), -amplitude, delta=0.5)
+        self.assertAlmostEqual(max(azimuths), ORBIT_COVERAGE_DEGREES + amplitude, delta=0.5)
+        # the connection hands over at the back clock's 9 o'clock: the continuous pose falls between
+        # two samples, so its last level frame sits just short of it and the loop's first frame just
+        # past it - and NO level frame ever runs through the connection's own azimuth range again
+        # (the only level pose beyond the handover is the glide's HOME: the dial's centre at 180)
+        nine = ORBIT_COVERAGE_DEGREES - amplitude
+        home = ORBIT_COVERAGE_DEGREES
+        level_yaws = [azimuths[index] for index in range(len(angles))
+                      if abs(angles[index][1]) < 1e-9]
+        self.assertTrue(all(yaw <= nine + 1e-6 or _wrap_delta(yaw, home) < 1e-6
+                            for yaw in level_yaws))
+        self.assertGreater(max(level_yaws), nine - 12.0)        # the handover really happens
+        last_level = max(index for index, (_yaw, elevation) in enumerate(angles)
+                         if abs(elevation) < 1e-9 and azimuths[index] <= nine + 1e-6)
+        loop = angles[last_level + 1:]
+        self.assertGreater(len(loop), 20)                      # the loop owns the tail of the clip
+        # ... and the loop is a FULL circle: over the back's head (+A) and under it (-A), both
+        # straight behind the subject (its middle azimuth)
+        apex_yaw, apex_elevation = max(loop, key=lambda pose: pose[1])
+        bottom_yaw, bottom_elevation = min(loop, key=lambda pose: pose[1])
+        # the apex/bottom sit at the back's middle azimuth, where atan2 wraps (+-180): compare the
+        # circular difference, the sample may land a few degrees either side of it
+        self.assertAlmostEqual(apex_elevation, amplitude, delta=1.5)
+        self.assertAlmostEqual(_wrap_delta(apex_yaw, ORBIT_COVERAGE_DEGREES), 0.0, delta=3.0)
+        self.assertAlmostEqual(bottom_elevation, -amplitude, delta=1.5)
+        self.assertAlmostEqual(_wrap_delta(bottom_yaw, ORBIT_COVERAGE_DEGREES), 0.0, delta=3.0)
+        # ... the loop still passes 8 o'clock (az 180 - 0.866A, el -A/2) and then glides HOME: the
+        # closing pose is the dial's centre - level, straight behind the subject - instead of the
+        # clock's lower tick
+        eight_yaw = ORBIT_COVERAGE_DEGREES - 0.8660254 * amplitude
+        self.assertTrue(any(abs(yaw - eight_yaw) < 8.0 and abs(elevation + 0.5 * amplitude) < 6.0
+                            for yaw, elevation in angles[last_level + 1:]))
+        self.assertAlmostEqual(angles[-1][0], ORBIT_COVERAGE_DEGREES, delta=1e-6)
+        self.assertAlmostEqual(angles[-1][1], 0.0, delta=1e-6)
+        gap = math.hypot(angles[-1][0] - angles[last_level][0],
+                         angles[-1][1] - angles[last_level][1])
+        self.assertGreater(gap, 10.0)                           # never re-lands on 9 o'clock
+        for sample in samples:                                  # every phase keeps the radius
+            self.assertAlmostEqual(math.dist(sample, pivot), 5.0, places=6)
+
+    def test_the_back_loop_never_re_flies_the_connection(self):
+        """No redundant frames: the loop never walks back along the level connection.
+
+        The old junction ran the connection all the way to the back circle's *middle* and the back
+        orbit then swung back over the same level azimuth (measured: 44.5 deg of backwards azimuth
+        on top of the front O's own 45 - the same poses twice). Now the connection stops where the
+        loop begins, the loop climbs away from the level line immediately, and every near-level
+        frame of the loop lies outside the connection's azimuth range: measured 0 retracing frames
+        (see `q_loop.py`).
+        """
+        pivot = [0.0, 0.0, 0.0]
+        amplitude, _ = front_amplitudes()
+        samples = subject_samples(73, pivot, 5.0, 1.0, 1.0, None, ORBIT_DIRECTION_DEFAULT,
+                                  view_angle=0.0, coverage=ORBIT_COVERAGES[1])
+        poses = [_orbit_angles(sample, pivot) for sample in samples]
+        azimuths = _unwrapped([value for value, _ in poses])
+        # the connection's true end is the 9 o'clock pose; the shared pose falls between two samples,
+        # so measure the run by the level frames themselves: every level frame is either ON the
+        # connection (at or below its handover) or - the only exception - the glide's HOME pose at
+        # the dial's centre, which is where the whole path ends
+        nine = ORBIT_COVERAGE_DEGREES - amplitude
+        home = ORBIT_COVERAGE_DEGREES
+        level_yaws = [azimuths[index] for index in range(len(poses))
+                      if abs(poses[index][1]) < 1e-9]
+        self.assertTrue(all(yaw <= nine + 1e-6 or _wrap_delta(yaw, home) < 1e-6
+                            for yaw in level_yaws))
+        junction = max(index for index, (yaw, elevation) in enumerate(poses)
+                       if abs(elevation) < 1e-9 and azimuths[index] <= nine + 1e-6)
+        retracing = 0
+        for index in range(junction + 1, len(poses)):
+            yaw, elevation = azimuths[index], poses[index][1]
+            if abs(elevation) < 5.0 and amplitude + 1.0 < yaw < nine - 5.0:
+                retracing += 1                                  # a level frame inside the
+        self.assertEqual(retracing, 0)                          # connection's own run = re-flying it
+        # the loop leaves the level line immediately (it climbs toward 12 o'clock), so the level
+        # frames after the junction are the clock's own ticks and the glide's last steps settling
+        # at home - all of them BEYOND the loop's start, none inside the connection's run
+        self.assertGreater(poses[junction + 1][1], 1.0)
+        near_level = [azimuths[index] for index in range(junction + 1, len(poses))
+                      if abs(poses[index][1]) < 0.5]
+        self.assertTrue(all(yaw > nine - 1e-6 for yaw in near_level))
+        self.assertLessEqual(len(near_level), 4)
+
+
+    def test_front_only_is_the_cheapest_visit_and_the_far_side_costs_less_azimuth(self):
+        """What the rework buys: 'Front only' is one circle, and the far side is 270 deg, not 405.
+
+        The far side is reached by the shortest level connection plus the back clock's loop, so the
+        azimuth the camera sweeps drops from 405 deg (the old 360 deg end, which still paid for the
+        front O's own half) to 270 (-A .. 180 + A), and the old lap's 45 deg crane at the back is
+        gone. The full back loop (9 -> 12 -> 3 -> 6 -> 8, then the glide to the back's centre) is
+        what the frames buy: it costs a little more than the old lap did in world travel - the
+        front sweep alone grew from 270 to 330 deg - and 'Front only' stays the cheap option at a
+        quarter of the price, so the speed cap decides from there (see `_cut_back_span`).
+        """
+        pivot = [0.0, 0.0, 0.0]
+        amplitude, _ = front_amplitudes()
+        alone = subject_samples(73, pivot, 5.0, 1.0, 1.0, None, ORBIT_DIRECTION_DEFAULT,
+                                view_angle=0.0, coverage=ORBIT_COVERAGES[0])
+        both = subject_samples(73, pivot, 5.0, 1.0, 1.0, None, ORBIT_DIRECTION_DEFAULT,
+                               view_angle=0.0, coverage=ORBIT_COVERAGES[1])
+        legacy = subject_samples(73, pivot, 5.0, 1.0, 1.0, FULL_CIRCLE, ORBIT_DIRECTION_DEFAULT)
+
+        def span(samples):
+            values = _unwrapped([_orbit_angles(sample, pivot)[0] for sample in samples])
+            return max(values) - min(values)
+
+        self.assertLess(_travelled(alone), _travelled(both))          # a back loop costs travel
+        self.assertLess(_travelled(alone), _travelled(legacy))        # ... and a lap costs travel
+        # the full back loop costs a little more than the old lap (270 deg of azimuth, but a 330
+        # deg arc at the O's radius PLUS the front sweep's 330 deg and the glide home - measured
+        # 54.9 vs 46.6 world units = +8.3); 'Front only' must still be clearly cheaper than both
+        self.assertAlmostEqual(_travelled(both), _travelled(legacy), delta=12.0)
+        self.assertAlmostEqual(span(both), ORBIT_COVERAGE_DEGREES + 2.0 * amplitude, delta=2.0)
+        self.assertAlmostEqual(span(legacy), FULL_CIRCLE + amplitude, delta=1.0)   # the old round
+
+    def test_clockwise_mirrors_the_whole_shape(self):
+        """Direction still mirrors everything - the view angle stays where the user put it."""
+        pivot = [0.0, 0.0, 0.0]
+        amplitude, _ = front_amplitudes()
+        samples = subject_samples(73, pivot, 5.0, 1.0, 1.0, None, "clockwise",
+                                  view_angle=90.0, coverage=ORBIT_COVERAGES[1])
+        angles = [_orbit_angles(sample, pivot) for sample in samples]
+        azimuths = _unwrapped([value for value, _ in angles])
+        self.assertAlmostEqual(max(azimuths), 90.0 + amplitude, delta=1.0)
+        self.assertAlmostEqual(min(azimuths), 90.0 - ORBIT_COVERAGE_DEGREES - amplitude, delta=1.0)
+
+    def test_the_envelope_makes_room_for_the_far_circle_only_when_it_runs(self):
+        """The room check sees the front extremes, the connection and (only) a full far O."""
+        amplitude, _ = front_amplitudes()
+        front = _envelope_angles(1.0, include_back=True, view_angle=None, coverage=ORBIT_COVERAGES[0])
+        back = _envelope_angles(1.0, include_back=True, view_angle=None, coverage=ORBIT_COVERAGES[1])
+        turned = _envelope_angles(1.0, include_back=True, view_angle=90.0,
+                                  coverage=ORBIT_COVERAGES[1])
+        self.assertLessEqual(max(yaw for yaw, _ in front), amplitude + 1e-6)
+        self.assertAlmostEqual(max(yaw for yaw, _ in back),
+                               ORBIT_COVERAGE_DEGREES + amplitude, delta=1e-6)
+        self.assertAlmostEqual(min(yaw for yaw, _ in back), -amplitude, delta=1e-6)
+        self.assertAlmostEqual(max(yaw for yaw, _ in turned),
+                               90.0 + ORBIT_COVERAGE_DEGREES + amplitude, delta=1e-6)
+        # a cut connection must NOT reserve room for a far O that never runs
+        cut = _envelope_angles(1.0, include_back=True, view_angle=None, coverage=ORBIT_COVERAGES[1],
+                               back_span=10.0)
+        self.assertAlmostEqual(max(yaw for yaw, _ in cut), amplitude + 10.0, delta=1e-6)
+        # ... and the back orbit's own loop ticks: level at its 9 o'clock edge (the connection's end),
+        # +A over the back's head, -A under it, and the far 3 o'clock edge on the other side
+        arc = [(yaw, elevation) for yaw, elevation in back if yaw >= ORBIT_COVERAGE_DEGREES - 90.0]
+        self.assertAlmostEqual(max(elevation for _yaw, elevation in arc), amplitude, delta=1e-9)
+        self.assertAlmostEqual(min(elevation for _yaw, elevation in arc), -amplitude, delta=1e-9)
+        self.assertAlmostEqual(max(yaw for yaw, _e in arc),
+                               ORBIT_COVERAGE_DEGREES + amplitude, delta=1e-9)   # 3 o'clock
+        self.assertTrue(any(abs(yaw - (ORBIT_COVERAGE_DEGREES - amplitude)) < 1e-9
+                            for yaw, _e in arc))                  # 9 o'clock (the arrival point)
+
+    def test_estimate_reports_the_view_angle_and_the_coverage(self):
+        """Both modes stay inside the speed cap and say what they did in the summary.
+
+        The speed cap is the only thing allowed to shorten the path, and it takes it out of the FAR
+        part first (`_cut_back_span`): a tight cap flies the front O with a cut connection and says
+        so, a roomy one flies the whole front + back visit.
+        """
+        depth = _depth_with_subject(near=1.0, far=1.6)
+        mask = torch.zeros(64, 64)
+        mask[20:44, 20:44] = 1.0
+        circle = _estimate(depth, subject_mask=mask, subject_fill=25.0, max_speed=0.05,
+                           view_angle=90.0, coverage=ORBIT_COVERAGES[0])[1]
+        self.assertEqual(circle["coverage"], ORBIT_COVERAGES[0])
+        self.assertEqual(circle["view_angle_deg"], 90.0)
+        self.assertTrue(circle["visibility_ok"])
+        self.assertLessEqual(circle["drift_px"], circle["drift_cap_px"] * 1.01)
+        self.assertEqual(circle["lap_span_deg"], 0.0)             # nothing beyond the circle
+        self.assertFalse(circle["back_orbit"])
+        self.assertGreaterEqual(circle["front_yaw_deg"], 5.0)     # a real orbit, not a wobble
+        self.assertLessEqual(circle["orbit_coverage_deg"], 2.0 * circle["front_yaw_deg"] + 1e-6)
+        self.assertIn("front circle only", format_summary(circle))   # no back visit is claimed
+        for speed in (0.05, 0.6):                                 # the front + back visit
+            _document, summary = _estimate(depth, subject_mask=mask, subject_fill=25.0,
+                                           max_speed=speed, view_angle=90.0,
+                                           coverage=ORBIT_COVERAGES[1])
+            self.assertEqual(summary["coverage"], ORBIT_COVERAGES[1])
+            self.assertEqual(summary["view_angle_deg"], 90.0)
+            self.assertTrue(summary["visibility_ok"])
+            self.assertLessEqual(summary["drift_px"], summary["drift_cap_px"] * 1.01)
+            self.assertGreater(summary["lap_span_deg"], 0.0)      # the far side is reached
+            self.assertLessEqual(summary["lap_span_deg"],
+                                 ORBIT_COVERAGE_DEGREES - 2.0 * summary["front_yaw_deg"] + 1e-6)
+            self.assertIn("back connection", format_summary(summary))
+
+    def test_the_far_part_gives_way_first_when_the_budget_is_tight(self):
+        """The cut is taken out of the connection, never out of the front O (the user's move)."""
+        roomy = _fit_orbit_world(73, [0.0, 0.0, 0.0], 5.0, None, 1.0, 100.0,
+                                 direction=ORBIT_DIRECTION_DEFAULT, view_angle=0.0,
+                                 coverage=ORBIT_COVERAGES[1])[3]
+        tight = _fit_orbit_world(73, [0.0, 0.0, 0.0], 5.0, None, 1.0, 0.02,
+                                 direction=ORBIT_DIRECTION_DEFAULT, view_angle=0.0,
+                                 coverage=ORBIT_COVERAGES[1])[3]
+        self.assertTrue(roomy["back_orbit"])                      # a roomy cap flies the far O
+        self.assertAlmostEqual(roomy["back_span"],
+                               ORBIT_COVERAGE_DEGREES - 2.0 * roomy["front_yaw"], delta=1e-6)
+        self.assertFalse(tight["back_orbit"])                     # a tight one cuts the far side
+        self.assertLess(tight["back_span"], roomy["back_span"])
+        self.assertGreater(tight["back_span"], 0.0)
+
+    def test_the_legacy_orbit_end_path_is_untouched(self):
+        """Without a coverage mode the old choreography still runs (saved workflows, callers)."""
+        pivot = [0.0, 0.0, 0.0]
+        legacy = subject_samples(73, pivot, 5.0, 1.0, 1.0, 270.0, ORBIT_DIRECTION_DEFAULT)
+        angles = [_orbit_angles(sample, pivot) for sample in legacy]
+        azimuths = _unwrapped([value for value, _ in angles])
+        elevations = [value for _yaw, value in angles]
+        split = _front_split(73, 1.0, 1.0, 270.0)
+        self.assertAlmostEqual(max(azimuths), 270.0, delta=1e-3)     # the requested end is honoured
+        self.assertGreater(max(azimuths), ORBIT_COVERAGE_DEGREES + 45.0)   # a lap, not 270+2A
+        self.assertAlmostEqual(max(elevations[split:]), REST_ELEVATION_HIGH, delta=0.5)  # back crane
+        self.assertAlmostEqual(azimuths[0], 0.0, delta=1e-6)         # still opens on the front pose
+
+
+class AutoCameraOrbitAngleTests(unittest.TestCase):
+    """The node's O Orbit Angle (`orbit_amplitude`) scales the front O for one estimate."""
+
+    def test_resolve_clamps_the_widget_value(self):
+        self.assertAlmostEqual(resolve_front_orbit_amplitude(None), FRONT_ORBIT_AMPLITUDE)
+        self.assertAlmostEqual(resolve_front_orbit_amplitude(0.0), FRONT_ORBIT_AMPLITUDE)
+        self.assertAlmostEqual(resolve_front_orbit_amplitude(-10.0), FRONT_ORBIT_AMPLITUDE)
+        self.assertAlmostEqual(resolve_front_orbit_amplitude(1.0), FRONT_ORBIT_ANGLE_MIN)
+        self.assertAlmostEqual(resolve_front_orbit_amplitude(90.0), FRONT_ORBIT_LIMIT)
+        self.assertAlmostEqual(resolve_front_orbit_amplitude(30.0), 30.0)
+
+    def test_the_override_is_active_inside_the_estimate_and_then_restored(self):
+        seen = []
+
+        def depth_fn(reference):
+            seen.append(front_orbit_amplitude())
+            return _depth_with_subject()
+
+        self.assertAlmostEqual(front_orbit_amplitude(), FRONT_ORBIT_AMPLITUDE, places=6)
+        _estimate(None, depth_fn=depth_fn, orbit_amplitude=25.0)
+        self.assertEqual(seen, [25.0])            # the radius was in effect while the path was built
+        self.assertAlmostEqual(front_orbit_amplitude(), FRONT_ORBIT_AMPLITUDE, places=6)
+        _estimate(None, depth_fn=depth_fn)        # no widget -> the built-in radius
+        self.assertAlmostEqual(seen[-1], FRONT_ORBIT_AMPLITUDE, places=6)
+
+    def test_a_smaller_angle_scales_the_front_orbit_down(self):
+        """The fit keeps its headroom, so the flown O scales with the widget value."""
+        def front_span(signal):
+            keys = json.loads(signal)["path"]
+            pivot = keys[0]["look"]
+            return max(abs(_orbit_angles(key["pos"], pivot)[0]) for key in keys)
+
+        narrow = front_span(_estimate(_depth_with_subject(), subject_fill=40.0, max_speed=0.5,
+                                      orbit_amplitude=20.0)[0])
+        wide = front_span(_estimate(_depth_with_subject(), subject_fill=40.0, max_speed=0.5,
+                                    orbit_amplitude=45.0)[0])
+        self.assertLess(narrow, wide)
 
 
 if __name__ == "__main__":

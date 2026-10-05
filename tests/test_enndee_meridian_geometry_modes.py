@@ -104,7 +104,9 @@ class MeridianGeometryFastDepthTests(unittest.TestCase):
 
     def test_forwards_the_widgets_and_the_da3_depth_resolution(self):
         spec = geometry.EnndeeMeridianGeometry.INPUT_TYPES()["required"]["depth_res"]
-        self.assertEqual(spec[1]["default"], fast_depth.DA3_RES)   # the fast default
+        # the default is the example workflow's value: the still's own side (DA3_RES stays the
+        # model's native grid and the 0 = "keep the still's resolution" sentinel)
+        self.assertEqual(spec[1]["default"], 1920)
         self.assertEqual(spec[1]["min"], 0)                        # 0 = the still's own resolution
         capture = _FastCapture()
         images = torch.zeros(1, 64, 112, 3)

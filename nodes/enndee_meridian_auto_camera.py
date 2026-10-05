@@ -7,7 +7,8 @@ letting the user hand-place one. Two targets:
              close the round around it: the framing solves the distance so the subject fills
              `Auto Subject Fill` percent of the picture (and re-centres the pivot on its projected
              midpoint), then the front O-orbit opens on that framed front pose (the middle of the
-             O), rises to the top of the O (12 o'clock) and swings around to the subject's side -
+             O), rises to 2 o'clock (up and right of the top of the O, where the crane used to land) and
+             swings around to the subject's side -
              counter-clockwise or clockwise, whichever `Auto Orbit Direction` asks for. From there
              the concluding orbit runs `Auto Orbit End` degrees (360 = all the way back to the start
              point, the middle of the O; the elevation arcs up to a new height at the back and back
@@ -65,16 +66,60 @@ AUTO_DEPTH_RES = 504              # DA3 process_res for the surface estimate (st
 MIN_SUBJECT_PIXELS = 64           # absolute floor for a near layer / mask to count as a subject
 MIN_SUBJECT_SHARE = 0.01          # ... plus 1 % of the cloud, so big frames need a real subject
 NO_SUBJECT_SOURCE = "whole surface (no clear near layer)"   # split_subject's "there is no subject"
+MASK_COVERAGE_WARN = 0.90          # a mask above this covers (nearly) the frame: it segments nothing
 PIVOT_PERCENTILE_LOW = 2.0        # per-axis clip before the bounding-box midpoint (robust pivot)
 PIVOT_PERCENTILE_HIGH = 98.0
 SUBJECT_FILL = 2.2                # fallback orbit radius / subject radius (Auto Orbit Distance 0)
 SCENE_FILL = 2.0                  # stand-off for the scene survey (content radii)
 FRONT_ORBIT_RISE = 0.25           # share *of the front loop* spent rising from the framed front
-                                  # pose (yaw 0, elevation 0 = the middle of the O) to its top
-FRONT_YAW_AMPLITUDE = 62.0        # deg, the front O swings this far to either side at scale 1
-FRONT_ELEVATION = 30.0            # deg, the front O reaches this high/low at scale 1
-FRONT_YAW_LIMIT = 85.0            # deg, the front O never swings past this (the sides, not the lap)
-FRONT_ELEVATION_LIMIT = 60.0      # deg, same for the elevation (gimbal lock starts at 70)
+                                  # pose (yaw 0, elevation 0 = the middle of the O) to the sweep's
+                                  # start pose, 2 o'clock (upper right of the circle)
+# The front O is a CIRCLE: the same angular radius in yaw and elevation, so the reading is equally
+# good at every clock position (a 45 deg compromise - a wide flat ellipse showed the sides well but
+# the top/bottom poorly). `FRONT_ORBIT_AMPLITUDE` is that radius at scale 1; the speed fit may grow
+# it up to `FRONT_ORBIT_LIMIT` (gimbal lock starts at 70 deg, so 60 is the ceiling). The old
+# FRONT_YAW_AMPLITUDE / FRONT_ELEVATION / *_LIMIT names are kept as aliases for callers that still
+# import them - they now all mean the one circle radius.
+FRONT_ORBIT_AMPLITUDE = 45.0      # deg, the front O's radius at scale 1 (yaw AND elevation)
+FRONT_ORBIT_LIMIT = 60.0          # deg, the furthest the fit may grow it (gimbal-safe)
+FRONT_ORBIT_ANGLE_DEFAULT = FRONT_ORBIT_AMPLITUDE   # deg, the node's "O Orbit Angle" default
+FRONT_ORBIT_ANGLE_MIN = 5.0       # deg, below this the front O is barely a loop
+FRONT_ORBIT_GROWTH = FRONT_ORBIT_LIMIT / FRONT_ORBIT_AMPLITUDE   # 60/45 - the built-in headroom
+FRONT_YAW_AMPLITUDE = FRONT_ORBIT_AMPLITUDE     # deprecated aliases (the O is a circle now)
+FRONT_ELEVATION = FRONT_ORBIT_AMPLITUDE
+FRONT_YAW_LIMIT = FRONT_ORBIT_LIMIT
+FRONT_ELEVATION_LIMIT = FRONT_ORBIT_LIMIT
+# Where the O's sweep BEGINS on its own clock. The crane from the middle used to land on 12 (the top
+# of the circle); it now lands on FRONT_ORBIT_START_CLOCK = 2 o'clock - 60 deg of clock arc right of
+# the top, i.e. a circle angle of 90 - 30 * hour = 30 deg measured from the 3 o'clock axis - and the
+# sweep runs the REST of the circle from there in the travel direction: counter-clockwise
+# 2 -> 1 -> 12 -> 9 -> 6 -> 3 (330 deg = 360 - the start angle), so the END of the front O - the
+# level side the connection takes over from - is exactly where it always was. 'clockwise' mirrors
+# the start to 10 o'clock and sweeps 10 -> 11 -> 12 -> ... -> 9.
+FRONT_ORBIT_START_CLOCK = 2.0
+FRONT_ORBIT_START_DEGREES = 90.0 - 30.0 * FRONT_ORBIT_START_CLOCK   # 30 deg: 2 o'clock on the circle
+FRONT_ORBIT_SWEEP_DEGREES = 360.0 - FRONT_ORBIT_START_DEGREES       # 330 deg: from 2 around to 3
+
+# The node's "O Orbit Angle" widget overrides the radius for one estimate. The active value is a
+# module global so the deep helpers (`front_amplitudes` / `_amplitude_ceiling`) do not have to
+# thread it through every signature; `estimate_camera_path` sets and restores it around the call.
+_ACTIVE_FRONT_ORBIT_AMPLITUDE = FRONT_ORBIT_AMPLITUDE
+
+
+def front_orbit_amplitude():
+    """The front O's angular radius (deg) in effect for the estimate being built."""
+    return _ACTIVE_FRONT_ORBIT_AMPLITUDE
+
+
+def resolve_front_orbit_amplitude(degrees):
+    """Clamp an O Orbit Angle widget value; None (or <= 0) keeps the built-in radius."""
+    if degrees is None:
+        return FRONT_ORBIT_AMPLITUDE
+    value = _finite(degrees, "O Orbit Angle")
+    if value <= 0.0:
+        return FRONT_ORBIT_AMPLITUDE
+    return min(FRONT_ORBIT_LIMIT, max(FRONT_ORBIT_ANGLE_MIN, value))
+
 
 # Subject framing: the orbit distance is solved so the subject covers `auto_subject_fill` percent of
 # the frame *area* (projected bounding box, 1 %/99 % percentiles plus a silhouette margin), and the
@@ -110,15 +155,49 @@ FRONT_ORBIT_SHARE_LOW = 0.10      # the balanced frame split never starves eithe
 FRONT_ORBIT_SHARE_HIGH = 0.92
 REST_ELEVATION_HIGH = 38.0        # the height the concluding orbit reaches at the subject's back
 LOOP_TRAVEL_FACTOR = 2.0 * math.pi   # the O's arc: 2*pi x A radii per loop of frames (see below)
+# The back orbit's clock and arc (see `_back_orbit_point`). It starts at "9 o'clock" - the pose the
+# level connection hands over to - and sweeps CLOCKWISE: over the subject's back head ("12"), out to
+# the far level point ("3"), down under the back ("6") and back up to "8", one hour short of the
+# start so the closing frames never repeat the opening pose. That is 330 deg of the circle, hence the
+# travel factor (the O's own loop is the full 2*pi; `BACK_ORBIT_CLOCKS` lists the sampled ticks).
+# From 8 o'clock a final GLIDE runs in to the back dial's CENTRE - the level pose straight behind the
+# subject, the mirror of where the front O opened (its own circle's middle) - so the clip settles on
+# a far view instead of stopping on the clock's lower tick. Its travel is one amplitude (the chord
+# from any ring point to the dial centre is exactly A), hence BACK_ORBIT_HOME_FACTOR.
+BACK_ORBIT_CLOCKS = (180.0, 90.0, 0.0, -90.0, -150.0)   # 9, 12, 3, 6, 8 o'clock on the back's clock
+BACK_ORBIT_CLOCK_START = 180.0                       # the arrival pose the connection ends on
+BACK_ORBIT_CLOCK_SWEEP = 330.0                       # ... and the clockwise sweep to 8 o'clock
+BACK_ORBIT_TRAVEL_FACTOR = 2.0 * math.pi * (BACK_ORBIT_CLOCK_SWEEP / 360.0)
+BACK_ORBIT_HOME_FACTOR = 1.0                         # the 8 o'clock -> dial-centre glide, in O radii
 
-# The concluding orbit (the lap after the front O): where it ends and which way it runs. `end` is
-# measured in degrees around the subject from the start azimuth (the middle of the O), so the default
-# 360 brings the camera back to the *start point* - the elevation arc lands on 0 as well, which makes
-# frame N-1 sit on frame 0 (the clip loops). The orbit's *speed* is the hard limit: when the max
-# camera speed cannot pay for the requested end, the lap is cut and the console names the levers.
-ORBIT_END_DEFAULT = 360.0         # deg, back to the start point (the middle of the O)
-ORBIT_END_MIN = 0.0               # 0 = no lap at all: the path is the front O alone
-ORBIT_END_MAX = 720.0             # two rounds; more is never useful
+# The orbit's shape. The "concluding orbit" of earlier versions is gone; two knobs replace it:
+#   * Auto Orbit View Angle - the azimuth the front O is CENTRED on: 0 = the frontal view towards the
+#     subject, +90 = its viewer-left side, 180 = its back, 270/-90 = its right side. The aim stays
+#     the pivot, so the subject keeps its place in the picture - only the side the camera visits
+#     first moves.
+#   * Auto Orbit Coverage - "Front only" (the front O alone, ending on the circle's side) or
+#     "Front and Back" (the front O, the SHORTEST level connection - 180 deg minus the O's own
+#     DIAMETER, straight to the back orbit's near edge - and that back orbit: a full clockwise loop
+#     from the connection's first contact point, the back clock's "9 o'clock", over the subject's
+#     back head ("12"), out to the far level point ("3"), under the back ("6") and back up to "8" -
+#     plus a final glide from 8 in to the dial's centre, the level pose straight behind the
+#     subject). The frames are split between the phases by their travel, so all of them run at the
+#     same per-frame subject drift. When frames x speed cap cannot pay for the whole back part, the
+#     BACK gives way (its sweep is cut and the console names it) - the front O is protected.
+ORBIT_VIEW_ANGLE_DEFAULT = 0.0    # deg, 0 = the orbit is centred on the frontal view
+ORBIT_VIEW_ANGLE_MIN = -180.0
+ORBIT_VIEW_ANGLE_MAX = 360.0
+ORBIT_COVERAGES = ("Front only", "Front and Back")
+ORBIT_COVERAGE_DEFAULT = ORBIT_COVERAGES[1]
+ORBIT_COVERAGE_DEGREES = 180.0    # deg from the front circle's middle to the back circle's middle
+                                  # (the level connection stops one O radius short of this, at the
+                                  # back orbit's own edge - see `_back_orbit_point`)
+# Deprecated predecessors, kept so every saved workflow and old caller still loads. `orbit_end` was
+# the azimuth the path ended at: 0 meant "the front O alone" (now "Front only"), anything larger
+# meant "go round" (now "Front and Back").
+ORBIT_END_DEFAULT = 360.0
+ORBIT_END_MIN = 0.0
+ORBIT_END_MAX = 720.0
 ORBIT_CUT_TARGET = 0.96           # the cut aims a touch *below* the cap: the analytic step lands on
                                   # it, and a path that merely touches the cap still measures a hair
                                   # over it - the margin is what makes the cut rungs *fit*
@@ -291,12 +370,34 @@ def split_subject(points):
 
 
 def subject_points(depth, mask=None):
-    """Subject points plus the label describing their source (a mask wins over the layer)."""
-    if mask is not None:
-        selected = surface_points(depth, mask=mask)
-        if selected.shape[0] >= _minimum_subject_pixels(surface_points(depth).shape[0]):
-            return selected, "input mask"
-    return split_subject(surface_points(depth))
+    """Subject points plus the label describing their source.
+
+    A connected mask is **authoritative**: the pivot (and every subject metric built on it) is
+    computed from the mask's points and nothing else. There is deliberately NO silent fallback to
+    the depth heuristic while a mask is connected - that fallback is what put the pivot into the
+    BACKGROUND: a mask that selects almost nothing (failed segmentation, a muted/empty RMBG run -
+    the RMBG node answers an exception with an all-zero mask) used to drop onto `split_subject`,
+    which answers "the whole surface" as soon as its Otsu cut collapses, and the camera then
+    orbited the centre of the whole cloud instead of the subject. An unusable mask therefore
+    raises, so the failure is visible instead of silently changing what "subject" means.
+    Without a mask the depth heuristic stays as it was (near layer, whole surface as a labelled
+    last resort).
+    """
+    if mask is None:
+        return split_subject(surface_points(depth))
+    points = surface_points(depth)
+    selected = surface_points(depth, mask=mask)
+    needed = _minimum_subject_pixels(points.shape[0])
+    if selected.shape[0] < needed:
+        raise ValueError(
+            f"The subject mask selects only {selected.shape[0]} of {points.shape[0]} pixels "
+            f"(at least {int(needed)} are needed to orbit). The estimate does NOT fall back to the "
+            f"depth heuristic while a mask is connected, because that fallback orbits the whole "
+            f"surface - background included - instead of the subject. Check the mask source "
+            f"(white = subject, e.g. the RMBG MASK output), or disconnect it to let the depth "
+            f"split choose."
+        )
+    return selected, "input mask"
 
 
 def geometric_pivot(points):
@@ -383,14 +484,17 @@ def front_camera(pivot, distance):
 
 
 def front_amplitudes(scale=1.0, size=1.0):
-    """(yaw, elevation) swing of the front O in deg: the built-in amplitudes x scale x size.
+    """(yaw, elevation) swing of the front O in deg: ONE circle radius, scale x size.
 
-    One definition for the path, the fit's ladder and the console, always clamped to the view
-    limits (FRONT_YAW_LIMIT / FRONT_ELEVATION_LIMIT) - the O never swings past the subject's sides.
+    The O is a *circle* (`FRONT_ORBIT_AMPLITUDE` both ways), so the two numbers are equal by
+    construction - a 45 deg compromise between a wide sweep that only shows the sides and a tall one
+    that only shows the top. The tuple shape is kept because the ellipse parameterisation
+    (`yaw = A cos t`, `elevation = A sin t`) is exactly what traces that circle. The fit may grow the
+    radius up to `FRONT_ORBIT_LIMIT` (gimbal-safe); it never swings past it.
     """
     size = max(1e-3, float(size))
-    return (min(FRONT_YAW_LIMIT, FRONT_YAW_AMPLITUDE * float(scale) * size),
-            min(FRONT_ELEVATION_LIMIT, FRONT_ELEVATION * float(scale) * size))
+    amplitude = min(FRONT_ORBIT_LIMIT, front_orbit_amplitude() * float(scale) * size)
+    return amplitude, amplitude
 
 
 def lap_span_for_end(yaw_amplitude, end=None):
@@ -422,8 +526,9 @@ def direction_label(direction=ORBIT_DIRECTION_DEFAULT):
 def balanced_front_share(yaw_amplitude, lap_span):
     """Share of the frames the front O gets so that O and lap run at the *same* per-frame drift.
 
-    The speed cap is per frame, so the frames are the real currency. The O's arc sweeps 270 deg of
-    its envelope in 3/4 of its frames, i.e. at `2*pi*A` radii per loop of frames, while the lap
+    The speed cap is per frame, so the frames are the real currency. The O's arc pays for a whole
+    loop of the circle - the crane to 2 o'clock plus the 330 deg sweep around to 3 - at
+    `2*pi*A` radii per loop of frames, while the lap
     travels its span on the full circle - splitting the frames in that ratio puts both halves at the
     same subject motion, which is the smallest worst-case drift the path can have at this frame
     count (the speed cap's best case). A path without a lap takes (almost) every frame; a very long
@@ -432,7 +537,10 @@ def balanced_front_share(yaw_amplitude, lap_span):
     loop = LOOP_TRAVEL_FACTOR * math.radians(max(0.0, float(yaw_amplitude)))
     lap = math.radians(max(0.0, float(lap_span)))
     if lap <= 1e-9:
-        return FRONT_ORBIT_SHARE_HIGH
+        # No concluding orbit: there is nothing to share the frames with, so the O takes them ALL -
+        # the clip then ends on 3 o'clock (the O's own last pose) instead of spending the last
+        # frames on a lap that has no azimuth left (see `subject_samples`).
+        return 1.0
     return min(FRONT_ORBIT_SHARE_HIGH,
                max(FRONT_ORBIT_SHARE_LOW, loop / (loop + lap)))
 
@@ -516,7 +624,7 @@ def _fill_envelope(points, pivot, distance, surface, size, canvas_area, height):
     a 40 % request, measured). The lap is covered by `_envelope_angles` + `_room_distance` instead -
     a *room* requirement, which can only pull the camera back, never push it in.
     """
-    angles = _envelope_angles(size, include_lap=False)
+    angles = _envelope_angles(size, include_back=False)
     positions = [_place(pivot, distance, yaw, elevation) for yaw, elevation in angles]
     u, v, z = _batch_project(points, positions, pivot, surface, height)
     areas = []
@@ -534,34 +642,61 @@ def _fill_envelope(points, pivot, distance, surface, size, canvas_area, height):
     return min(areas), max(areas)
 
 
-def _envelope_angles(size, include_lap=True, orbit_end=None, direction=ORBIT_DIRECTION_DEFAULT):
-    """(yaw, elevation) sample list of the path's swing envelope at the built-in amplitudes x `size`.
+def _envelope_angles(size, include_back=True, orbit_end=None, direction=ORBIT_DIRECTION_DEFAULT,
+                     view_angle=None, coverage=None, back_span=None):
+    """(yaw, elevation) sample list of the whole path's envelope at the amplitude scale `size`.
 
-    With `include_lap` the concluding orbit's own poses are appended (from the O's side around to
-    `end`, the elevation arcing up to REST_ELEVATION_HIGH at its middle and back down to 0): the far
-    side of that lap - looking back at the subject from behind and above - is the tightest pose in
-    practice, and the room check has to include it.
+    The front O's own extremes first (12/3/6/9 o'clock and the corners, offset to its `view_angle`
+    centre), then - when the path runs a back part - the connection's azimuths (level, the tightest
+    poses in practice: the subject's projected box is tallest at eye level) and, once the connection
+    is complete, the back orbit's loop (its 9 o'clock edge, over the back's head, the far level point,
+    under the back and the 8 o'clock end) plus the glide home to the back dial's centre - the whole
+    visit is what it flies now. The room check and the fill envelope both have to see the tightest
+    pose of the finished path, which is on this list.
     """
-    yaw_amplitude = min(FRONT_YAW_LIMIT, FRONT_YAW_AMPLITUDE * size)
-    elevation_amplitude = min(FRONT_ELEVATION_LIMIT, FRONT_ELEVATION * size)
-    angles = [(yaw_amplitude * yaw_step, elevation_amplitude * elevation_step)
+    amplitude, _ = front_amplitudes(size, 1.0)
+    centre = ORBIT_VIEW_ANGLE_DEFAULT if view_angle is None else float(view_angle)
+    angles = [(centre + amplitude * yaw_step, amplitude * elevation_step)
               for yaw_step in (-1.0, -0.5, 0.0, 0.5, 1.0)
               for elevation_step in (-1.0, 0.0, 1.0)]
-    if not include_lap:
+    if coverage is None:
+        # Compatibility: the older concluding orbit, whose 38 deg height arc is what needs room.
+        span = lap_span_for_end(amplitude, orbit_end)
+        if not include_back or span <= 1e-9:
+            return angles
+        rest_high = min(FRONT_ORBIT_LIMIT, REST_ELEVATION_HIGH * size)
+        mirror = direction_mirror(direction)
+        for fraction in (0.0, 0.25, 0.5, 0.75, 1.0):
+            angles.append((mirror * (amplitude + span * fraction),
+                           rest_high * (1.0 - math.cos(2.0 * math.pi * fraction)) / 2.0))
         return angles
-    span = lap_span_for_end(yaw_amplitude, orbit_end)
-    rest_high = min(FRONT_ELEVATION_LIMIT, REST_ELEVATION_HIGH * size)
-    mirror = direction_mirror(direction)
+    if not include_back or amplitude >= ORBIT_COVERAGE_DEGREES:
+        return angles
+    mode = ORBIT_COVERAGE_DEFAULT if coverage is None else str(coverage)
+    if coverage is None and orbit_end is not None:
+        mode = coverage_for_end(orbit_end)
+    if mode != ORBIT_COVERAGES[1]:
+        return angles                      # "Front only": no back poses to make room for
+    full = max(0.0, ORBIT_COVERAGE_DEGREES - 2.0 * amplitude)   # level, to the back orbit's edge
+    span = full if back_span is None else min(full, max(0.0, float(back_span)))
     if span <= 1e-9:
-        return angles                      # no concluding orbit -> no lap poses to make room for
+        return angles
+    mirror = direction_mirror(direction)
     for fraction in (0.0, 0.25, 0.5, 0.75, 1.0):
-        angles.append((mirror * (yaw_amplitude + span * fraction),
-                       rest_high * (1.0 - math.cos(2.0 * math.pi * fraction)) / 2.0))
+        angles.append((centre + mirror * (amplitude + span * fraction), 0.0))
+    if span >= full - 1e-9:                # the back orbit runs: its own loop needs room as well
+        back = centre + mirror * ORBIT_COVERAGE_DEGREES
+        angles += [_back_orbit_point(_back_clock_progress(clock), back, amplitude, mirror)
+                   for clock in BACK_ORBIT_CLOCKS]      # 9, 12, 3, 6 and 8 o'clock
+        eight_yaw, eight_elevation = _back_orbit_point(1.0, back, amplitude, mirror)
+        angles.append((eight_yaw + (back - eight_yaw) * 0.5,   # the glide home: halfway and at the
+                       eight_elevation * 0.5))                 # back dial's centre (level, far)
+        angles.append((back, 0.0))
     return angles
 
 
 def _room_distance(pool, surface, pivot, distance, size, height, margin_px, orbit_end=None,
-                   direction=ORBIT_DIRECTION_DEFAULT):
+                   direction=ORBIT_DIRECTION_DEFAULT, options=None):
     """Smallest distance >= `distance` that clears the frame at every pose of the whole path.
 
     The counterpart of the fill: the framing may want a close camera for the requested fill, but the
@@ -572,7 +707,8 @@ def _room_distance(pool, surface, pivot, distance, size, height, margin_px, orbi
     the *speed* cap is the only thing allowed to shorten the orbit. Bisection works because pulling
     back shrinks every projection towards the frame centre.
     """
-    angles = _envelope_angles(size, include_lap=True, orbit_end=orbit_end, direction=direction)
+    angles = _envelope_angles(size, include_back=True, orbit_end=orbit_end, direction=direction,
+                              **(options or {}))
 
     def worst(factor):
         positions = [_place(pivot, distance * factor, yaw, elevation) for yaw, elevation in angles]
@@ -593,13 +729,14 @@ def _room_distance(pool, surface, pivot, distance, size, height, margin_px, orbi
 
 
 def _amplitude_ceiling(size):
-    """Largest amplitude scale the view limits allow (FRONT_YAW_LIMIT / _ELEVATION_LIMIT).
+    """Largest amplitude scale the view limits allow (the built-in headroom over the O's angle).
 
-    One definition for the fit's ladder, the visibility pass and the console hint, so a change to
-    the limits can never leave one of them behind.
+    The gimbal-safe ceiling (`FRONT_ORBIT_LIMIT`) fixes how far the fit may grow the O above the
+    node's O Orbit Angle, so this ratio is the same whatever angle is set - a smaller angle yields a
+    proportionally smaller orbit. One definition for the fit's ladder, the visibility pass and the
+    console hint, so a change to the limits can never leave one of them behind.
     """
-    return min(FRONT_YAW_LIMIT / FRONT_YAW_AMPLITUDE,
-               FRONT_ELEVATION_LIMIT / FRONT_ELEVATION) / max(1e-3, float(size))
+    return FRONT_ORBIT_GROWTH / max(1e-3, float(size))
 
 
 def subject_box(surface):
@@ -787,34 +924,41 @@ def _dolly_for_visibility(pool, unit_positions, pivot, distance, surface, height
 
 
 def _path_fits(pool, surface, pivot, distance, scale, size, frames, height, margin_px,
-               orbit_end=None, direction=ORBIT_DIRECTION_DEFAULT):
+               orbit_end=None, direction=ORBIT_DIRECTION_DEFAULT, options=None):
     """Does the subject stay inside the frame at every pose of this amplitude?"""
-    units = subject_samples(frames, pivot, 1.0, scale, size, orbit_end, direction)
+    units = subject_samples(frames, pivot, 1.0, scale, size, orbit_end, direction,
+                            **(options or {}))
     positions = _path_positions(units, pivot, distance)
     return min(visibility_clearances(pool, positions, pivot, surface, height, margin_px)) >= 0.0
 
 
 def _shrink_amplitude(pool, surface, pivot, distance, scale, size, frames, height, margin_px,
-                      orbit_end=None, direction=ORBIT_DIRECTION_DEFAULT):
+                      orbit_end=None, direction=ORBIT_DIRECTION_DEFAULT, options=None):
     """Largest amplitude <= `scale` whose whole path keeps the subject visible.
 
     Shrinking is the *cheap* fix: the front pose - and with it the requested fill - does not move at
     all, only the viewing angles narrow. Pulling the camera back is the expensive one (it shrinks the
     subject everywhere), so the pass always tries this first. Bisection is enough because the
     clearance falls with the swing: a wider loop moves the subject further towards the border.
+
+    When *no* swing keeps the subject in frame - not even `FIT_GROW_STEP` - the crop cannot be the
+    front O's at all (its poses are the ones that move with the amplitude; the offending frames sit
+    in the concluding orbit, whose poses barely change with it). Shrinking then buys nothing, so the
+    incoming `scale` is kept and the caller's dolly does the work: a shrink that cannot fit must
+    never be allowed to cost the user their front orbit.
     """
     scale = max(FIT_GROW_STEP, float(scale))
     if _path_fits(pool, surface, pivot, distance, scale, size, frames, height, margin_px, orbit_end,
-                  direction):
+                  direction, options):
         return scale
     low, high = FIT_GROW_STEP, scale
     if not _path_fits(pool, surface, pivot, distance, low, size, frames, height, margin_px,
-                      orbit_end, direction):
-        return low                      # even the smallest loop does not fit: the dolly must help
+                      orbit_end, direction, options):
+        return scale                      # no swing fits: keep the O, the dolly has to help
     for _ in range(VISIBILITY_BISECTIONS):
         middle = 0.5 * (low + high)
         if _path_fits(pool, surface, pivot, distance, middle, size, frames, height, margin_px,
-                      orbit_end, direction):
+                      orbit_end, direction, options):
             low = middle
         else:
             high = middle
@@ -823,7 +967,7 @@ def _shrink_amplitude(pool, surface, pivot, distance, scale, size, frames, heigh
 
 def enforce_subject_visibility(surface, pivot, distance, scale, size, frames, height=CANVAS_HEIGHT,
                                orbit_end=None, direction=ORBIT_DIRECTION_DEFAULT, pool=None,
-                               recentre=True):
+                               recentre=True, view_angle=None, coverage=None, back_span=None):
     """(distance, pivot, metrics) - no frame of the fitted path may crop the subject.
 
     The fill solve frames the subject in the front pose and keeps its *area* centred along the path;
@@ -847,14 +991,17 @@ def enforce_subject_visibility(surface, pivot, distance, scale, size, frames, he
     0/25/50/75/100 % frames - the console line reports the trade instead of hiding it.
     """
     _, extents = subject_box(surface)
+    # The path this pass guarantees is the path the keys come from - the orbit's own options travel
+    # with it (view angle, coverage mode), so a "Front and Back" round is judged where it really goes.
+    options = path_options(view_angle, coverage, back_span)
     # The pool is the caller's (the cylinder-trimmed 95 % subject) when given, so the guarantee and
     # the framing judge the same points; otherwise the full cloud.
     pool = _decimate(surface["content_cloud"] if pool is None else pool, VISIBILITY_POOL)
     margin_px = VISIBILITY_MARGIN * float(height)
     start = [float(value) for value in pivot]
     amplitude_cap = _shrink_amplitude(pool, surface, pivot, distance, scale, size, frames, height,
-                                      margin_px, orbit_end, direction)
-    units = subject_samples(frames, pivot, 1.0, amplitude_cap, size, orbit_end, direction)
+                                      margin_px, orbit_end, direction, options)
+    units = subject_samples(frames, pivot, 1.0, amplitude_cap, size, orbit_end, direction, **options)
     before = visibility_clearances(pool, _path_positions(units, pivot, distance), pivot,
                                    surface, height, margin_px)
     cropped = sum(1 for value in before if value < 0.0)
@@ -1004,7 +1151,7 @@ def equalize_pivot(surface, pivot, distance, scale, size, frames, orbit_end=None
 
 
 def subject_framing(surface, fill_percent, size=1.0, height=CANVAS_HEIGHT, orbit_end=None,
-                    direction=ORBIT_DIRECTION_DEFAULT):
+                    direction=ORBIT_DIRECTION_DEFAULT, view_angle=None, coverage=None):
     """(distance, pivot, metrics): frame the subject's cylinder to `fill_percent` % of the picture.
 
     The subject is approximated by a vertical cylinder (`fit_subject_cylinder`: robust trimmed fit,
@@ -1049,13 +1196,13 @@ def subject_framing(surface, fill_percent, size=1.0, height=CANVAS_HEIGHT, orbit
         # the horizontal picture centre instead of merely the projected box's.
         low, high = _fill_envelope(points, pivot, distance, surface, size, canvas_area, height)
         distance = max(MIN_ORBIT_RADIUS, distance * math.sqrt(math.sqrt(low * high) / target))
-    # ... and the room the O *and* the concluding orbit need: the fill request may not push the
-    # camera so close that a pose of the path leaves the frame (the far side of the lap is the
-    # tightest pose in practice). This may only pull the camera back, so the distance stays ONE
-    # value for every frame - and the aim stays on the cylinder axis.
+    # ... and the room the O *and* the back part need: the fill request may not push the camera so
+    # close that a pose of the path leaves the frame (the level connection and the far side of the
+    # back orbit are the tightest poses in practice). This may only pull the camera back, so the
+    # distance stays ONE value for every frame - and the aim stays on the cylinder axis.
     room = _room_distance(_decimate(cloud[keep], VISIBILITY_POOL), surface, pivot,
                           distance, size, height, VISIBILITY_MARGIN * float(height), orbit_end,
-                          direction)
+                          direction, path_options(view_angle, coverage))
     distance_fill = distance
     if room > distance:
         distance = max(MIN_ORBIT_RADIUS, room)
@@ -1096,49 +1243,124 @@ def _key_frames(frames, target=KEY_TARGET):
     return ticks
 
 
-def subject_samples(frames, pivot, radius, scale=1.0, size=1.0, orbit_end=None,
+def coverage_for_end(orbit_end=None):
+    """The coverage mode a (DEPRECATED) `orbit_end` asks for: 0 = the front O alone, else round.
+
+    `orbit_end` was replaced by Auto Orbit View Angle + Auto Orbit Coverage; old callers and saved
+    workflows keep working, `orbit_end=0` mapping onto "Front only" and anything larger onto
+    "Front and Back" (the complete front + back).
+    """
+    if orbit_end is None:
+        return ORBIT_COVERAGE_DEFAULT
+    return ORBIT_COVERAGES[0] if float(orbit_end) <= 1e-9 else ORBIT_COVERAGES[1]
+
+
+def path_options(view_angle=None, coverage=None, back_span=None):
+    """The `subject_samples` keywords that shape the path (empty = the legacy choreography).
+
+    One bundle instead of three parameters through the private chain (room check, amplitude shrink,
+    dolly, back cut): every pass that judges the path has to judge the SAME path the keys come from,
+    so the options travel with it.
+    """
+    options = {}
+    if view_angle is not None:
+        options["view_angle"] = float(view_angle)
+    if coverage is not None:
+        options["coverage"] = str(coverage)
+    if back_span is not None:
+        options["back_span"] = float(back_span)
+    return options
+
+
+def _orbit_point(progress, centre, amplitude, mirror, rise=FRONT_ORBIT_RISE):
+    """(yaw, elevation) of one O-orbit at `progress` 0..1: middle -> 2 o'clock -> 3 o'clock.
+
+    Progress 0 is the *middle of the circle* (the pose the framing solved, elevation 0), the first
+    FRONT_ORBIT_RISE of it is the eased crane up and over to the sweep's START - 2 o'clock, the
+    upper right of the circle (the crane used to land on the top, 12) - and the rest sweeps
+    2 -> 1 -> 12 -> 9 -> 6 -> 3 o'clock (counter-clockwise, 330 deg of the circle; `mirror` = -1
+    mirrors everything to a crane to 10 o'clock and a 10 -> 11 -> 12 -> ... -> 9 sweep), ending on
+    the circle's side at level elevation - exactly where the connection takes over, so only the
+    opening of the front O moved. This is the FRONT O's move; the back orbit is the half circle
+    `_back_orbit_point` traces from the connection's first contact point.
+    """
+    progress = min(1.0, max(0.0, float(progress)))
+    start_angle = math.radians(90.0 - mirror * 30.0 * FRONT_ORBIT_START_CLOCK)
+    if progress <= rise:
+        phase = progress / rise
+        eased = (1.0 - math.cos(math.pi * phase)) / 2.0
+        return (centre + amplitude * math.cos(start_angle) * eased,
+                amplitude * math.sin(start_angle) * eased)
+    phase = (progress - rise) / max(1e-9, 1.0 - rise)
+    angle = start_angle + mirror * math.radians(FRONT_ORBIT_SWEEP_DEGREES) * phase
+    return centre + amplitude * math.cos(angle), amplitude * math.sin(angle)
+
+
+def _back_clock_progress(clock):
+    """Where a clock angle sits on the back orbit's arc, 0..1 (9 o'clock = 0, 8 o'clock = 1)."""
+    return (BACK_ORBIT_CLOCK_START - float(clock)) / BACK_ORBIT_CLOCK_SWEEP
+
+
+def _back_orbit_point(progress, centre, amplitude, mirror):
+    """(yaw, elevation) of the back orbit - a full clockwise loop that starts at 9 o'clock.
+
+    The level connection leaves the front O's side at elevation 0 and runs straight to the subject's
+    far side, so the first pose of the back orbit it meets is that orbit's *level point on the
+    arrival side* - the "9 o'clock" of the back clock, whose 12 o'clock is the subject's back head.
+    The loop begins exactly there and sweeps clockwise (on the clock face as seen from behind the
+    subject): 9 -> 12 over the back's head -> 3, the far level point -> 6, under the back -> 8, one
+    hour short of the start, so the closing frames never repeat the opening pose. In the orbit's own
+    terms that is `yaw = centre + mirror*A*cos(clock)`, `elevation = A*sin(clock)` with the clock
+    running from `BACK_ORBIT_CLOCK_START` down by `BACK_ORBIT_CLOCK_SWEEP` - 330 deg of the circle
+    (hence `BACK_ORBIT_TRAVEL_FACTOR`).
+
+    Two things this buys over the older moves. (a) The earlier "concluding orbit" started at the
+    circle's *middle* and had to walk back across the 9 o'clock point the connection had already
+    reached - a 2A degree out-and-back of level azimuth that showed the same poses twice. (b)
+    Beginning on the near edge also lets the connection be 180 - 2A long instead of 180 - A, so the
+    whole visit is shorter: the freed frames go to the front O, whose radius the fit may then grow.
+    The half-loop version (9 -> 12 -> 3) covered the back's upper half only; this one closes the
+    circle and shows the back from below as well. The glide from this ring's 8 o'clock end to the
+    dial's centre is not part of this function - `subject_samples` appends it (it is a straight
+    run to a point OFF the ring, the last pose of the whole path).
+    """
+    progress = min(1.0, max(0.0, float(progress)))
+    angle = math.radians(BACK_ORBIT_CLOCK_START - BACK_ORBIT_CLOCK_SWEEP * progress)
+    return centre + mirror * amplitude * math.cos(angle), amplitude * math.sin(angle)
+
+
+def _legacy_samples(frames, pivot, radius, scale=1.0, size=1.0, orbit_end=None,
                     direction=ORBIT_DIRECTION_DEFAULT, share=None):
-    """Per-frame positions of the subject path: the front O-orbit, then the concluding orbit.
+    """The pre-`coverage` choreography: the front O, then the concluding orbit to `orbit_end`.
 
-    Phase 1 (the front O) opens on the *middle of the O* - the framed front pose (yaw 0, elevation
-    0, the pose the fill solve targets, so frame 0 is that view and its drift is zero) - rises to
-    the top of the O (12 o'clock) within FRONT_ORBIT_RISE of its frames and then swings around,
-    counter-clockwise by default, to the subject's right side (3 o'clock; 'clockwise' mirrors the
-    whole path: 12 -> 3 -> 6 -> 9 o'clock, ending on the left side).
-
-    Phase 2 (the rest of the frames) is the concluding orbit. It starts exactly where the O ended
-    (the side the travel direction just reached) and runs around the subject until it has covered
-    `orbit_end` degrees - measured from the start azimuth. The default 360 brings the camera back to
-    the start point: the elevation arcs up to REST_ELEVATION_HIGH at the lap's middle (the back of
-    the subject gets a new height) and back down to 0, so the last frame sits on the first one and
-    the clip loops. `orbit_end = 0` skips the lap entirely and leaves just the O.
-
-    `share` is the part of the frames the O gets; None uses `balanced_front_share`, the split that
-    gives both phases the same per-frame subject motion (the speed cap's best case).
+    Kept verbatim - its numbers, including the 38 deg height arc at the back - so saved API calls and
+    the older tests behave exactly as they did. It still gets the 45 deg *circle* for the front O
+    (that is `front_amplitudes` now); new callers pass one of `ORBIT_COVERAGES` to `subject_samples`
+    and get the front/back path with the shortest connection instead.
     """
     frames = int(frames)
     size = max(1e-3, float(size))
     yaw_amplitude, elevation_amplitude = front_amplitudes(scale, size)
-    rest_high = min(FRONT_ELEVATION_LIMIT, REST_ELEVATION_HIGH * scale * size)
+    rest_high = min(FRONT_ORBIT_LIMIT, REST_ELEVATION_HIGH * scale * size)
     span = lap_span_for_end(yaw_amplitude, orbit_end)
     mirror = direction_mirror(direction)
-    if share is None:
-        share = balanced_front_share(yaw_amplitude, span)
-    share = min(0.95, max(0.05, float(share)))
+    if span <= 1e-9:
+        share = 1.0                       # no concluding orbit: the O takes every frame
+    else:
+        if share is None:
+            share = balanced_front_share(yaw_amplitude, span)
+        share = min(0.95, max(0.05, float(share)))
     split = max(1.0, (frames - 1) * share)
     rise = max(1.0, split * FRONT_ORBIT_RISE)
     positions = []
     for index in range(frames):
         if index <= split:
             if index <= rise:
-                # the middle of the O -> 12 o'clock: a pure crane move, eased so the first and the
-                # last frame of it are gentle (a beat on the top view, no jump at frame 0)
                 phase = index / rise
                 yaw = 0.0
                 elevation = elevation_amplitude * (1.0 - math.cos(math.pi * phase)) / 2.0
             else:
                 phase = (index - rise) / max(1.0, split - rise)
-                # 12 -> 9 -> 6 -> 3 o'clock for the default, 12 -> 3 -> 6 -> 9 for clockwise
                 angle = math.radians(90.0 + mirror * 270.0 * phase)
                 yaw = yaw_amplitude * math.cos(angle)
                 elevation = elevation_amplitude * math.sin(angle)
@@ -1146,6 +1368,102 @@ def subject_samples(frames, pivot, radius, scale=1.0, size=1.0, orbit_end=None,
             phase = (index - split) / max(1.0, (frames - 1) - split)
             yaw = mirror * (yaw_amplitude + span * phase)      # around the back, back to the start
             elevation = rest_high * (1.0 - math.cos(2.0 * math.pi * phase)) / 2.0
+        positions.append(_place(pivot, radius, yaw, elevation))
+    return positions
+
+
+def subject_samples(frames, pivot, radius, scale=1.0, size=1.0, orbit_end=None,
+                    direction=ORBIT_DIRECTION_DEFAULT, share=None, view_angle=None,
+                    coverage=None, back_span=None):
+    """Per-frame positions of the subject path: the front O, then (optionally) the back O.
+
+    **The front O** is a *circle* (`front_amplitudes`: one radius both ways) centred on the azimuth
+    `view_angle` - 0 = the frontal view towards the subject, +90 = its viewer-left side, 180 = its
+    back, 270/-90 = its right. Frame 0 is the *middle of the circle* (the framed pose, elevation 0,
+    so its drift is zero), the camera then rises to 2 o'clock (an eased crane over FRONT_ORBIT_RISE
+    of the O's frames - up and right of the top, which is what it used to aim at) and sweeps
+    2 -> 1 -> 12 -> 9 -> 6 -> 3 o'clock (counter-clockwise, 330 deg of the circle; 'clockwise'
+    mirrors the whole path to a crane to 10 and a 10 -> ... -> 9 sweep), ending on the circle's side
+    at level elevation.
+
+    **"Front and Back"** (`coverage`) then adds the back orbit: the SHORTEST connection first - a
+    level azimuth sweep from where the front O ended straight to the back orbit's *near edge*, i.e.
+    180 deg minus the O's own DIAMETER, never a round trip and never past the back circle's middle -
+    and then that back orbit from exactly that first contact point (`_back_orbit_point`): a full
+    clockwise loop over the subject's back head (9 -> 12 -> 3 -> 6 -> 8 o'clock, ending one hour
+    short of its start so no pose is shown twice) and a final glide from 8 o'clock in to the back
+    dial's CENTRE - the level pose straight behind the subject, the mirror of the front O's own
+    opening pose. `back_span` shortens the connection (the fit does,
+    when frames x speed cap cannot pay for the whole back part): below the full value the back orbit
+    is skipped and the path simply ends where the sweep stopped, so the front O is never the thing
+    that gives way.
+
+    The frames are split between the phases by their travel, so every phase runs at the same
+    per-frame subject drift (the speed cap's best case). `share` overrides the front O's part.
+
+    Without a `coverage` mode this is the OLDER choreography ("the front O, then a concluding orbit
+    to `orbit_end`") - verbatim, so saved callers behave as before; the new front/back path needs an
+    explicit `ORBIT_COVERAGES` value.
+    """
+    if coverage is None:
+        return _legacy_samples(frames, pivot, radius, scale, size, orbit_end, direction, share)
+    frames = int(frames)
+    size = max(1e-3, float(size))
+    amplitude = front_amplitudes(scale, size)[0]
+    centre = ORBIT_VIEW_ANGLE_DEFAULT if view_angle is None else float(view_angle)
+    mirror = direction_mirror(direction)
+    mode = ORBIT_COVERAGE_DEFAULT if coverage is None else str(coverage)
+    if coverage is None and orbit_end is not None:
+        mode = coverage_for_end(orbit_end)
+    back = mode == ORBIT_COVERAGES[1]
+    # The level connection ends where the back orbit begins: its near edge, one O radius (half the
+    # circle's span) short of the back circle's middle. That is the shortest way to reach the back
+    # at all - the older move went on to the middle and the back orbit then walked back across it.
+    full = max(0.0, ORBIT_COVERAGE_DEGREES - 2.0 * amplitude)
+    connect = min(full, max(0.0, float(back_span))) if (back and back_span is not None) else full
+    if not back or connect <= 1e-9:
+        connect = 0.0
+    run_back = connect >= full - 1e-9 and full > 1e-9        # the back orbit only after a full connection
+    front_travel = LOOP_TRAVEL_FACTOR * math.radians(amplitude)
+    connect_travel = math.radians(connect)
+    back_travel = ((BACK_ORBIT_TRAVEL_FACTOR + BACK_ORBIT_HOME_FACTOR) * math.radians(amplitude)
+                   if run_back else 0.0)
+    rest = connect_travel + back_travel
+    if share is None:
+        total = front_travel + rest
+        front_share = front_travel / total if total > 1e-9 else 1.0
+    else:
+        front_share = min(0.95, max(0.05, float(share)))
+    connect_share = (connect_travel / rest) * (1.0 - front_share) if rest > 1e-9 else 0.0
+    split_front = max(1.0, (frames - 1) * front_share)
+    split_connect = split_front + max(0.0, (frames - 1) * connect_share)
+    positions = []
+    for index in range(frames):
+        if index <= split_front or not rest:
+            # the front O alone when there is no back part - every frame belongs to the circle, so
+            # the clip ends on its side (and never on a tail with nothing left to fly)
+            progress = index / max(1.0, split_front)
+            yaw, elevation = _orbit_point(progress, centre, amplitude, mirror)
+        elif index <= split_connect:
+            phase = (index - split_front) / max(1e-9, split_connect - split_front)
+            yaw = centre + mirror * (amplitude + connect * phase)     # straight to its near edge
+            elevation = 0.0
+        else:
+            phase = (index - split_connect) / max(1e-9, (frames - 1) - split_connect)
+            back_centre = centre + mirror * ORBIT_COVERAGE_DEGREES
+            # The back phase runs its 330 deg ring first and glides home afterwards, the two parts
+            # split by their travel (BACK_ORBIT_TRAVEL_FACTOR : BACK_ORBIT_HOME_FACTOR) so the
+            # hand-off keeps the same per-frame drift as every other phase.
+            ring_share = (BACK_ORBIT_TRAVEL_FACTOR
+                          / (BACK_ORBIT_TRAVEL_FACTOR + BACK_ORBIT_HOME_FACTOR))
+            if phase <= ring_share:
+                yaw, elevation = _back_orbit_point(phase / max(1e-9, ring_share),
+                                                   back_centre, amplitude, mirror)
+            else:
+                glide = (phase - ring_share) / max(1e-9, 1.0 - ring_share)
+                eight_yaw, eight_elevation = _back_orbit_point(1.0, back_centre, amplitude, mirror)
+                yaw = eight_yaw + (back_centre - eight_yaw) * glide
+                elevation = eight_elevation * (1.0 - glide)     # -A/2 at 8 o'clock -> 0, level
         positions.append(_place(pivot, radius, yaw, elevation))
     return positions
 
@@ -1213,6 +1531,11 @@ def _largest_step(samples):
 def _cut_orbit_end(pool, surface, frames, pivot, radius, scale, size, end, direction, cap_px):
     """(end, samples, drift, typical) - the longest concluding orbit the speed cap can pay for.
 
+    The COMPATIBILITY path: without an explicit `coverage` the path keeps the older "front O, then a
+    concluding orbit that runs around to `end` degrees" choreography, so saved API calls and the
+    older tests behave exactly as before. New callers ask for `ORBIT_COVERAGES` instead, which
+    `_cut_back_span` below fits.
+
     The max camera speed is a *hard* limit for the orbit, so when the requested end cannot be paid
     the lap gives way - and only the lap: the O's amplitude was already searched by the ladder, and
     the room the framing needs never cuts anything. With the balanced frame split the path's drift is
@@ -1234,21 +1557,83 @@ def _cut_orbit_end(pool, surface, frames, pivot, radius, scale, size, end, direc
         samples = subject_samples(frames, pivot, radius, scale, size, end, direction)
         drift, typical = subject_drift(pool, samples, pivot, surface)
     return end, samples, drift, typical
+def _cut_back_span(pool, surface, frames, pivot, radius, scale, size, direction, cap_px,
+                   view_angle=None, coverage=None):
+    """(span, samples, drift, typical) - the longest back connection the speed cap can pay for.
+
+    The max camera speed is a *hard* limit, so when the shortest full connection to the back orbit
+    cannot be paid, the BACK gives way - and only the back: the front O's radius was already searched
+    by the ladder, and the room the framing needs never cuts anything. The full connection is
+    `ORBIT_COVERAGE_DEGREES - 2 * amplitude`: it stops where the back orbit *begins* (its near edge,
+    the clock's 9 o'clock), not at the back circle's middle. Cutting it below that also drops the
+    back orbit itself (see `subject_samples`), so
+    the clip simply ends where the sweep stopped, at whatever azimuth that was. One analytic step
+    lands close (the drift falls with the travel), it aims `ORBIT_CUT_TARGET` of the cap rather than
+    the cap itself (a path that exactly touches the cap still measures a hair over it, and then the
+    rung would be rejected), and `ORBIT_CUT_STEPS` rounds converge the rest.
+    """
+    mode = ORBIT_COVERAGE_DEFAULT if coverage is None else str(coverage)
+    amplitude = front_amplitudes(scale, size)[0]
+    full = max(0.0, ORBIT_COVERAGE_DEGREES - 2.0 * amplitude) if mode == ORBIT_COVERAGES[1] else 0.0
+    if full <= 1e-9:                        # "Front only": the front O takes every frame
+        samples = subject_samples(frames, pivot, radius, scale, size, None, direction,
+                                  view_angle=view_angle, coverage=ORBIT_COVERAGES[0])
+        drift, typical = subject_drift(pool, samples, pivot, surface)
+        return 0.0, samples, drift, typical
+    span = full
+    samples = subject_samples(frames, pivot, radius, scale, size, None, direction,
+                              view_angle=view_angle, coverage=ORBIT_COVERAGES[1], back_span=span)
+    drift, typical = subject_drift(pool, samples, pivot, surface)
+    target = cap_px * ORBIT_CUT_TARGET
+    for _ in range(ORBIT_CUT_STEPS):
+        if drift <= target or span <= 1e-9:
+            break
+        span = span * max(0.0, min(1.0, target / max(1e-9, drift)))
+        samples = subject_samples(frames, pivot, radius, scale, size, None, direction,
+                                  view_angle=view_angle, coverage=ORBIT_COVERAGES[1], back_span=span)
+        drift, typical = subject_drift(pool, samples, pivot, surface)
+    return span, samples, drift, typical
 
 
-def _orbit_candidate(pool, surface, frames, pivot, radius, scale, size, end, direction, cap_px):
-    """(scale, samples, drift, typical, info) for one amplitude rung, its orbit cut to the cap."""
-    end, samples, drift, typical = _cut_orbit_end(pool, surface, frames, pivot, radius, scale, size,
-                                                  end, direction, cap_px)
-    yaw_amplitude = front_amplitudes(scale, size)[0]
-    span = max(0.0, end - yaw_amplitude)
-    info = {"front_yaw": yaw_amplitude, "orbit_end": end,
-            "front_share": balanced_front_share(yaw_amplitude, span)}
+def _orbit_candidate(pool, surface, frames, pivot, radius, scale, size, end, direction, cap_px,
+                     view_angle=None, coverage=None):
+    """(scale, samples, drift, typical, info) for one amplitude rung, cut to the speed cap.
+
+    Two flavours. Without an explicit `coverage` the older concluding-orbit choreography is fitted
+    and its `end` cut (`_cut_orbit_end`); with one of `ORBIT_COVERAGES` the front/back path is fitted
+    and its back connection cut (`_cut_back_span`). Either way the BACK gives way first - the front O
+    keeps the radius the ladder found for it.
+    """
+    if coverage is None:
+        end, samples, drift, typical = _cut_orbit_end(pool, surface, frames, pivot, radius, scale,
+                                                      size, end, direction, cap_px)
+        amplitude = front_amplitudes(scale, size)[0]
+        info = {"front_yaw": amplitude, "orbit_end": end,
+                "front_share": balanced_front_share(amplitude, max(0.0, end - amplitude))}
+        return scale, samples, drift, typical, info
+    span, samples, drift, typical = _cut_back_span(pool, surface, frames, pivot, radius, scale, size,
+                                                   direction, cap_px, view_angle, coverage)
+    amplitude = front_amplitudes(scale, size)[0]
+    full = max(0.0, ORBIT_COVERAGE_DEGREES - 2.0 * amplitude)
+    back_orbit = span >= full - 1e-9 and full > 1e-9
+    reached = amplitude + span                      # the azimuth the path gets to
+    front_travel = LOOP_TRAVEL_FACTOR * math.radians(amplitude)
+    rest_travel = math.radians(span) + ((BACK_ORBIT_TRAVEL_FACTOR + BACK_ORBIT_HOME_FACTOR)
+                                        * math.radians(amplitude) if back_orbit else 0.0)
+    total = front_travel + rest_travel
+    # How much azimuth the path shows: the front O's own width (2A), the connection, and the back
+    # orbit's width (2A again) - i.e. 180 + 2A when the whole back visit runs.
+    width = 2.0 * amplitude
+    info = {"front_yaw": amplitude, "orbit_end": reached, "back_span": span,
+            "back_orbit": back_orbit, "orbit_coverage": width + span + (width if back_orbit else 0.0),
+            "view_angle": None if view_angle is None else float(view_angle),
+            "front_share": (front_travel / total) if total > 1e-9 else 1.0}
     return scale, samples, drift, typical, info
 
 
 def _fit_subject_amplitude(frames, pivot, radius, surface, size, cap_px, amplitude_cap=None,
-                           orbit_end=None, direction=ORBIT_DIRECTION_DEFAULT):
+                           orbit_end=None, direction=ORBIT_DIRECTION_DEFAULT, view_angle=None,
+                           coverage=None):
     """(scale, samples, drift, typical, info) - how far round the speed cap lets the camera go.
 
     The amplitude ladder walks up from a small loop and every rung is measured with its concluding
@@ -1289,7 +1674,7 @@ def _fit_subject_amplitude(frames, pivot, radius, surface, size, cap_px, amplitu
         fallback = None
         for scale in candidates:
             candidate = _orbit_candidate(pool, surface, frames, pivot, radius, scale, size, end,
-                                         direction, cap_px)
+                                         direction, cap_px, view_angle, coverage)
             if candidate[2] <= cap_px + 1e-9:
                 if key == "width":
                     score = candidate[0]
@@ -1327,30 +1712,72 @@ def _fit_subject_amplitude(frames, pivot, radius, surface, size, cap_px, amplitu
     return chosen
 
 
+def _front_travel_share(amplitude, span, back_orbit):
+    """The front O's share of the frames: the phases split by their travel (equal per-frame drift).
+
+    The front O travels its whole circle's arc (the crane to 2 o'clock and the 330 deg sweep
+    together pay for the full loop), the connection its level azimuth and the back orbit the 330
+    deg loop it really flies (9 -> 12 -> 3 -> 6 -> 8 o'clock, `BACK_ORBIT_TRAVEL_FACTOR`) plus its
+    glide home to the dial's centre (`BACK_ORBIT_HOME_FACTOR`).
+    """
+    front = LOOP_TRAVEL_FACTOR * math.radians(amplitude)
+    rest = math.radians(span) + ((BACK_ORBIT_TRAVEL_FACTOR + BACK_ORBIT_HOME_FACTOR)
+                                 * math.radians(amplitude) if back_orbit else 0.0)
+    total = front + rest
+    return front / total if total > 1e-9 else 1.0
+
+
 def _fit_orbit_world(frames, pivot, radius, surface, size, budget, orbit_end=None,
-                     direction=ORBIT_DIRECTION_DEFAULT):
+                     direction=ORBIT_DIRECTION_DEFAULT, view_angle=None, coverage=None):
     """(scale, samples, travel, info) - the world-unit fit for the orbit, speed cap first.
 
     The fallback when no pixel cap is available (no framing, direct calls): the same amplitude
-    ladder, but the budget is `max_speed` in world units. The concluding orbit is cut to the budget
-    with the same analytic step the pixel fit uses, so the orbit never runs faster than the
-    parameter allows; only the coverage gives way, and the caller reports it.
+    ladder, but the budget is `max_speed` in world units. The back part is cut to the budget with the
+    same analytic step the pixel fit uses, so the path never runs faster than the parameter allows;
+    only the coverage gives way, and the caller reports it. Without an `ORBIT_COVERAGES` mode the
+    older concluding orbit is fitted and cut exactly as it always was.
     """
-    end = ORBIT_END_DEFAULT if orbit_end is None else max(ORBIT_END_MIN, float(orbit_end))
-    samples_of = lambda scale: subject_samples(frames, pivot, radius, scale, size, end, direction)
+    if coverage is None:                       # legacy: the concluding orbit to `orbit_end`
+        end = ORBIT_END_DEFAULT if orbit_end is None else max(ORBIT_END_MIN, float(orbit_end))
+        samples_of = lambda scale: subject_samples(frames, pivot, radius, scale, size, end, direction)
+        scale, samples, travel = _fit_amplitude(samples_of, budget)
+        if travel > budget:
+            amplitude = front_amplitudes(scale, size)[0]
+            span = max(0.0, end - amplitude)
+            if span > 1e-9:
+                end = amplitude + span * max(0.0, min(1.0, budget / max(1e-9, travel)))
+                cut_samples = subject_samples(frames, pivot, radius, scale, size, end, direction)
+                cut_travel = _largest_step(cut_samples)
+                if cut_travel < travel:
+                    samples, travel = cut_samples, cut_travel
+        amplitude = front_amplitudes(scale, size)[0]
+        info = {"front_yaw": amplitude, "orbit_end": end,
+                "front_share": balanced_front_share(amplitude, max(0.0, end - amplitude))}
+        return scale, samples, travel, info
+    options = path_options(view_angle, coverage)
+    # The connection ends at the back orbit's near edge (the clock's 9 o'clock), so the azimuth it
+    # has to cover is the circle-to-circle distance MINUS the O's own diameter - the back orbit's
+    # first half (over the head) is what closes the rest.
+    full_of = lambda scale: (max(0.0, ORBIT_COVERAGE_DEGREES - 2.0 * front_amplitudes(scale, size)[0])
+                             if str(coverage) == ORBIT_COVERAGES[1] else 0.0)
+    samples_of = lambda scale: subject_samples(frames, pivot, radius, scale, size, None, direction,
+                                               **dict(options, back_span=full_of(scale)))
     scale, samples, travel = _fit_amplitude(samples_of, budget)
-    if travel > budget:
-        yaw_amplitude = front_amplitudes(scale, size)[0]
-        span = max(0.0, end - yaw_amplitude)
-        if span > 1e-9:
-            end = yaw_amplitude + span * max(0.0, min(1.0, budget / max(1e-9, travel)))
-            cut_samples = subject_samples(frames, pivot, radius, scale, size, end, direction)
-            cut_travel = _largest_step(cut_samples)
-            if cut_travel < travel:
-                samples, travel = cut_samples, cut_travel
-    yaw_amplitude = front_amplitudes(scale, size)[0]
-    info = {"front_yaw": yaw_amplitude, "orbit_end": end,
-            "front_share": balanced_front_share(yaw_amplitude, max(0.0, end - yaw_amplitude))}
+    span = full_of(scale)
+    if travel > budget and span > 1e-9:
+        span *= max(0.0, min(1.0, budget / max(1e-9, travel)))
+        cut_samples = subject_samples(frames, pivot, radius, scale, size, None, direction,
+                                      **dict(options, back_span=span))
+        cut_travel = _largest_step(cut_samples)
+        if cut_travel < travel:
+            samples, travel = cut_samples, cut_travel
+    amplitude = front_amplitudes(scale, size)[0]
+    full = max(0.0, ORBIT_COVERAGE_DEGREES - 2.0 * amplitude)
+    back_orbit = span >= full - 1e-9 and full > 1e-9
+    width = 2.0 * amplitude
+    info = {"front_yaw": amplitude, "orbit_end": amplitude + span, "back_span": span,
+            "back_orbit": back_orbit, "front_share": _front_travel_share(amplitude, span, back_orbit),
+            "orbit_coverage": width + span + (width if back_orbit else 0.0)}
     return scale, samples, travel, info
 
 
@@ -1514,7 +1941,7 @@ def scene_samples(frames, pivot, radius, plan, scale=1.0):
 
 def automatic_keys(frames, pivot, radius, content_radius, target, max_speed=DEFAULT_MAX_SPEED,
                    orbit_size=1.0, surface=None, cap_px=None, amplitude_cap=None, orbit_end=None,
-                   direction=ORBIT_DIRECTION_DEFAULT):
+                   direction=ORBIT_DIRECTION_DEFAULT, view_angle=None, coverage=None):
     """(keys, info) for the automatic path of `target`: subject orbit or scene lateral survey.
 
     The keys are the Catmull-Rom control points the Geometry node samples (evenly spaced, whole
@@ -1544,12 +1971,12 @@ def automatic_keys(frames, pivot, radius, content_radius, target, max_speed=DEFA
     if str(target).strip().lower() == SUBJECT_TARGET:
         style = "front O-orbit + closing orbit"
         fitted = _fit_subject_amplitude(frames, pivot, radius, surface, orbit_size, cap_px,
-                                        amplitude_cap, orbit_end, direction)
+                                        amplitude_cap, orbit_end, direction, view_angle, coverage)
         if fitted is None:
             fit_name = "world travel"
             scale, samples, travel, meta = _fit_orbit_world(frames, pivot, radius, surface,
                                                             orbit_size, budget, orbit_end,
-                                                            direction)
+                                                            direction, view_angle, coverage)
         else:
             fit_name = "subject pixels"
             scale, samples, drift, typical, meta = fitted
@@ -1574,23 +2001,41 @@ def automatic_keys(frames, pivot, radius, content_radius, target, max_speed=DEFA
     if plan is not None:
         info.update(plan)
     else:
-        # the subject orbit: how wide the O swings, how far round the lap got and who got which frames
-        requested = ORBIT_END_DEFAULT if orbit_end is None else max(ORBIT_END_MIN, float(orbit_end))
-        span = max(0.0, meta["orbit_end"] - meta["front_yaw"])
-        info.update({"front_yaw": meta["front_yaw"], "lap_span": span,
+        # the subject orbit: how wide the O swings, how far round it got and who got which frames
+        amplitude = meta["front_yaw"]
+        if coverage is None:                   # legacy: the concluding orbit to `orbit_end`
+            requested = ORBIT_END_DEFAULT if orbit_end is None else max(ORBIT_END_MIN,
+                                                                        float(orbit_end))
+            span = max(0.0, meta["orbit_end"] - amplitude)
+        else:                                  # the front/back path: the request is the full back
+            requested = amplitude + max(0.0, ORBIT_COVERAGE_DEGREES - 2.0 * amplitude)
+            span = max(0.0, meta.get("back_span", 0.0))
+        info.update({"front_yaw": amplitude, "lap_span": span,
                      "orbit_end": meta["orbit_end"], "orbit_end_requested": requested,
                      "front_share": meta["front_share"], "orbit_direction": str(direction),
+                     "view_angle": None if view_angle is None else float(view_angle),
+                     "coverage": coverage, "back_orbit": bool(meta.get("back_orbit")),
                      "front_floor": meta.get("front_floor"),
-                     "orbit_coverage": min(FULL_CIRCLE, meta["front_yaw"]
-                                           + max(meta["front_yaw"], meta["orbit_end"]))})
+                     "orbit_coverage": min(FULL_CIRCLE, meta.get(
+                         "orbit_coverage",
+                         amplitude + max(amplitude, meta["orbit_end"])))})
     return keys, info
 
 
-def document_from_keys(frames, keys, name, description):
-    """The MERIDIAN_CAMERA_PATH JSON for a finished key list (used by both camera paths)."""
+def document_from_keys(frames, keys, name, description, extra=None):
+    """The MERIDIAN_CAMERA_PATH JSON for a finished key list (used by both camera paths).
+
+    `extra` merges additional top-level fields into the document (the automatic path records which
+    depth model the estimate ran on - see `render_depth_aligned`, which warns when the render uses
+    a different one, because two models' depth maps do not share a scale and the aim would then
+    land at the wrong depth).
+    """
     frames = validate_frames(frames)
     document = {"name": name, "description": description, "frames": frames,
                 "stations": ["Auto"], "path": keys}
+    for key, value in (extra or {}).items():
+        if value is not None:
+            document[key] = value
     return json.dumps(document, separators=(",", ":"), allow_nan=False)
 
 
@@ -1607,9 +2052,13 @@ def probe_surface(reference, target=SUBJECT_TARGET, subject_mask=None, model_siz
     target = str(target or SUBJECT_TARGET).strip().lower()
     if target not in AUTO_TARGETS:
         raise ValueError(f"Automatic camera target must be one of {', '.join(AUTO_TARGETS)}.")
-    depth = (depth_fn(reference) if depth_fn is not None else
-             depth_from_reference(reference, model_size=model_size, depth_res=depth_res,
-                                  device=device))
+    depth = None
+    depth_model = "(injected depth map)"
+    if depth_fn is not None:
+        depth = depth_fn(reference)
+    else:
+        depth, depth_model = depth_from_reference(reference, model_size=model_size,
+                                                  depth_res=depth_res, device=device)
     cloud = surface_points(depth)
     scene_pivot, scene_extents = geometric_pivot(cloud)
     scene_radius = pivot_radius(cloud, scene_pivot)
@@ -1662,6 +2111,7 @@ def probe_surface(reference, target=SUBJECT_TARGET, subject_mask=None, model_siz
         "subject_radius": subject_radius,
         "subject_source": subject_source,
         "median_depth": max(1e-6, median_depth),
+        "depth_model": depth_model,
         "aspect": aspect, "hfov": hfov,
         "lateral_half_width": float(scene_extents[0]) / 2.0,
     }
@@ -1723,7 +2173,36 @@ def estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DEF
                          subject_mask=None, model_size="", depth_res=AUTO_DEPTH_RES,
                          device=None, depth_fn=None, pivot_offset=(0.0, 0.0, 0.0),
                          orbit_distance=None, orbit_size=None, subject_fill=None, orbit_end=None,
-                         direction=ORBIT_DIRECTION_DEFAULT):
+                         direction=ORBIT_DIRECTION_DEFAULT, view_angle=None, coverage=None,
+                         orbit_amplitude=None):
+    """(signal JSON, summary) for one still, with the node's O Orbit Angle applied.
+
+    `orbit_amplitude` (deg) is the front O's angular radius - the swing AND the rise, because the O
+    is one circle. It is the node's "O Orbit Angle" widget: a smaller value keeps the automatic
+    subject orbit flatter / less steep (and narrower), a larger one climbs higher and reaches
+    further round. `None` keeps the built-in `FRONT_ORBIT_AMPLITUDE`; a value is clamped to
+    `FRONT_ORBIT_ANGLE_MIN .. FRONT_ORBIT_LIMIT`. Everything else is documented on
+    `_estimate_camera_path`, which does the work.
+    """
+    global _ACTIVE_FRONT_ORBIT_AMPLITUDE
+    previous = _ACTIVE_FRONT_ORBIT_AMPLITUDE
+    _ACTIVE_FRONT_ORBIT_AMPLITUDE = resolve_front_orbit_amplitude(orbit_amplitude)
+    try:
+        return _estimate_camera_path(
+            reference, frames, target=target, max_speed=max_speed, subject_mask=subject_mask,
+            model_size=model_size, depth_res=depth_res, device=device, depth_fn=depth_fn,
+            pivot_offset=pivot_offset, orbit_distance=orbit_distance, orbit_size=orbit_size,
+            subject_fill=subject_fill, orbit_end=orbit_end, direction=direction,
+            view_angle=view_angle, coverage=coverage)
+    finally:
+        _ACTIVE_FRONT_ORBIT_AMPLITUDE = previous
+
+
+def _estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DEFAULT_MAX_SPEED,
+                          subject_mask=None, model_size="", depth_res=AUTO_DEPTH_RES,
+                          device=None, depth_fn=None, pivot_offset=(0.0, 0.0, 0.0),
+                          orbit_distance=None, orbit_size=None, subject_fill=None, orbit_end=None,
+                          direction=ORBIT_DIRECTION_DEFAULT, view_angle=None, coverage=None):
     """(signal JSON, summary) for one still: geometric pivot, automatic path, collision guard.
 
     The pivot is the target's **cylindrical centre**: a robust vertical-cylinder fit of the depth
@@ -1747,10 +2226,17 @@ def estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DEF
     the ONLY distance control for a subject now (`orbit_distance` is deprecated and ignored: whether
     0 or a value, the fill decides, and a bigger fill means a closer camera); `orbit_size`
     multiplies the path's swing amplitudes (None/1.0 keeps the built-in swing; the subject fit
-    searches *up* from there to the view limits, the scene fit can shrink it). `orbit_end` (deg, 360
-    = back to the start point) and `direction` ('counter-clockwise'/'clockwise') shape the subject's
-    concluding orbit; both are honoured as far as the max camera speed allows, and the summary
-    reports what was achieved.
+    searches *up* from there to the view limits, the scene fit can shrink it). `view_angle` (deg) is
+    the azimuth the front O is centred on (0 = the frontal view, +90 = the subject's viewer-left
+    side, 180 = its back, 270/-90 = its right) and `coverage` one of `ORBIT_COVERAGES` - "Front
+    only" or "Front and Back" (the front O, the level connection straight to the back orbit's near
+    edge, then that orbit's full clockwise loop over the back's head, under it and up to 8 o'clock,
+    followed by a glide to the level pose at the back's centre; the back gives way when the speed
+    cap cannot pay for it). `direction`
+    ('counter-clockwise'/'clockwise') mirrors the whole path. `orbit_end` is the DEPRECATED
+    predecessor of `coverage` - without a coverage mode the older concluding orbit is fitted, so
+    saved callers behave as before; all of it is honoured as far as the max camera speed allows, and
+    the summary reports what was achieved.
     """
     frames = validate_frames(frames)
     surface = probe_surface(reference, target=target, subject_mask=subject_mask,
@@ -1773,7 +2259,9 @@ def estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DEF
         # subject's apparent size, and the trimmed 95 % cloud it returns feeds the visibility pass.
         distance, framing_pivot, framing = subject_framing(surface, subject_fill, size,
                                                            orbit_end=orbit_end,
-                                                           direction=direction)
+                                                           direction=direction,
+                                                           view_angle=view_angle,
+                                                           coverage=coverage)
         framed_pool = framing.get("pool")
         orbit_radius = max(distance, MIN_ORBIT_RADIUS)
         pivot = list(framing_pivot)
@@ -1791,7 +2279,8 @@ def estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DEF
         pivot = [float(value) for value in surface["pivot"]]
     cap_px = max_speed * framing["radius_px"] if framing else None
     keys, info = automatic_keys(frames, pivot, orbit_radius, content_radius, target, max_speed,
-                                size, surface, cap_px, orbit_end=orbit_end, direction=direction)
+                                size, surface, cap_px, orbit_end=orbit_end, direction=direction,
+                                view_angle=view_angle, coverage=coverage)
     scene_subject = None
     if target == SCENE_TARGET and info.get("rows") and surface.get("subject_cloud") is not None:
         # How well the subject inside the scene is framed: a survey sweeps past it, so the numbers
@@ -1823,7 +2312,8 @@ def estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DEF
             end_used = info.get("orbit_end", orbit_end)   # the speed cap may have cut the orbit
             distance, pivot, visibility = enforce_subject_visibility(
                 surface, pivot, orbit_radius, fitted, size, frames, orbit_end=end_used,
-                direction=direction, pool=framed_pool, recentre=False)
+                direction=direction, pool=framed_pool, recentre=False, view_angle=view_angle,
+                coverage=coverage, back_span=info.get("back_span"))
             if attempt == 0:
                 cropped_before = visibility["cropped"]
             cap_next = min(fitted, visibility["amplitude_cap"])
@@ -1838,7 +2328,8 @@ def estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DEF
             keys, info = automatic_keys(frames, pivot, orbit_radius, content_radius, target,
                                         max_speed, size, surface, cap_px,
                                         amplitude_cap=cap_next, orbit_end=end_used,
-                                        direction=direction)
+                                        direction=direction, view_angle=view_angle,
+                                        coverage=coverage)
         # report the *total* pull-back of the whole pass and the frames that were cropped before it
         visibility["scale"] = orbit_radius / max(1e-9, start_radius)
         visibility["cropped"] = cropped_before
@@ -1927,11 +2418,40 @@ def estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DEF
     if info.get("orbit_end") is not None:
         wrapped = info["orbit_end"] % FULL_CIRCLE
         closed_round = bool(info.get("orbit_coverage")) and min(wrapped, FULL_CIRCLE - wrapped) < 0.5
+    # What the path shows after the front O - built first, so the description stays readable. The new
+    # modes reach the back through the level connection and the far orbit's clockwise loop ("Front and
+    # Back"), or give the back up to the speed cap; the DEPRECATED `orbit_end` path still runs the
+    # older concluding orbit.
+    beyond = ""
+    if info.get("orbit_coverage"):
+        if info.get("coverage") == ORBIT_COVERAGES[1]:
+            beyond = (f", then the {info['lap_span']:.0f} deg level connection to the back orbit's "
+                      f"near edge, and that orbit's loop (9 -> 12 -> 3 -> 6 -> 8 o'clock: over the "
+                      f"back head, out to the far side, under the back and back up) plus its glide "
+                      f"in to the back's centre reaches "
+                      f"{info['orbit_end'] + info['front_yaw']:.0f} deg"
+                      + (" - cut there by the speed cap"
+                         if info['orbit_end'] < info['orbit_end_requested'] - 0.5 else "")
+                      + f", covering {info['orbit_coverage']:.0f} deg around the subject")
+        elif info.get("coverage"):
+            beyond = (f", the back visit giving way to the speed cap: the path ends at "
+                      f"{info['orbit_end']:.0f} deg of the requested "
+                      f"{info['orbit_end_requested']:.0f} deg, covering "
+                      f"{info['orbit_coverage']:.0f} deg around the subject")
+        else:                              # deprecated `orbit_end`: the older concluding orbit
+            beyond = (f" and the {info['lap_span']:.0f} deg concluding orbit run "
+                      f"{direction_label(info['orbit_direction'])} and end at "
+                      f"{info['orbit_end']:.0f} deg"
+                      + ("" if info["orbit_end"] >= info["orbit_end_requested"] - 0.5
+                         else f" of the requested {info['orbit_end_requested']:.0f} deg (speed cap)")
+                      + (", back at the start point" if closed_round else "")
+                      + f", covering {info['orbit_coverage']:.0f} deg around the subject")
     description = (
         f"Estimated from the still's surface ({surface['source']}): pivot "
         f"[{pivot[0]:.3g}, {pivot[1]:.3g}, {pivot[2]:.3g}] is the cylindrical centre of the "
         f"depth profile ({surface['extents'][0]:.3g} x {surface['extents'][1]:.3g} x "
-        f"{surface['extents'][2]:.3g} units), {info['style']} at {distance_text}"
+        f"{surface['extents'][2]:.3g} units, built from {surface['content_points']} of "
+        f"{surface['points']} points - only those), {info['style']} at {distance_text}"
         + (f", {framing_text}" if framing_text else "")
         + (f", {visibility_text}" if visibility_text else "")
         + f", amplitudes at {info['amplitude_scale']:.2f} of the built-in swing ({speed_text}), "
@@ -1945,13 +2465,7 @@ def estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DEF
         + (f", the Auto Pivot offset ({offset_values[0]:g}, {offset_values[1]:g}, "
            f"{offset_values[2]:g}) content radii shifted the final aim"
            if any(abs(value) > 1e-9 for value in offset_values) else "")
-        + (f", the front O (+/-{info['front_yaw']:.0f} deg) and the {info['lap_span']:.0f} deg "
-           f"concluding orbit run {direction_label(info['orbit_direction'])} and end at "
-           f"{info['orbit_end']:.0f} deg"
-           + ("" if info["orbit_end"] >= info["orbit_end_requested"] - 0.5
-              else f" of the requested {info['orbit_end_requested']:.0f} deg (speed cap)")
-           + (", back at the start point" if closed_round else "")
-           + f", covering {info['orbit_coverage']:.0f} deg around the subject"
+        + (f", the front O (+/-{info['front_yaw']:.0f} deg)" + beyond
            if info.get("orbit_coverage") else "")
         + (f"; survey {info['rows']} rows across +/-{info['half_yaw']:.0f} deg "
            f"({info['lane_overlap'] * 100:.0f} % side overlap, {info['lane_step']:.3g} units "
@@ -1970,19 +2484,32 @@ def estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DEF
         + "Non-front views are synthetic depth reprojections, not observed geometry."
     )
     document = document_from_keys(frames, emitted, f"Auto {info['style']} ({frames} frames)",
-                                  description)
+                                  description,
+                                  extra={"depth_model": surface.get("depth_model")})
     hint = ""
+    # The lever that frees frames for the front O. With the new modes it is 'Front only' (which
+    # drops the whole back visit); with the DEPRECATED `orbit_end` path it is a shorter end.
+    lever = (f"set Auto Orbit Coverage to '{ORBIT_COVERAGES[0]}'" if info.get("coverage")
+             else "a shorter Auto Orbit End")
     if info.get("fit") == "subject pixels":
         ceiling = _amplitude_ceiling(size)
-        if info["amplitude_scale"] < ceiling * 0.99:
+        # WHO stopped the front O - the drift ladder (`amplitude_before`, the speed budget's own
+        # answer) or the visibility pass (`amplitude_cap`, "this swing would crop the subject")?
+        # Only the former may be blamed on Auto Max Speed: crediting the visibility cap to the drift
+        # told the user to raise a speed parameter for a problem no speed can fix, while the real
+        # cause (a shrink that bought nothing) stayed invisible.
+        drift_scale = float((visibility or {}).get("amplitude_before", info["amplitude_scale"]))
+        if info["amplitude_scale"] < ceiling * 0.99 and drift_scale < ceiling * 0.99:
             hint = (f"the subject-drift budget stops the front loop at "
                     f"{info['amplitude_scale']:.2f}x of its {ceiling:.2f}x view limit "
                     f"({info['drift_px']:.3g} px/frame vs {info['drift_cap_px']:.3g} px cap) - raise "
-                    f"Auto Max Speed or Output Frames for a bigger O, or shorten Auto Orbit End "
+                    f"Auto Max Speed or Output Frames for a bigger O, or {lever} "
                     f"(the frames it frees go to the front loop)")
         floor = info.get("front_floor")
         if floor is not None and info["amplitude_scale"] < floor - 1e-9:
-            shrink = (f"the cap could not even pay for Auto Orbit Size {floor:.2f}x, so the front O "
+            named = (f"the built-in {floor:.2f}x circle" if info.get("coverage")
+                     else f"Auto Orbit Size {floor:.2f}x")
+            shrink = (f"the cap could not even pay for {named}, so the front O "
                       f"had to shrink below it to {info['amplitude_scale']:.2f}x - more Output "
                       f"Frames or a higher Auto Max Speed give it back")
             hint = f"{hint}; {shrink}" if hint else shrink
@@ -1996,9 +2523,9 @@ def estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DEF
             if room > wanted * 1.02:
                 room_note = (f"Auto Subject Fill would frame {float(subject_fill or 0):.0f} % but "
                              f"wants {wanted:.3g} units - the orbit's room (the whole subject inside "
-                             f"every frame, including the O and lap extremes) keeps the camera at "
-                             f"{room:.3g} units ({room / max(1e-9, wanted):.2f}x back). Lower Auto "
-                             f"Orbit Size or Auto Orbit End, or mask the subject tighter, to come closer")
+                             f"every frame, including the O and the back part) keeps the camera at "
+                             f"{room:.3g} units ({room / max(1e-9, wanted):.2f}x back). Use a lower "
+                             f"Auto Subject Fill, {lever}, or mask the subject tighter, to come closer")
                 hint = f"{hint}; {room_note}" if hint else room_note
     if visibility and not visibility["ok"]:
         hint = (f"the whole subject does not fit the picture even at "
@@ -2008,13 +2535,13 @@ def estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DEF
         parts = []
         if (info.get("orbit_end") is not None
                 and info["orbit_end"] < info["orbit_end_requested"] - 0.5):
-            parts.append(f"the max camera speed ends the orbit at {info['orbit_end']:.0f} deg of the "
+            parts.append(f"the max camera speed ends the path at {info['orbit_end']:.0f} deg of the "
                          f"requested {info['orbit_end_requested']:.0f} deg - more Output Frames, a "
-                         f"higher Auto Max Speed or a shorter Auto Orbit End balance the round")
+                         f"higher Auto Max Speed or {lever} balance the round")
         if info.get("drift_px") and info["drift_px"] > info["drift_cap_px"] + 1e-9:
             parts.append(f"the orbit already runs at the smallest drift these frames allow "
                          f"({info['drift_px']:.3g} px/frame vs the {info['drift_cap_px']:.3g} px cap) "
-                         f"- more Output Frames or a higher Auto Max Speed, a shorter Auto Orbit End "
+                         f"- more Output Frames or a higher Auto Max Speed, {lever} "
                          f"or a tighter MASK (it shrinks what moves) take the rest")
         elif (info.get("fit") == "world travel" and info.get("orbit_coverage")
               and info["travel_per_frame"] > info["budget_per_frame"] + 1e-12):
@@ -2051,8 +2578,8 @@ def estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DEF
                              f"the frame (trading side overlap)")
             else:
                 parts.append(f"the rows reach {reach:.3g} units of the scene's "
-                             f"{info['half_width']:.3g} half width - raise Auto Orbit Distance (fly "
-                             f"further out), Auto Orbit Size or Auto Max Speed to cover the rest")
+                             f"{info['half_width']:.3g} half width - raise Auto Orbit Size (a wider "
+                             f"row sweep) or Auto Max Speed (a bigger budget) to cover the rest")
         if info.get("lane_overlap", 1.0) < SCENE_LANE_OVERLAP_WARN:
             # coverage needs overlap: rows further apart than the frame's footprint leave strips of
             # the scene out of every row - more frames buy rows, Auto Orbit Size buys breadth per row
@@ -2063,21 +2590,23 @@ def estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DEF
         if scene_subject:
             if scene_subject["frames"] == 0:
                 parts.append(f"the survey never shows the subject ({scene_subject['source']}) - "
-                             f"raise Auto Orbit Size or a lower Auto Orbit Distance make the rows "
-                             f"pass it")
+                             f"raise Auto Orbit Size so the rows sweep past it")
             elif scene_subject["share_median"] < SCENE_SUBJECT_SHARE_MIN:
                 parts.append(f"the subject ({scene_subject['source']}) covers only "
                              f"{scene_subject['share_median'] * 100:.1f} % of the picture in the "
-                             f"survey - a lower Auto Orbit Distance brings the rows closer, a "
-                             f"smaller Auto Orbit Size narrows them onto the subject")
+                             f"survey - a smaller Auto Orbit Size narrows the rows onto the subject")
             elif scene_subject["share_median"] > 1.0:
                 parts.append(f"the subject ({scene_subject['source']}) is bigger than the frame at "
-                             f"{scene_subject['share_median'] * 100:.0f} % of the picture - raise "
-                             f"Auto Orbit Distance for a wider survey, or treat it as the subject "
-                             f"target instead of the scene")
+                             f"{scene_subject['share_median'] * 100:.0f} % of the picture - a bigger "
+                             f"Auto Orbit Size widens the survey, or set Auto Target to 'subject' "
+                             f"and orbit the subject itself")
         extra = "; ".join(parts)
         if extra:
             hint = f"{hint}; {extra}" if hint else extra
+    # Last, appended (never overwritten): where the pivot's points came from. The orbit can look
+    # perfectly fine while it circles the BACKGROUND's centre, so this is never left implicit.
+    for note in pivot_provenance_notes(target, surface):
+        hint = f"{hint}; {note}" if hint else note
     summary = {
         "target": target, "frames": frames, "source": surface["source"],
         "points": surface["points"], "content_points": surface["content_points"],
@@ -2102,6 +2631,11 @@ def estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DEF
         "orbit_end_deg": info.get("orbit_end"),
         "orbit_end_requested_deg": info.get("orbit_end_requested"),
         "orbit_direction": info.get("orbit_direction"), "front_share": info.get("front_share"),
+        # Auto Orbit View Angle / Coverage: 0 deg = the front O is centred on the frontal view,
+        # +90 = the subject's viewer-left side, 180 = its back, 270/-90 = its right; `coverage` is
+        # None while the deprecated `orbit_end` path is in charge (saved callers).
+        "view_angle_deg": info.get("view_angle"), "coverage": info.get("coverage"),
+        "back_orbit": info.get("back_orbit"),
     }
     if info.get("fit") == "subject pixels":
         summary.update({"drift_px": info["drift_px"], "drift_typical_px": info["drift_typical_px"],
@@ -2158,12 +2692,14 @@ def estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DEF
 
 
 def depth_from_reference(reference, model_size="", depth_res=AUTO_DEPTH_RES, device=None):
-    """Depth for the estimator: the requested DA3 pick, else DA3-Small, else Depth-Anything-V2.
+    """(depth, model_name) for the estimator: the requested DA3 pick, else DA3-Small, else DAv2.
 
     Reuses the fast-depth backend's loaders (its VRAM cache included), so the automatic camera
     costs one depth pass per run. Every fallback goes through the same "larger = farther"
     conversion, and the caller's `model_size` is tried first so the estimate matches what the
-    Geometry node will render with.
+    Geometry node will render with. The name that actually ran comes back with the depth: the
+    keys are emitted in *this* depth map's median units, so the renderer has to be told which
+    map that was (see `render_depth_aligned`'s mismatch warning).
     """
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     first = reference[0:1].to(device=device, dtype=torch.float32).clamp(0.0, 1.0)
@@ -2174,9 +2710,13 @@ def depth_from_reference(reference, model_size="", depth_res=AUTO_DEPTH_RES, dev
         try:
             if candidate.startswith(fast_depth.DA3_PREFIX):
                 height, width = int(first.shape[1]), int(first.shape[2])
-                return fast_depth._predict_da3_depth(
+                # Same contract as the V2 branch below: (depth, model_name) - probe_surface
+                # unpacks it, so a bare tensor here surfaces as "too many values to unpack
+                # (expected 2)" for every DA3 pick (production: Depth-Anything-3-Mono-Large).
+                depth = fast_depth._predict_da3_depth(
                     candidate, first, device,
                     fast_depth._da3_process_res(depth_res, width, height))
+                return depth, candidate
             model = fast_depth._get_depth_model(candidate, device)
             mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
             std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
@@ -2185,11 +2725,35 @@ def depth_from_reference(reference, model_size="", depth_res=AUTO_DEPTH_RES, dev
                                  mode="bilinear", align_corners=False)
             with torch.no_grad():
                 prediction = model(pixel_values=((x518 - mean) / std).half())
-            return fast_depth._invert_disparity(prediction.predicted_depth[0].float())
+            return (fast_depth._invert_disparity(prediction.predicted_depth[0].float()), candidate)
         except Exception as exc:      # missing weights / no network: try the next family
             last_error = exc
     raise RuntimeError("No depth model is available for the automatic camera "
                        f"(tried {', '.join(attempts)}): {last_error}")
+
+
+def pivot_provenance_notes(target, surface):
+    """Console notes for the ways a *subject* pivot can silently become the SCENE's centre.
+
+    `subject_points` already refuses an unusable mask (it raises), so what can still reach the
+    summary is: no mask at all with a collapsed depth split, or a mask that - by its own admission
+    - covers (nearly) the whole frame. Both put the pivot in the middle of the background, and
+    both have to be said out loud: the orbit would otherwise quietly circle the wrong point while
+    the path itself looks perfectly fine.
+    """
+    if target != SUBJECT_TARGET:
+        return []
+    source = str(surface.get("source") or "")
+    if source == NO_SUBJECT_SOURCE:
+        return ["no subject mask is connected and the depth split found no clear near layer, so the "
+                "pivot is the centre of the WHOLE surface (background included) - connect a subject "
+                "mask (white = subject, e.g. the RMBG MASK output) to orbit the subject itself"]
+    coverage = float(surface.get("content_points") or 0) / max(1.0, float(surface.get("points") or 0))
+    if source.startswith("input mask") and coverage > MASK_COVERAGE_WARN:
+        return [f"the subject mask covers {coverage * 100:.0f} % of the frame, so its points are "
+                f"(nearly) the whole cloud and the pivot sits at the background's centre as well - "
+                f"check that the mask is white on the SUBJECT, not on the background"]
+    return []
 
 
 def format_summary(summary):
@@ -2199,7 +2763,9 @@ def format_summary(summary):
         f"[{summary['pivot'][0]:.3g}, {summary['pivot'][1]:.3g}, {summary['pivot'][2]:.3g}] "
         f"- the cylindrical centre of the {summary['target']} depth profile "
         f"({summary['extents'][0]:.3g} x {summary['extents'][1]:.3g} x "
-        f"{summary['extents'][2]:.3g} units, {summary['source']})",
+        f"{summary['extents'][2]:.3g} units, {summary['source']}, "
+        f"{summary['content_points']} of {summary['points']} points used - the pivot is computed "
+        f"from those and only those)",
     ]
     if summary.get("subject_fill_area"):
         parts.append(
@@ -2227,15 +2793,33 @@ def format_summary(summary):
             + ")"
         )
     parts.append(f"orbit size {summary['orbit_size']:g}x over {summary['frames']} frames")
+    # What lies beyond the front circle: nothing at all ('Front only'), the level connection to the
+    # far orbit's near edge plus its clockwise loop ('Front and Back' - cut when the speed cap cannot
+    # pay for it), or the DEPRECATED concluding lap. The view angle is reported either way, because it
+    # is the one azimuth that moves all of it.
+    orbit = ""
+    if summary.get("orbit_coverage_deg"):
+        if summary.get("coverage") == ORBIT_COVERAGES[1]:
+            beyond = (f"+ {summary['lap_span_deg']:.0f} deg level back connection"
+                      + (", then the back O loop (9 -> 12 -> 3 -> 6 -> 8 o'clock)"
+                         if summary.get("back_orbit")
+                         else " (the speed cap could not pay for the back O loop, so the path ends "
+                              "where the sweep stopped)"))
+        elif summary.get("coverage"):
+            beyond = "front circle only"
+        else:
+            beyond = f"+ {summary['lap_span_deg']:.0f} deg lap"
+        orbit = (f", O +/-{summary['front_yaw_deg']:.0f} deg "
+                 f"{summary.get('orbit_direction', '')} "
+                 f"centred on {summary.get('view_angle_deg') or 0.0:.0f} deg {beyond} "
+                 f"to {summary['orbit_end_deg']:.0f} deg "
+                 f"= {summary['orbit_coverage_deg']:.0f} deg around")
     if summary.get("drift_px") is not None:
         parts.append(
             f"({summary['drift_px']:.3g} px/frame subject drift, typical "
             f"{summary['drift_typical_px']:.3g} px, cap {summary['drift_cap_px']:.3g} px, "
             f"{summary['amplitude_scale']:.2f}x amplitude, {summary['keys']} keys"
-            + (f", O +/-{summary['front_yaw_deg']:.0f} deg {summary.get('orbit_direction', '')} "
-               f"+ {summary['lap_span_deg']:.0f} deg lap to {summary['orbit_end_deg']:.0f} deg "
-               f"= {summary['orbit_coverage_deg']:.0f} deg around"
-               if summary.get("orbit_coverage_deg") else "")
+            + orbit
             + ")"
         )
     else:

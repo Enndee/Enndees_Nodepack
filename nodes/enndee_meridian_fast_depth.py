@@ -299,6 +299,28 @@ def _bucket_480(width: int, height: int) -> Tuple[int, int]:
     return min(LADDER_480, key=lambda c: abs(math.log((c[0] / c[1]) * (height / width))))
 
 
+def warn_depth_model_mismatch(path_data, model_size):
+    """The warning text when a camera path was estimated on a different depth model, else None.
+
+    The path's keys are in *its* depth map's median units (median-depth units) and the render
+    scales them by THIS map's median (`zm`). Two models do not share a depth scale, so a path
+    estimated on one and rendered on another puts the aim - the pivot - at a different depth than
+    intended: the orbit then circles a point in the background while the path itself looks fine.
+    The estimator records the model it used; this is where that record is checked.
+    """
+    declared_model = str((path_data or {}).get("depth_model") or "").strip()
+    used_model = str(model_size or "").strip()
+    if not declared_model or not used_model or declared_model == used_model:
+        return None
+    if declared_model.startswith("("):          # injected depth map (tests): nothing to compare
+        return None
+    return (f"the camera path was estimated with depth model '{declared_model}' but this render "
+            f"uses '{used_model}' - their depth maps do not share a scale, so the orbit's aim (the "
+            f"pivot) lands at the wrong depth and the camera circles a point in the background. "
+            f"Set the SAME depth model on Meridian Parameters and Camera (Depth Model) and on "
+            f"Meridian Geometry.")
+
+
 def _parse_camera_signal(signal: str) -> Tuple[dict, int]:
     """Parse the custom_camera JSON emitted by Meridian Camera Path Configurator (Enndee).
 
@@ -738,6 +760,9 @@ def render_depth_aligned(first, device, model_size="Depth-Anything-V2-Small-hf",
     # --- camera: the authored path wins; otherwise Meridian's parametric offsets -----------------
     if custom_camera is not None:
         path_data, num_frames = _parse_camera_signal(custom_camera)
+        mismatch = warn_depth_model_mismatch(path_data, model_size)
+        if mismatch:
+            print(f"[Enndee] WARNING: {mismatch}", flush=True)
         c2w_np, focal_np = _evaluate_camera_path(path_data, num_frames, zm)
         c2w = torch.from_numpy(c2w_np).to(device)
         focal = torch.from_numpy(focal_np).to(device)

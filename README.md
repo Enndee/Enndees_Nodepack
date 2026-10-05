@@ -37,6 +37,9 @@ Lichtfeld Studio dataset in a single step.
 | **Meridian Geometry (Enndee)** | `Enndee_MeridianGeometry` | Run VGGT geometry preview; optionally repeat the first frame to a connected custom path's required length |
 | **Lichtfeld Headless Trainer (Enndee)** | `Enndee_LichtfeldHeadlessTrainer` | Start configurable Lichtfeld Studio Gaussian-splat training from a tracker dataset and export the result as .ply, .sog or .spz |
 | **Standby On Signal (Enndee)** | `Enndee_StandbyOnSignal` | Puts the PC into S3 standby when the workflow reaches the node and the ComfyUI queue is empty (last queued prompt) |
+| **Sharpness Analyzer (Enndee)** | `Enndee_SharpnessAnalyzer` | Laplacian-variance sharpness score for every frame of an IMAGE batch |
+| **Sharp Frame Selector Top-N (Enndee)** | `Enndee_SharpFrameSelector` | Reduce an IMAGE batch to its sharpest frames - top N per chunk (`batched_topn`, e.g. 3 of every 4), one per chunk, or the global top N |
+| **Meridian Prompt Composer (conditional pictures)** | `MeridianPromptComposer` | The Meridian example workflow's conditional per-picture prompt blocks |
 
 ---
 
@@ -752,6 +755,52 @@ call (OpenAI, Ollama, Gemini or Claude). Vendored here from the standalone
 
 ---
 
+## Node: Sharpness Analyzer + Sharp Frame Selector Top-N (Enndee)
+
+A self-contained pair for **filtering the sharpest frames** out of an IMAGE
+batch, based on the MIT-licensed
+[ComfyUI-Sharp-Selector](https://github.com/ethanfel/ComfyUI-Sharp-Selector)
+duo. Every frame is scored with the **Laplacian variance** (higher = sharper),
+then the selector reduces the batch.
+
+The customized selector adds a **`batched_topn`** mode the original node does
+not have: it keeps the **top `num_frames` frames of every `batch_size` chunk** -
+e.g. the **3 sharpest of every 4 frames** of a 73-243 frame clip - so a long
+clip keeps its sharp frames evenly distributed instead of only its global best.
+
+### Node: Sharpness Analyzer (Enndee)
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `images` | IMAGE | frame batch to score (one Laplacian-variance score per frame) |
+
+Output: `scores` (`SHARPNESS_SCORES`) - feed into the selector.
+
+### Node: Sharp Frame Selector Top-N (Enndee)
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `images` | IMAGE | - | the full frame batch to reduce |
+| `scores` | SHARPNESS_SCORES | - | scores from a Sharpness Analyzer (Enndee or ComfyUI-Sharp-Selector) |
+| `selection_method` | COMBO | `batched_topn` | `batched_topn` = top `num_frames` of every `batch_size` chunk; `batched` = single sharpest per chunk (original); `best_n` = global top N |
+| `batch_size` | INT | 24 | chunk length in frames (use **4** to group into batches of four) |
+| `batch_buffer` | INT | 0 | frames skipped between chunks (stride = `batch_size + batch_buffer`); keep **0** for gap-free coverage |
+| `num_frames` | INT | 10 | frames kept **per chunk** in `batched_topn` (e.g. **3**) and globally in `best_n`; ignored by `batched` |
+| `min_sharpness` | FLOAT | 0.0 | drop frames scoring below this value (0.0 keeps everything) |
+
+Outputs: `selected_images` (IMAGE) - the reduced batch; `count` (INT) - how many
+frames were kept.
+
+**Recipe - "3 sharpest of every 4 frames"**: `selection_method=batched_topn`,
+`batch_size=4`, `batch_buffer=0`, `num_frames=3`, `min_sharpness=0.0`. A
+73-frame clip yields **55** frames, a 243-frame clip yields **183** (about 75 %,
+evenly distributed).
+
+The `SHARPNESS_SCORES` type is shared with ComfyUI-Sharp-Selector, so the
+Enndee and the original analyzer/selector are interchangeable.
+
+---
+
 ## Global: save without the running counter
 
 ComfyUI appends a running number to **every** saved file
@@ -786,6 +835,10 @@ prefix means the number never shows up at all.
 * The copied `Enndee_ResolutionSelector` node is based on BRADSEC's MIT licensed
   [ComfyUI_ResolutionSelector](https://github.com/BRADSEC/ComfyUI_ResolutionSelector)
   (MIT, Copyright (c) 2023 BRADSEC) - MIT is compatible with this pack's license.
+* The `Sharpness Analyzer (Enndee)` / `Sharp Frame Selector Top-N (Enndee)`
+  nodes are based on ethanfel's MIT licensed
+  [ComfyUI-Sharp-Selector](https://github.com/ethanfel/ComfyUI-Sharp-Selector) -
+  MIT is compatible with this pack's license.
 * The vendored `minimax_h3_promptor/` component: **GPL-3.0** (see
   `minimax_h3_promptor/LICENSE`) - a fork of the
   [1038lab/ComfyUI-Minimax-H3-Promptor](https://github.com/1038lab/ComfyUI-Minimax-H3-Promptor)

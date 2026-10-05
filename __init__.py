@@ -69,6 +69,23 @@ except Exception as _e:
     print(f"\033[31m[Enndee] Enndee_StandbyOnSignal unavailable: {_e}\033[0m")
     Enndee_StandbyOnSignal = None
 
+try:
+    from enndee_sharp_selector import (
+        Enndee_SharpnessAnalyzer,
+        Enndee_SharpFrameSelector,
+    )
+except Exception as _e:
+    print(f"\033[31m[Enndee] Sharp selector nodes unavailable: {_e}\033[0m")
+    Enndee_SharpnessAnalyzer = None
+    Enndee_SharpFrameSelector = None
+
+# Meridian example workflow helper: the conditional per-picture prompt blocks.
+try:
+    from meridian_prompt_composer import MeridianPromptComposer
+except Exception as _e:
+    print(f"\033[31m[Enndee] MeridianPromptComposer unavailable: {_e}\033[0m")
+    MeridianPromptComposer = None
+
 # Global save-behavior hook (no node): strip ComfyUI's running counter and
 # number files only when the target name is already taken. Opt out with the
 # environment variable ENNDEE_KEEP_FILE_COUNTER=1.
@@ -119,6 +136,18 @@ if LichtfeldHeadlessTrainer is not None:
 if Enndee_StandbyOnSignal is not None:
     NODE_CLASS_MAPPINGS["Enndee_StandbyOnSignal"] = Enndee_StandbyOnSignal
     NODE_DISPLAY_NAME_MAPPINGS["Enndee_StandbyOnSignal"] = "Standby On Signal (Enndee)"
+
+if Enndee_SharpnessAnalyzer is not None:
+    NODE_CLASS_MAPPINGS["Enndee_SharpnessAnalyzer"] = Enndee_SharpnessAnalyzer
+    NODE_DISPLAY_NAME_MAPPINGS["Enndee_SharpnessAnalyzer"] = "Sharpness Analyzer (Enndee)"
+
+if Enndee_SharpFrameSelector is not None:
+    NODE_CLASS_MAPPINGS["Enndee_SharpFrameSelector"] = Enndee_SharpFrameSelector
+    NODE_DISPLAY_NAME_MAPPINGS["Enndee_SharpFrameSelector"] = "Sharp Frame Selector Top-N (Enndee)"
+
+if MeridianPromptComposer is not None:
+    NODE_CLASS_MAPPINGS["MeridianPromptComposer"] = MeridianPromptComposer
+    NODE_DISPLAY_NAME_MAPPINGS["MeridianPromptComposer"] = "Meridian Prompt Composer (conditional pictures)"
 
 WEB_DIRECTORY = os.path.join(_pack_dir, "web")
 

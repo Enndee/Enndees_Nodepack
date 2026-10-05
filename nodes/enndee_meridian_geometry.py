@@ -84,13 +84,13 @@ class EnndeeMeridianGeometry:
         return {
             "required": {
                 "video": ("STRING", {"default": "clip.mp4", "tooltip": "Source video path. Ignored when a ComfyUI image/batch is connected; with a custom camera path and no image input, the first frame of this video is repeated."}),
-                "args": ("STRING", {"default": "--boom 0.35 --pivot 0.5,0.55 --ease --sweep", "multiline": True, "tooltip": "Additional Meridian options. When custom_camera is connected, its path and frame count take precedence over camera-motion and frame-count flags."}),
+                "args": ("STRING", {"default": "", "multiline": True, "tooltip": "Additional Meridian options. When custom_camera is connected, its path and frame count take precedence over camera-motion and frame-count flags. Empty by default: the Parameters node emits its own arguments, and hand-written flags here are OR-ed with the widgets below."}),
                 "model_size": (["Depth-Anything-V2-Small-hf", "Depth-Anything-V2-Base-hf", "Depth-Anything-V2-Large-hf",
                                 "Depth-Anything-3-Small", "Depth-Anything-3-Base", "Depth-Anything-3-Large",
                                 "Depth-Anything-3-Mono-Large"],
-                               {"default": "Depth-Anything-V2-Small-hf",
+                               {"default": "Depth-Anything-3-Mono-Large",
                                 "tooltip": "Fast depth only: the depth model. The V2 trio predicts inverted disparity at ~7 ms per frame (needs `transformers`); the V3 series predicts depth directly and is markedly more accurate (needs `python -m pip install --no-deps depth-anything-3` in the ComfyUI python_embeded) - Mono-Large is tuned for single stills, Small is the fast one. Downloads land in the Hugging Face cache; all variants are Apache-2.0."}),
-                "canvas_mode": (["auto_meridian480", "custom"], {"default": "auto_meridian480",
+                "canvas_mode": (["auto_meridian480", "custom"], {"default": "custom",
                                                                  "tooltip": "Fast depth only: 'auto_meridian480' picks the Meridian 480-class ladder entry nearest the frame's aspect (the trained condition canvas); 'custom' uses the two fields below."}),
                 "custom_width": ("INT", {"default": 832, "min": 64, "max": 2048, "step": 32,
                                          "tooltip": "Fast depth only: 'custom' canvas width."}),
@@ -102,11 +102,13 @@ class EnndeeMeridianGeometry:
                                        "tooltip": "Fast depth only: point footprint 0=1x1, 1=3x3, 2=5x5, 3=7x7. Larger fills holes where the cloud is sparse after a big camera move."}),
                 "edge_cull": ("BOOLEAN", {"default": True,
                                           "tooltip": "Fast depth only: drop points on steep depth edges (Meridian's 3x3 EDGE_RTOL rule, applied on the model's own depth grid) so silhouette borders cannot smear into flying spikes."}),
-                "edge_threshold": ("FLOAT", {"default": 0.30, "min": 0.05, "max": 2.0, "step": 0.01,
-                                             "tooltip": "Fast depth only: cull points whose 3x3 relative depth spread exceeds this ratio (Meridian's EDGE_RTOL = 0.30)."}),
-                "back_face_cull": ("BOOLEAN", {"default": False,
+                "edge_threshold": ("FLOAT", {"default": 0.10, "min": 0.05, "max": 2.0, "step": 0.01,
+                                             "tooltip": "Fast depth only: cull points whose 3x3 relative depth spread exceeds this ratio (Meridian's own EDGE_RTOL is 0.30; a tighter value keeps more of the silhouette and drops fewer fine details)."}),
+                "back_face_cull": ("BOOLEAN", {"default": True,
                                                "tooltip": "Fast depth only: mirror Meridian's --cull - drop the splats the target camera sees from behind, so a 180-degree view is a hole, not the mirrored front. This widget is the one place to set it: Meridian Parameters and Camera no longer emits --cull (a hand-written --cull in the args string still enables it, but never use both - the renderer reads them as one OR-ed switch, and the widget cannot turn an args-driven cull back off)."}),
-                "depth_res": ("INT", {"default": DA3_RES, "min": 0, "max": 4096, "step": 1,
+                # 1920 matches the Meridian_Splatting_1.0 example workflow: the render depth model
+                # runs at (about) the still's own side, so the reprojection keeps full detail.
+                "depth_res": ("INT", {"default": 1920, "min": 0, "max": 4096, "step": 1,
                                       "tooltip": "Fast depth only: working-resolution cap in pixels on the still's longest side (aspect preserved). A bigger input picture is resized down to it *before* the depth model, the colours and the point cloud are built, so huge photos stay fast and can never overflow the percentile clip; the same number is Depth-Anything-V3's `process_res` (rounded to multiples of 14 by the library; a value above the still's own side makes the model upscale). 0 = keep the still's own resolution for maximum depth detail - only a 16.7 Mpx safety ceiling still applies, and a full-resolution still costs seconds per frame on the depth model. The V2 models keep their native 518 depth grid, but the still and the cloud follow this cap for them too."}),
             },
             "optional": {

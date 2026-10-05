@@ -8,7 +8,8 @@
  *   switches) or "Spiral Sweep" (yaw pair, sweep elevations). The style switcher, the look pivot
  *   and the dolly are shared.
  * - "Automatic": the automatic controls appear (target scene/subject, the speed cap, the path
- *   mode, the orbit distance/size and the pivot offsets). "auto_path_mode" then decides the path:
+ *   mode, Auto Subject Fill, the orbit's view angle/coverage/direction and the pivot offsets).
+ *   "auto_path_mode" then decides the path:
  *   "Automatic" hides the manual group (the estimator builds the path itself), "Manual" shows it -
  *   the same styles, but flown around the estimated pivot, so the absolute look-pivot widgets stay
  *   hidden.
@@ -24,10 +25,12 @@ const SPIRAL_SWEEP_PANEL = ["path_start_yaw", "path_target_yaw", "path_spiral_st
 const PATH_SHARED = ["path_camera_mode", "path_dolly", "path_pivot_x", "path_pivot_y", "path_pivot_z"];
 const PATH_PIVOTS = ["path_pivot_x", "path_pivot_y", "path_pivot_z"];
 const PATH_PANEL = [...O_ORBIT_PANEL, ...HEIGHT_SWEEP_PANEL, ...SPIRAL_SWEEP_PANEL, ...PATH_SHARED];
-const AUTO_PANEL = ["auto_target", "auto_max_speed", "auto_path_mode", "auto_subject_fill", "auto_orbit_size", "auto_orbit_end", "auto_orbit_direction", "auto_pivot_x", "auto_pivot_y", "auto_pivot_z"];
+const AUTO_PANEL = ["auto_target", "auto_max_speed", "auto_path_mode", "auto_subject_fill", "auto_orbit_view_angle", "auto_orbit_coverage", "auto_orbit_direction", "auto_pivot_x", "auto_pivot_y", "auto_pivot_z", "auto_orbit_angle"];
 // Deprecated widgets: never visible (the saved value survives in the graph, the backend ignores it).
 // `auto_orbit_distance` was the fixed camera stand-off; the distance follows Auto Subject Fill now.
-const DEPRECATED_PANEL = ["auto_orbit_distance"];
+// `auto_orbit_end` was where the concluding orbit stopped and `auto_orbit_size` scaled the O - the
+// fixed front circle plus Auto Orbit View Angle / Auto Orbit Coverage say where the path goes now.
+const DEPRECATED_PANEL = ["auto_orbit_distance", "auto_orbit_end", "auto_orbit_size"];
 const ALL_HIDEABLE = [...PATH_PANEL, ...AUTO_PANEL, ...DEPRECATED_PANEL];
 
 // Must match CAMERA_MODE_OPTIONS in nodes/enndee_meridian_camera_path.py ...

@@ -48,6 +48,12 @@ from enndee_meridian_auto_camera import (
     AUTO_TARGETS,
     COLLISION_MARGIN,
     DEFAULT_MAX_SPEED,
+    FRONT_ORBIT_ANGLE_DEFAULT,
+    FRONT_ORBIT_ANGLE_MIN,
+    FRONT_ORBIT_LIMIT,
+    ORBIT_COVERAGE_DEFAULT,
+    ORBIT_COVERAGE_DEGREES,
+    ORBIT_COVERAGES,
     ORBIT_DIRECTION_DEFAULT,
     ORBIT_DIRECTIONS,
     ORBIT_DISTANCE_MAX,
@@ -57,6 +63,9 @@ from enndee_meridian_auto_camera import (
     ORBIT_SIZE_DEFAULT,
     ORBIT_SIZE_MAX,
     ORBIT_SIZE_MIN,
+    ORBIT_VIEW_ANGLE_DEFAULT,
+    ORBIT_VIEW_ANGLE_MAX,
+    ORBIT_VIEW_ANGLE_MIN,
     SCENE_FILL,
     SUBJECT_FILL,
     SUBJECT_FILL_DEFAULT,
@@ -122,7 +131,8 @@ PATH_WIDGET_NAMES = (
 )
 AUTO_WIDGET_NAMES = ("auto_target", "auto_max_speed", "auto_path_mode", "auto_subject_fill",
                      "auto_orbit_distance", "auto_orbit_size", "auto_orbit_end",
-                     "auto_orbit_direction", "auto_pivot_x", "auto_pivot_y", "auto_pivot_z")
+                     "auto_orbit_direction", "auto_orbit_view_angle", "auto_orbit_coverage",
+                     "auto_pivot_x", "auto_pivot_y", "auto_pivot_z", "auto_orbit_angle")
 
 
 def build_meridian_arguments(output_frames):
@@ -153,11 +163,11 @@ class MeridianParametersAndCamera:
         return {
             "required": {
                 "output_frames": (OUTPUT_FRAME_OPTIONS, {
-                    "default": "73",
-                    "tooltip": "Total reference/output frames and the camera-path length. Meridian has matching prompt assets only for these lengths.",
+                    "default": "158",
+                    "tooltip": "Total reference/output frames and the camera-path length. Meridian has matching prompt assets only for these lengths. 158 is the length the Meridian_Splatting_1.0 example workflow ships with.",
                 }),
                 "camera_mode": (list(CAMERA_MODES), {
-                    "default": MANUAL_MODE,
+                    "default": AUTOMATIC_MODE,
                     "tooltip": "Where the camera path comes from. 'Manual' flies the path widgets below around the absolute look-pivot. 'Automatic' estimates the geometric pivot of the subject (or of the whole scene) from the connected reference image - the midpoint of its depth profile, so depth decides where the camera looks instead of the picture centre - and then flies either the estimated path or the manual one around that pivot (see Auto Path Mode).",
                 }),
                 "auto_target": (list(AUTO_TARGETS), {
@@ -203,23 +213,14 @@ class MeridianParametersAndCamera:
                     "default": round(ORBIT_SIZE_DEFAULT, 2),
                     "min": ORBIT_SIZE_MIN, "max": ORBIT_SIZE_MAX, "step": 0.05,
                     "tooltip": (
-                        f"Automatic camera: size of the O-orbit, i.e. a multiplier on the path's swing "
-                        f"amplitudes. 1 is the built-in swing: the loop opens on the framed front pose, rises "
-                        f"to the top of the O, swings around to the subject's side (see Auto Orbit Direction) "
-                        f"and the concluding orbit carries on from there around the back to Auto Orbit End. "
-                        f"For a subject this is a *floor*: the fit only ever grows the loop above it "
-                        f"towards the view limits (+/-85 deg azimuth, +/-60 deg elevation) - a wider O keeps "
-                        f"the front's angle variety and shortens the orbit - and when the Auto Max Speed "
-                        f"budget cannot pay for the requested Auto Orbit End at this width, the *orbit* is "
-                        f"cut there (the console says so), not the front. Only if the cap cannot even pay for "
-                        f"the loop itself does the O shrink below this value - and then the fit keeps the "
-                        f"*widest* loop it can pay for and shortens the orbit further, so the front stays the "
-                        f"front (reported too). Values below 1 "
-                        f"keep the whole visit deliberately tight; the frames are split between O and orbit so "
-                        f"both run at the same drift. "
-                        f"For a scene the survey's sweep and heights "
-                        f"follow it. The scene budget may still scale the amplitudes down; the subject budget "
-                        f"stops the growth instead, and the console line reports both."
+                        f"DEPRECATED for the subject - the front O is a fixed circle now (45 deg "
+                        f"swing and 45 deg rise, so the camera keeps one distance to the pivot all "
+                        f"the way round it and the subject views span {2.0 * 45.0:.0f} deg in all). "
+                        f"Auto Orbit View Angle says WHERE that circle sits and Auto Orbit Coverage "
+                        f"how far past it the path runs; a subject's orbit is no longer scaled by "
+                        f"this value. It still shapes a SCENE survey: 1 is the built-in sweep, "
+                        f"larger values widen the rows' sweep, smaller ones keep the visit tight "
+                        f"(the speed budget may scale it down; the console line reports it)."
                     ),
                 }),
                 "auto_pivot_x": ("FLOAT", {
@@ -330,22 +331,17 @@ class MeridianParametersAndCamera:
                 # inserting them next to the other `auto_*` widgets would shift every widget below
                 # them, and ComfyUI stores a workflow's widget values by position. The JS panel
                 # hides/shows them with the rest of the automatic group either way.
+                # Kept for saved workflows (and hidden by the JS panel): Auto Orbit View Angle +
+                # Auto Orbit Coverage say where the path goes now, so this value is ignored.
                 "auto_orbit_end": ("FLOAT", {
                     "default": round(ORBIT_END_DEFAULT, 1),
                     "min": ORBIT_END_MIN, "max": ORBIT_END_MAX, "step": 5.0,
                     "tooltip": (
-                        f"Automatic camera (subject target): where the concluding orbit ends, in degrees "
-                        f"around the subject measured from the start - the *middle of the O*, the framed "
-                        f"front pose. {ORBIT_END_DEFAULT:g} (the default) is the complete round: the orbit "
-                        f"runs around the back and arrives back at the start point, and its height arc "
-                        f"lands back on the start height, so the last frame sits on the first one and the "
-                        f"clip loops. Smaller values stop earlier (180 = the subject's back, "
-                        f"{360.0 / 2:g} = its side), 0 skips the concluding orbit entirely and flies the "
-                        f"front O alone. Larger values keep going (up to "
-                        f"{ORBIT_END_MAX:g} = two rounds). The auto fit never exceeds Auto Max "
-                        f"Speed: when the budget cannot pay for the requested end, the orbit is cut "
-                        f"there and the console line reports it (more Output Frames, a higher Auto Max "
-                        f"Speed or a shorter end balance the round)."
+                        f"DEPRECATED - hidden and ignored. Auto Orbit View Angle (where the front O "
+                        f"sits) and Auto Orbit Coverage ('Front only' / 'Front and Back') replaced "
+                        f"this widget; a saved workflow's stored value is simply not read any more. "
+                        f"The path still reports how far round the subject it got and cuts the back "
+                        f"part when Auto Max Speed cannot pay for it."
                     ),
                 }),
                 "auto_orbit_direction": (list(ORBIT_DIRECTIONS), {
@@ -357,6 +353,84 @@ class MeridianParametersAndCamera:
                         f"carries on; '{ORBIT_DIRECTIONS[1]}' mirrors the whole path (12 -> 3 -> 6 -> 9 "
                         f"o'clock and the orbit runs the other way round). Same swing, same end, same "
                         f"speed - only the side the camera travels towards first changes."
+                    ),
+                }),
+                # Deliberately near the END of the node (only the two Automatic-orbit shape widgets
+                # follow it): appending keeps every existing workflow's positional widgets_values
+                # array valid (it is simply shorter than the widget list and these keep their
+                # defaults) - inserting anywhere earlier would shift all following values, the
+                # widget-shift bug of Teil 13.
+                "model_size": (["Depth-Anything-V2-Small-hf", "Depth-Anything-V2-Base-hf",
+                                "Depth-Anything-V2-Large-hf", "Depth-Anything-3-Small",
+                                "Depth-Anything-3-Base", "Depth-Anything-3-Large",
+                                "Depth-Anything-3-Mono-Large"], {
+                    "default": "Depth-Anything-3-Mono-Large",
+                    "tooltip": (
+                        "Depth model the automatic pivot is ESTIMATED with. It must be the SAME "
+                        "model the Meridian Geometry node renders with: the emitted camera path "
+                        "carries its keys in this depth map's median units, and two depth models "
+                        "do not share a scale - a mismatch puts the orbit's aim (the pivot) at "
+                        "the wrong depth, so the camera circles a point in the background while "
+                        "the path itself looks fine. The render prints a warning when the two "
+                        "differ. Set both nodes to the same value."
+                    ),
+                }),
+                # The two Automatic-orbit SHAPE widgets, appended after `model_size` (which used to
+                # be the last one) for the same reason: appending keeps every saved workflow's
+                # positional widgets_values array valid. Inserting them next to the other `auto_*`
+                # widgets would shift all following values - the widget-shift bug of Teil 13. The JS
+                # panel shows them with the automatic group.
+                "auto_orbit_view_angle": ("FLOAT", {
+                    "default": round(ORBIT_VIEW_ANGLE_DEFAULT, 1),
+                    "min": ORBIT_VIEW_ANGLE_MIN, "max": ORBIT_VIEW_ANGLE_MAX, "step": 5.0,
+                    "tooltip": (
+                        f"Automatic camera (subject target): the azimuth the front O-orbit is centred "
+                        f"on, in degrees around the subject's vertical axis. "
+                        f"{ORBIT_VIEW_ANGLE_DEFAULT:g} is the frontal view (the source camera's own "
+                        f"side, +/-45 deg around it); +90 is the subject's viewer-LEFT side, 180 its "
+                        f"BACK, 270 (or -90) its RIGHT - negative values mean the same as their 360 "
+                        f"complement. The whole path follows: the O, the connection to the far side "
+                        f"and that far O are all measured from this angle, so 180 turns the 'front' O "
+                        f"into a back orbit and 'Front and Back' into a back-and-front round. The "
+                        f"camera's distance to the pivot is unaffected."
+                    ),
+                }),
+                "auto_orbit_coverage": (list(ORBIT_COVERAGES), {
+                    "default": ORBIT_COVERAGE_DEFAULT,
+                    "tooltip": (
+                        f"Automatic camera (subject target): how much of the subject the estimated "
+                        f"path shows. '{ORBIT_COVERAGES[0]}' flies the front O circle alone - the "
+                        f"cheapest visit, all of it at the Auto Subject Fill distance, and the framing "
+                        f"is solved for exactly that path. '{ORBIT_COVERAGES[1]}' (the default) adds "
+                        f"the shortest level connection - {ORBIT_COVERAGE_DEGREES:g} deg minus TWICE "
+                        f"the O's own swing, because it stops at the first point of the far orbit it "
+                        f"can reach (that orbit's '9 o'clock') - and then that far orbit runs its "
+                        f"whole loop CLOCKWISE: 9 -> 12 (over the subject's back head) -> 3 (the far "
+                        f"level point) -> 6 (under the back) -> 8, one hour short of its start so no "
+                        f"frame is shown twice - the clip shows both sides without a full lap. Auto "
+                        f"Max Speed always wins: when the budget cannot pay for the loop it is cut "
+                        f"short and the console line says so (more Output Frames or a higher Auto "
+                        f"Max Speed buy it back)."
+                    ),
+                }),
+                # The front O's angular radius, appended last (same reason as the shape widgets
+                # above): the O is ONE circle, so this is the swing AND the rise - a smaller value
+                # keeps the automatic subject orbit flatter / less steep. Hidden with the automatic
+                # group by the JS panel.
+                "auto_orbit_angle": ("FLOAT", {
+                    "default": round(FRONT_ORBIT_ANGLE_DEFAULT, 1),
+                    "min": FRONT_ORBIT_ANGLE_MIN, "max": FRONT_ORBIT_LIMIT, "step": 5.0,
+                    "tooltip": (
+                        f"Automatic camera (subject target): the front O-orbit's angular radius in "
+                        f"degrees - its swing AND its rise, because the O is one circle "
+                        f"({FRONT_ORBIT_ANGLE_DEFAULT:g} deg both ways by default). The camera rises "
+                        f"this far to the top of the O and swings this far to each side, so a "
+                        f"SMALLER value keeps the orbit flatter and less steep (and narrower), a "
+                        f"larger one climbs higher and reaches further round the subject. The speed "
+                        f"fit may still grow the loop a little above this when the budget allows "
+                        f"(up to the gimbal-safe ceiling). Clamped to "
+                        f"{FRONT_ORBIT_ANGLE_MIN:g}-{FRONT_ORBIT_LIMIT:g} deg. This is the live shape "
+                        f"control - Auto Orbit Size / End are deprecated."
                     ),
                 }),
             },
@@ -384,10 +458,12 @@ class MeridianParametersAndCamera:
         "camera path. Camera Mode picks between a hand-authored path (vertical O orbits at named "
         "stations, an alternating-height pendulum, or a monotone spiral sweep) and an automatic "
         "mode that estimates the *geometric pivot* of the subject - or of the whole scene - from "
-        "the reference image's depth profile, then flies either the estimated path (a front O "
-        "orbit that opens on the framed front pose plus a concluding orbit that runs Auto Orbit End "
-        "degrees around the subject, counter-clockwise or clockwise, back at the start point for "
-        "the default 360 deg - or lateral "
+        "the reference image's depth profile, then flies either the estimated path (a fixed 45 deg "
+        "front O orbit - its centre picked by Auto Orbit View Angle - plus, for Auto Orbit Coverage "
+        "'Front and Back', the level connection straight to the far orbit's near edge and that "
+        "orbit's full clockwise loop (over the back's head, out to the far side, under it and back "
+        "up to an hour short of its start), "
+        "counter-clockwise or clockwise, always fitted to the Auto Max Speed budget - or lateral "
         "survey rows across a scene's width) or the manual "
         "path around that pivot, always fitted to a camera-speed budget and guarded against "
         "colliding with the scene geometry. VGGT is gone: Meridian Geometry runs its in-process "
@@ -431,19 +507,34 @@ class MeridianParametersAndCamera:
                 reference_image, int(kwargs["output_frames"]), target=target,
                 max_speed=float(kwargs["auto_max_speed"]) / 100.0,
                 subject_mask=subject_mask, device=device, pivot_offset=offset,
+                # The estimate's pivot lives in THIS model's depth scale; the renderer scales the
+                # keys by the model it renders with, so both nodes must name the same one.
+                model_size=str(kwargs.get("model_size", "") or ""),
                 # Auto Orbit Distance is deprecated and ignored: the camera-to-pivot distance now
                 # always follows Auto Subject Fill (a bigger fill = a closer camera).
                 orbit_distance=None,
-                orbit_size=float(kwargs["auto_orbit_size"]),
+                # Auto Orbit Size is DEPRECATED for a subject - the front O is a fixed circle and
+                # the fit must not rescale it; a scene survey still uses it for its row breadth.
+                orbit_size=(None if target == SUBJECT_TARGET
+                            else float(kwargs["auto_orbit_size"])),
                 subject_fill=float(kwargs["auto_subject_fill"]),
-                orbit_end=float(kwargs["auto_orbit_end"]),
+                # Auto Orbit End is DEPRECATED (hidden): Auto Orbit Coverage says how far the path
+                # goes now. The widget stays only so saved workflows keep loading; its value is not
+                # read. Orbit Direction still mirrors the whole path.
+                orbit_end=None,
                 direction=kwargs["auto_orbit_direction"],
+                # Auto Orbit View Angle (where the front O sits) + Coverage (how much of the subject
+                # is shown) shape the estimated path; see the widget tooltips.
+                view_angle=float(kwargs["auto_orbit_view_angle"]),
+                coverage=kwargs["auto_orbit_coverage"],
+                # O Orbit Angle: the front O's angular radius (swing AND rise). Smaller = flatter.
+                orbit_amplitude=float(kwargs["auto_orbit_angle"]),
             )
             print(f"[Enndee] Meridian {format_summary(summary)}", flush=True)
             return signal
         frame_count = int(kwargs["output_frames"])
         surface = probe_surface(reference_image, target=target, subject_mask=subject_mask,
-                                device=device)
+                                model_size=str(kwargs.get("model_size", "") or ""), device=device)
         pivot = offset_pivot(surface, offset)
         aimed = dict(kwargs, path_pivot_x=pivot[0], path_pivot_y=pivot[1], path_pivot_z=pivot[2])
         keys = json.loads(cls._build_manual_path(aimed))["path"]
