@@ -37,7 +37,7 @@ overrides the backend hooks.
 from typing import List, Optional
 
 from enndee_accelerators import ensure_accelerators
-from enndee_colmap.pycolmap_wrapper import PyColmapWrapper, pycolmap_info
+from enndee_colmap.pycolmap_wrapper import PyColmapWrapper, pycolmap_info, resolve_gpu_bridge
 from glomap_lichtfeld_node import GLOMAPLichtfeldTracker, log, log_warn, tooltip
 
 #: ``mapper_backend`` names of the binary node, mapped to the native options.
@@ -146,11 +146,12 @@ class ColmapLichtfeldTracker(GLOMAPLichtfeldTracker):
         optional["auto_install_binaries"] = ("BOOLEAN", {
             "default": True,
             **tooltip(
-                "Install/repair the python accelerators in ComfyUI's environment on "
-                "demand: pycolmap (this node's backend) and onnxruntime-gpu (CUDA "
-                "ONNX runtime for the RMBG/ONNX nodes, matched to your torch CUDA "
-                "version, with the shadowing CPU wheel removed). "
-                "ENNDEE_AUTO_DOWNLOAD=0 disables it."
+                "Install/repair what the node needs, on demand: pycolmap (this node's backend), "
+                "onnxruntime-gpu (CUDA ONNX runtime for the RMBG/ONNX nodes, matched to your torch "
+                "CUDA version, with the shadowing CPU wheel removed) and - with use_gpu on - the "
+                "CUDA COLMAP build that runs the SIFT stages on the GPU (~154 MB, one time; "
+                "pycolmap has no CUDA wheel for Windows). ENNDEE_AUTO_DOWNLOAD=0 disables it, "
+                "ENNDEE_PYCOLMAP_GPU_BRIDGE=0 keeps the node on pycolmap alone."
             ),
         })
         # Hidden: the node id routes the live status events to this node.
@@ -161,10 +162,11 @@ class ColmapLichtfeldTracker(GLOMAPLichtfeldTracker):
         "Global SfM camera tracking through COLMAP's native Python API (pycolmap) - "
         "GLOMAP is part of COLMAP >= 3.12, so nothing is downloaded. Same widgets, "
         "same Lichtfeld Studio dataset export as the binary tracker; installs/repairs "
-        "pycolmap and the CUDA ONNX runtime on demand. Note: the official Windows "
-        "pycolmap wheel has no CUDA build, so the SIFT work runs on the CPU here - "
-        "the binary tracker (COLMAP CUDA build) is the faster choice for long frame "
-        "sequences."
+        "pycolmap and the CUDA ONNX runtime on demand. GPU: a pycolmap CUDA build is "
+        "used in-process when present (Linux/macOS or self-built); on Windows - where "
+        "the pycolmap wheels have no CUDA - the node downloads the CUDA COLMAP build "
+        "and runs feature extraction + matching on the GPU through it, while the "
+        "global mapper stays in-process."
     )
 
     # =======================================================================
@@ -184,8 +186,31 @@ class ColmapLichtfeldTracker(GLOMAPLichtfeldTracker):
         attention = report.get("optional_attention") or {}
         self._backend_note = f"pycolmap {colmap['version'] or 'missing'} [{colmap['mode']}]"
 
+        # ---- the GPU bridge: SIFT on the GPU through the downloaded CUDA COLMAP build -----
+        # pycolmap has no CUDA build for Windows (PyPI wheels are CPU only, the CUDA ones are
+        # Linux/macOS), so the node borrows the GPU where it pays off - extraction and matching -
+        # and keeps the global mapper in-process. Downloading is fine: the user asked for GPU.
+        bridge = None
+        if not colmap["cuda"] and bool(getattr(self, "_use_gpu", True)):
+            bridge = resolve_gpu_bridge(auto_install=bool(auto_install_binaries), log=log)
+        self._gpu_bridge = bridge
+
         lines = ["COLMAP for Lichtfeld (Enndee) - native pycolmap backend",
                  f"pycolmap : {colmap['version'] or 'missing'} [{colmap['mode']}]"]
+        if bridge is not None:
+            label = "CUDA COLMAP bridge" if bridge.cuda else "COLMAP bridge"
+            self._backend_note += " + " + ("CUDA bridge" if bridge.cuda else "bridge")
+            lines.append(f"gpu      : {label} -> {bridge.executable}")
+            lines.append("           feature extraction + matching run "
+                         + ("on the GPU" if bridge.cuda else "in the COLMAP process")
+                         + ", the global mapper in-process")
+        elif colmap["cuda"]:
+            lines.append("gpu      : native pycolmap CUDA build - everything runs in-process")
+        elif not bool(getattr(self, "_use_gpu", True)):
+            lines.append("gpu      : off (use_gpu is False) - SIFT runs on the CPU")
+        else:
+            lines.append("gpu      : none - SIFT runs on the CPU "
+                         f"(ENNDEE_PYCOLMAP_GPU_BRIDGE=0 or no CUDA COLMAP build)")
         if colmap["mode"] == "cpu-fallback":
             lines.append(f"           CUDA {cuda.get('version') or '?'} "
                          f"({cuda.get('device') or 'GPU'}) is available, but pycolmap "
@@ -223,13 +248,17 @@ class ColmapLichtfeldTracker(GLOMAPLichtfeldTracker):
         return "pycolmap", None
 
     def _create_wrapper(self, colmap_exe, glomap_exe, mapper_backend):
-        """Build the native pycolmap wrapper instead of the CLI wrapper."""
+        """Build the native pycolmap wrapper (plus the CUDA bridge for the SIFT stages)."""
         info = pycolmap_info()
+        bridge = getattr(self, "_gpu_bridge", None)
         log(f"COLMAP : pycolmap {info['version']} (native, "
             f"{'CUDA' if info['cuda'] else 'CPU'} build)")
+        if bridge is not None:
+            log(f"SIFT   : {'GPU via the CUDA COLMAP build' if bridge.cuda else 'COLMAP build'} "
+                f"{bridge.executable}")
         log("Mapper : " + ("incremental_mapping" if mapper_backend == "incremental"
                            else "global_mapping (GLOMAP)"))
-        wrapper = PyColmapWrapper()
+        wrapper = PyColmapWrapper(bridge=bridge)
         status = getattr(self, "_status", None)
         if status is not None:
             wrapper.set_progress_hook(status.progress)
@@ -254,6 +283,7 @@ class ColmapLichtfeldTracker(GLOMAPLichtfeldTracker):
                                              str(mapper_backend).lower())
         self._status = NodeStatus(unique_id)
         self._backend_note = "pycolmap"
+        self._use_gpu = bool(use_gpu)          # decides whether the CUDA bridge is fetched
         self._status.set_stage("starting")
         result = GLOMAPLichtfeldTracker.track(
             self,

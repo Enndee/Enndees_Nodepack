@@ -29,7 +29,7 @@ Lichtfeld Studio dataset in a single step.
 | Node | ID | Purpose |
 |------|----|---------|
 | **GLOMAP Lichtfeld Tracker (Enndee)** | `Enndee_GLOMAPLichtfeldTracker` | Global SfM camera tracking + Lichtfeld dataset export |
-| **COLMAP for Lichtfeld (Enndee)** | `Enndee_ColmapLichtfeldTracker` | The same tracker through COLMAP's **native Python API** (pycolmap) - GLOMAP is part of COLMAP >= 3.12, so **nothing is downloaded**; installs/repairs `pycolmap` + `onnxruntime-gpu` on demand |
+| **COLMAP for Lichtfeld (Enndee)** | `Enndee_ColmapLichtfeldTracker` | The same tracker through COLMAP's **native Python API** (pycolmap) - GLOMAP is part of COLMAP >= 3.12, so no GLOMAP binary is needed; installs/repairs `pycolmap` + `onnxruntime-gpu` on demand and, on Windows (no CUDA pycolmap wheel), downloads the CUDA COLMAP build so the SIFT stages still run on the GPU |
 | **Video Frame Extractor + Audio (Enndee)** | `Enndee_VideoFrameExtractorWithAudio` | Frame/audio extraction with an in-node timeline widget |
 | **MiniMax H3 Direct Promptor (Enndee)** | `H3_Multimodal_Promptor_Enndee` | Official-format MiniMax H3 prompts from reference images (vision LLM) |
 | **Resolution Selector (Enndee)** | `Enndee_ResolutionSelector` | Aspect-ratio + megapixel sizing plus the nine core resize types and a resized image output |
@@ -601,7 +601,7 @@ enter the SfM dataset.
 The same tracker as above, but the Structure-from-Motion backend is **COLMAP's own
 Python API** (`pycolmap`) instead of downloaded executables. GLOMAP was merged into
 COLMAP (COLMAP >= 3.12 ships the global mapper), so `pycolmap.global_mapping()` *is*
-the GLOMAP pipeline - nothing is downloaded, pinned or searched for.
+the GLOMAP pipeline - no GLOMAP binary is needed, pinned or searched for.
 
 | binary tracker | native tracker |
 | --- | --- |
@@ -609,6 +609,11 @@ the GLOMAP pipeline - nothing is downloaded, pinned or searched for.
 | `colmap sequential_matcher` | `pycolmap.match_sequential` |
 | `colmap exhaustive_matcher` | `pycolmap.match_exhaustive` |
 | `colmap global_mapper` / `glomap mapper` | `pycolmap.global_mapping` |
+
+With `use_gpu` (default) and a pycolmap build that has no CUDA - every Windows wheel -
+the two **SIFT** stages are delegated to the downloaded CUDA COLMAP build instead, so
+the GPU is used where it pays off while the mapper stays in-process (see
+[Speed / GPU](#speed-the-gpu-bridge-on-windows)).
 
 Everything else - RMBG background removal, masks, frame stepping, the complete
 Lichtfeld Studio dataset export (`images/`, `masks/`, `sparse/` incl. the TXT model)
@@ -623,8 +628,9 @@ Identical to the GLOMAP tracker **except**:
 * `mapper_backend` is `global` (default) or `incremental` (COLMAP's classic mapper,
   slower but sometimes more forgiving); the old names `glomap` and `colmap_global`
   are still accepted.
-* `auto_install_binaries` now means "install/repair the python accelerators" - see
-  below.
+* `auto_install_binaries` now means "install/repair what the node needs": the python
+  accelerators (see below) **and** the CUDA COLMAP build that runs the SIFT stages on
+  the GPU (~154 MB, once).
 
 ### Environment / accelerators
 
@@ -640,31 +646,48 @@ With `auto_install_binaries=True` (default) the node checks and, if needed, inst
 `python install.py` does the same at setup time (`--skip-accelerators` opts out), and
 `ENNDEE_AUTO_DOWNLOAD=0` disables every automatic download/install.
 
-### Speed: on Windows the native backend is CPU only
+### Speed: the GPU bridge on Windows
 
-The native node is **not** a speed replacement for the binary tracker - the difference
-is the SIFT work. The binary tracker downloads *CUDA* builds of COLMAP/GLOMAP
-(`colmap.exe` links `cudart64_12.dll`) and runs extraction, matching and the bundle
-adjustment on the GPU. The official `pycolmap` wheel for Windows is compiled without
-CUDA (`pycolmap.has_cuda == False`), so the same stages run on the CPU there.
+The expensive part of SfM is SIFT - feature extraction and matching. The binary tracker
+downloads *CUDA* builds of COLMAP/GLOMAP (`colmap.exe` links `cudart64_12.dll`) and runs
+those stages on the GPU. The official `pycolmap` wheel for **Windows** is compiled without
+CUDA (`pycolmap.has_cuda == False`; the `pycolmap-cuda12` wheels exist for Linux and macOS
+only - see `https://pypi.org/project/pycolmap-cuda12/`).
 
-Measured on this machine (RTX 5090, 12 synthetic frames at 2048 px with ~11.5k features
-each, sequential overlap 5, identical settings in both nodes):
+So the native node **borrows the GPU** where it matters: with `use_gpu=True` (default) it
+downloads the pinned CUDA COLMAP build (the same one the binary tracker uses, ~154 MB, once,
+into `<pack>/bin`) and runs `feature_extractor`, `sequential_matcher` and `exhaustive_matcher`
+through it with `SiftExtraction.use_gpu 1` / `SiftMatching.use_gpu 1`. Both sides read and
+write the *same* COLMAP database, and everything else stays native: the global mapper runs
+in-process through `pycolmap.global_mapping`, the status label and progress bar stay live
+(COLMAP's own `Processed file [n/m]` records feed the bar, so nothing is printed).
 
-| stage | binary tracker (COLMAP CUDA) | native tracker (pycolmap CPU) |
-| --- | --- | --- |
-| feature extraction, 12 frames | 1.0 s | 4.8 s |
-| feature matching, 50 pairs | 0.6 s (incl. process start) | 22.1 s |
+Measured on this machine (RTX 5090, 12 real 2048 px photos, ~10k features each, sequential
+overlap 5, identical settings):
 
-Both pipelines extracted the same features (138k vs 140k), so this is pure compute
-time. On a real 113 frame workflow the same ratio shows up end to end:
-**121.8 s (native) vs 65.8 s (binary)** - the extraction is ~5x and the matching far
-more expensive on the CPU, while the global mapper itself is CPU-bound in both nodes.
+| stage | binary tracker (COLMAP CUDA) | native, no bridge (pycolmap CPU) | native + GPU bridge |
+| --- | --- | --- | --- |
+| feature extraction, 12 frames | 1.0 s | 4.8 s | **1.5 s** |
+| feature matching, 33-50 pairs | 0.6 s | 22.1 s | **0.8 s** |
 
-Rule of thumb: **binary tracker for speed, native tracker for "nothing to download"**
-plus the live status label and progress bar. If you build a CUDA pycolmap yourself
-(COLMAP + vcpkg + CUDA SDK) and drop it in via `ENNDEE_PYCOLMAP_CUDA_WHEEL`, the native
-node switches to the GPU automatically and `use_gpu` really means GPU.
+That is the difference between "121.8 s (native, CPU) vs 65.8 s (binary)" on a real 113
+frame workflow and **native ≈ binary** with the bridge. The mapping stage itself is
+CPU-bound in *both* nodes (Ceres without CUDA), which is why it is not bridged.
+
+Controls:
+
+* `use_gpu=False` - no download, no bridge, SIFT on the CPU.
+* `ENNDEE_PYCOLMAP_GPU_BRIDGE=0` - same, without touching the workflow.
+* `ENNDEE_AUTO_DOWNLOAD=0` / `auto_install_binaries=False` - never download; an already
+  installed CUDA COLMAP build (or `ENNDEE_COLMAP_PATH`) is still used.
+* a CUDA-enabled pycolmap build (self-built, or via `ENNDEE_PYCOLMAP_CUDA_WHEEL`) always
+  wins over the bridge and runs everything in-process.
+* the console says which one is active:
+
+      COLMAP for Lichtfeld (Enndee) - native pycolmap backend
+      pycolmap : 4.2.1 [cpu-fallback]
+      gpu      : CUDA COLMAP bridge -> ...\Enndees_Nodepack\bin\colmap-3.11.1-cuda\COLMAP.bat
+                 feature extraction + matching run on the GPU, the global mapper in-process
 
 ### Console output
 
@@ -705,24 +728,27 @@ per call - so a chunked run used to produce one camera per chunk (113 frames cam
 with 13 cameras, each with its own intrinsics block, and the global mapper warned about
 missing focal priors). The Lichtfeld export now always contains a single camera.
 
-### CUDA first, CPU only as the fallback
+### CUDA first, the GPU bridge, CPU only as the last resort
 
 The node always tries to run on the GPU and only then falls back - and it **shows
 which one it is using** (see below). The order is:
 
-1. an installed CUDA pycolmap (`pycolmap.has_cuda`) - used as is,
+1. an installed CUDA pycolmap (`pycolmap.has_cuda`) - everything in-process,
 2. `ENNDEE_PYCOLMAP_CUDA_WHEEL=<path|url>` - a wheel you built or downloaded yourself,
-3. `pycolmap-cuda12` - when pip finds a wheel for this platform (Linux so far).
+3. `pycolmap-cuda12` - when pip finds a wheel for this platform (Linux/macOS so far),
+4. **the GPU bridge** - the downloaded CUDA COLMAP build runs extraction + matching
+   (`SiftExtraction.use_gpu 1`), the mapper stays in-process (see the speed section).
 
 The CPU build is only kept when there is no CUDA device/driver, no CUDA wheel for
-this platform, or auto install is switched off. The verdict is cached per session
-(the first check costs about a second, later ones are free).
+this platform *and* no bridge (switched off, or no download allowed and nothing
+installed). The verdict is cached per session (the first check costs about a second,
+later ones are free).
 
 Reality check: the official **Windows** wheels of `pycolmap` have no CUDA and the
-CUDA wheels are Linux only, so on Windows the CPU fallback is the normal case - the
-label says so, including the reason. A CUDA build can be created from source (COLMAP
-+ vcpkg + CUDA SDK) and then either installed normally or dropped in via
-`ENNDEE_PYCOLMAP_CUDA_WHEEL`; `use_gpu` starts using the GPU automatically.
+CUDA wheels are Linux/macOS only - so on Windows step 4 is the normal case and the
+SIFT work still lands on the GPU. A CUDA build can be created from source (COLMAP +
+vcpkg + CUDA SDK) and then either installed normally or dropped in via
+`ENNDEE_PYCOLMAP_CUDA_WHEEL`; it takes over from the bridge automatically.
 
 ### Live status and progress
 
@@ -731,17 +757,18 @@ label says so, including the reason. A CUDA build can be created from source (CO
   environment check (backend, CUDA device, torch, onnxruntime, attention
   accelerators) plus the current stage. The final summary also goes through
   ComfyUI's built-in `ui.text` output.
-* **Progress bar** - `comfy.utils.ProgressBar`: 0-90 % for the reconstruction
-  (feature extraction per chunk of frames, matching per batch of image pairs - the
-  pairs come from COLMAP's own pair generator, so chunking does not change the
-  result) and the rest for the dataset export and the model parsing.
+* **Progress bar** - `comfy.utils.ProgressBar`: 0-90 % for the reconstruction and the
+  rest for the dataset export and the model parsing. Both paths feed it: the pycolmap
+  CPU/CUDA path reports per chunk of frames / batch of image pairs (the pairs come from
+  COLMAP's own pair generator, so chunking does not change the result), and the GPU
+  bridge parses COLMAP's own `Processed file [n/m]` / `Matching block [n/m]` records.
 
 While it runs the label looks like this:
 
     COLMAP for Lichtfeld (Enndee) - native pycolmap backend
     pycolmap : 4.2.1 [cpu-fallback]
-               CUDA 13.0 (NVIDIA GeForce RTX 5090) is available, but pycolmap has to run on the CPU here:
-               no 'pycolmap-cuda12' wheel exists for this platform; build pycolmap from source with CUDA, or set ENNDEE_PYCOLMAP_CUDA_WHEEL=<wheel|url>
+    gpu      : CUDA COLMAP bridge -> ...\Enndees_Nodepack\bin\colmap-3.11.1-cuda\COLMAP.bat
+               feature extraction + matching run on the GPU, the global mapper in-process
     torch    : 2.14.1+cu130 (CUDA 13.0, NVIDIA GeForce RTX 5090)
     onnx     : 1.30.0 [Tensorrt, CUDA, CPU]
     attention: flash_attn=yes, sageattention=yes

@@ -53,7 +53,7 @@ def colmap_verbose() -> bool:
     return bool((os.environ.get(VERBOSE_ENV) or "").strip())
 
 
-def colmap_child_env() -> dict:
+def colmap_child_env(minloglevel: Optional[str] = None) -> dict:
     """Environment for COLMAP/GLOMAP child processes: quiet unless asked otherwise.
 
     COLMAP and GLOMAP log through glog; at INFO level they print every SIFT thread setup,
@@ -62,24 +62,34 @@ def colmap_child_env() -> dict:
     process starts, so the flag goes into the child's environment; warnings and errors
     (missing focal priors, "compiled without CUDA support", failures) still come through.
     ``ENNDEE_COLMAP_VERBOSE=1`` restores the full output.
+
+    ``minloglevel`` forces a level for one child (the pycolmap wrapper's GPU bridge asks for
+    "0"/INFO, because that is where COLMAP's own "Processed file [n/m]" progress records live -
+    it parses them into the progress bar instead of printing them).
     """
     env = dict(os.environ)
     # Windows' os.environ upper-cases its keys, and a *copy* is case sensitive again - so
     # look for the flag without caring about case before adding it.
-    if not colmap_verbose() and not any(key.upper() == "GLOG_MINLOGLEVEL" for key in env):
+    if colmap_verbose():
+        return env
+    if minloglevel is not None:
+        env["GLOG_minloglevel"] = str(minloglevel)
+        return env
+    if not any(key.upper() == "GLOG_MINLOGLEVEL" for key in env):
         env["GLOG_minloglevel"] = GLOG_LEVEL_WARNING
     return env
 
 
 def run_streaming_command(cmd, desc: str, timeout: int,
-                          progress_callback=None) -> Tuple[int, str]:
+                          progress_callback=None, env: Optional[dict] = None) -> Tuple[int, str]:
     """Run a CLI process while forwarding its combined output as it arrives.
 
     COLMAP/GLOMAP can run for a long time. Capturing output with
     ``subprocess.run(capture_output=True)`` hides all native progress until a
     phase finishes. This helper relays both newline- and carriage-return-
     terminated progress records to the ComfyUI console while retaining the
-    complete output for the wrapper's existing return contract.
+    complete output for the wrapper's existing return contract. `env` overrides
+    the child's environment (default: `colmap_child_env()`).
     """
     prefix = f"[{desc}]" if desc else "[SfM]"
 
@@ -99,7 +109,7 @@ def run_streaming_command(cmd, desc: str, timeout: int,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             bufsize=0,
-            env=colmap_child_env(),
+            env=env if env is not None else colmap_child_env(),
             **subprocess_window_kwargs(),
         )
     except Exception:

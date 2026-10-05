@@ -21,23 +21,23 @@ CLI (downloaded binaries)     native (pycolmap)
 Nothing is downloaded and no executable is needed - only ``pip install pycolmap``.
 
 .. note::
-   The official PyPI wheels are built **without CUDA on Windows** (CUDA wheels are
-   Linux-only, see the pycolmap docs). Feature extraction/matching and the bundle
-   adjustment therefore run on the CPU here; ``use_gpu`` is honoured automatically
-   as soon as a CUDA-enabled pycolmap build is installed (``pycolmap.has_cuda``).
-   On a CPU-only build the pipeline is *told* that there is no GPU (see
-   :meth:`PyColmapWrapper.mapper`), so the "Requested to use GPU for bundle
-   adjustment ... falling back to the CPU" warnings disappear - and the run is
-   noticeably slower than the binary node, which does the SIFT work on the GPU.
+   The official PyPI wheels are built **without CUDA on Windows** (the CUDA wheels are Linux and
+   macOS only). Feature extraction and matching are therefore delegated to the **downloaded CUDA
+   COLMAP build** when one is available (``resolve_gpu_bridge``, ~154 MB, fetched on demand) - the
+   global mapper still runs in-process through ``pycolmap.global_mapping``, and both sides read and
+   write the same COLMAP database. A CUDA-enabled pycolmap build (self-built, or dropped in via
+   ``ENNDEE_PYCOLMAP_CUDA_WHEEL``) is used in-process instead, so ``use_gpu`` really means GPU.
+   Without either, the SIFT work runs on the CPU - and the run is noticeably slower.
 """
 
 from pathlib import Path
 import os
+import re
 import sys
 from typing import Callable, List, Optional, Sequence, Tuple
 
-from .colmap_wrapper import (COLMAPWrapper, GLOG_LEVEL_WARNING, VERBOSE_ENV,
-                             colmap_child_env, colmap_verbose)
+from .colmap_wrapper import (COLMAPWrapper, GLOG_LEVEL_WARNING, VERBOSE_ENV, _timeout_from_env,
+                             colmap_child_env, colmap_verbose, run_streaming_command)
 from .glomap_wrapper import GLOMAPWrapper
 
 #: ``callable(value, total, label)`` - drives ComfyUI's progress bar.
@@ -58,6 +58,91 @@ INCREMENTAL_BACKEND = "incremental"
 VERBOSE_ENV = "ENNDEE_COLMAP_VERBOSE"
 #: glog level 1 = WARNING: keep the warnings, drop the "I2026... " progress spam.
 GLOG_LEVEL_WARNING = "1"
+#: glog level 0 = INFO: where COLMAP's own "Processed file [n/m]" progress records live.
+GLOG_LEVEL_INFO = "0"
+#: ``ENNDEE_PYCOLMAP_GPU_BRIDGE=0`` keeps the native node on pycolmap alone (no download).
+BRIDGE_ENV = "ENNDEE_PYCOLMAP_GPU_BRIDGE"
+
+
+def gpu_bridge_enabled() -> bool:
+    """False when the user switched the CUDA bridge off via ``ENNDEE_PYCOLMAP_GPU_BRIDGE=0``."""
+    return not str(os.environ.get(BRIDGE_ENV) or "").strip() in ("0", "false", "no", "off")
+
+
+class GpuBridge:
+    """The downloaded COLMAP build, used for the SIFT stages (see `resolve_gpu_bridge`)."""
+
+    def __init__(self, executable, source: str = "", cuda: bool = False):
+        self.executable = Path(executable)
+        self.source = str(source or "")
+        #: True when the resolved build is the CUDA flavor (the one we download by default).
+        self.cuda = bool(cuda)
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"GpuBridge({self.executable}, {self.source!r}, cuda={self.cuda})"
+
+
+def _bin_manager():
+    """The pack's binary manager (`enndee_bin`), or None when it cannot be imported."""
+    for root in (Path(__file__).resolve().parent.parent,):
+        if str(root) not in sys.path:
+            sys.path.insert(0, str(root))
+    try:
+        import enndee_bin  # type: ignore
+    except Exception:  # noqa: BLE001 - standalone use without the pack
+        return None
+    return enndee_bin
+
+
+def resolve_gpu_bridge(auto_install: bool = True, log: Callable[[str], None] = print,
+                       flavor: str = "cuda") -> Optional[GpuBridge]:
+    """The **CUDA** COLMAP executable for the SIFT bridge, downloading it when allowed.
+
+    pycolmap has no CUDA build for Windows (the PyPI wheels are CPU only and the CUDA wheels are
+    Linux/macOS), so the native node borrows the GPU where it actually pays off: feature extraction
+    and matching. Everything else stays native - the global mapper still runs in-process through
+    ``pycolmap.global_mapping``, and the database both sides read and write is the same COLMAP
+    database file.
+
+    Resolution order: ``ENNDEE_COLMAP_PATH`` (explicit), the pin file ``bin/enndee_binaries.json``,
+    an already downloaded build in ``<pack>/bin``, then - when `auto_install` is set - the pinned
+    CUDA download (COLMAP 3.11.1, ~154 MB, done once).
+    """
+    if not gpu_bridge_enabled():
+        return None
+    if auto_install:
+        # ENNDEE_AUTO_DOWNLOAD=0 is the pack's documented global escape hatch (the binary node and
+        # the accelerator installer honour it as well).
+        value = (os.environ.get("ENNDEE_AUTO_DOWNLOAD") or "").strip().lower()
+        if value in ("0", "false", "no", "off"):
+            auto_install = False
+    manager = _bin_manager()
+    if manager is None:
+        return None
+    try:
+        explicit = os.environ.get("ENNDEE_COLMAP_PATH") or ""
+        executable = manager.resolve_binary("colmap", explicit)
+        if executable is None and auto_install:
+            log("[pycolmap] GPU bridge: downloading the CUDA COLMAP build "
+                "(one time, ~154 MB) - it runs SIFT on the GPU")
+            try:
+                manager.ensure_binaries(kinds=["colmap"], flavor=flavor, log=log)
+            except Exception as exc:  # noqa: BLE001 - no download, no bridge
+                log(f"[pycolmap] GPU bridge download failed: {exc}")
+            executable = manager.resolve_binary("colmap", explicit)
+    except Exception as exc:  # noqa: BLE001 - never break the node over the bridge
+        log(f"[pycolmap] GPU bridge unavailable: {exc}")
+        return None
+    if executable is None:
+        return None
+    try:
+        source = manager.source_of("colmap", explicit)
+    except Exception:  # noqa: BLE001
+        source = ""
+    # The pack installs into <pack>/bin/<kind>-<version>-<flavor>, so the folder says which
+    # build we ended up with - do not claim CUDA for a CPU build (or a user's own COLMAP).
+    detected = Path(executable).parent.name.lower().rsplit("-", 1)[-1] == "cuda"
+    return GpuBridge(executable, source, cuda=detected)
 
 
 #: the "no CUDA build" situation is a property of the build, not of a stage - one
@@ -133,10 +218,13 @@ class PyColmapWrapper(GLOMAPWrapper):
     """Global SfM through COLMAP's native Python API (no executables at all)."""
 
     def __init__(self, device: Optional[str] = None,
-                 progress_hook: Optional[ProgressHook] = None):
-        # No COLMAP/GLOMAP binaries: set up the base attributes by hand because
-        # COLMAPWrapper.__init__ insists on a real colmap_path.
-        self.colmap_path = None
+                 progress_hook: Optional[ProgressHook] = None,
+                 bridge: Optional[GpuBridge] = None):
+        # No COLMAP/GLOMAP binaries of our own: set up the base attributes by hand because
+        # COLMAPWrapper.__init__ insists on a real colmap_path. A `bridge` (the downloaded CUDA
+        # COLMAP build) only serves the SIFT stages - see `resolve_gpu_bridge`.
+        self.gpu_bridge = bridge
+        self.colmap_path = str(bridge.executable) if bridge is not None else None
         self.workspace = None
         self.image_dir = None
         self.mask_dir = None
@@ -222,6 +310,101 @@ class PyColmapWrapper(GLOMAPWrapper):
             return None
         return device.cuda if effective_gpu else device.cpu
 
+    # ------------------------------------------------------------ GPU bridge
+    def _bridge_active(self, use_gpu: bool) -> bool:
+        """True when the SIFT stages should run on the GPU through the CUDA COLMAP build.
+
+        A pycolmap build *with* CUDA always wins (everything stays in-process); the bridge is for
+        the builds that have none - which is every Windows wheel.
+        """
+        if not use_gpu or self.gpu_bridge is None:
+            return False
+        module = import_pycolmap()
+        return not bool(getattr(module, "has_cuda", False)) if module is not None else False
+
+    def _bridge_run(self, args: List[str], label: str) -> bool:
+        """Run one bridge command, turning COLMAP's "[n/m]" progress records into the progress bar.
+
+        The child runs at glog INFO (that is where the records live) and its output goes to the
+        callback instead of the console - so the console stays as quiet as with the CPU path while
+        the bar still moves.
+        """
+        bridge = self.gpu_bridge
+        if bridge is None:
+            return False
+        progress = {"value": 0, "total": max(1, len(self._image_names()))}
+
+        def on_output(message: str) -> None:
+            if colmap_verbose():
+                # run_streaming_command already prefixed the record with the label
+                print(message, flush=True)
+            found = re.findall(r"\[(\d+)/(\d+)\]", message)
+            if not found:
+                return                              # INFO chatter: neither console nor bar
+            value, total = int(found[-1][0]), int(found[-1][1])
+            progress["value"] = max(progress["value"], value)
+            progress["total"] = max(1, total)
+            self._emit(progress["value"], progress["total"], f"{label} {value}/{total}")
+
+        self._emit(0, 1, label)
+        try:
+            return_code, output = run_streaming_command(
+                [str(bridge.executable)] + [str(argument) for argument in args],
+                label,
+                _timeout_from_env("ENNDEE_COLMAP_TIMEOUT", 3600),
+                progress_callback=on_output,
+                env=colmap_child_env(GLOG_LEVEL_INFO),
+            )
+        except Exception as exc:  # noqa: BLE001 - the CPU path is the fallback
+            print(f"[pycolmap] GPU bridge {label} failed: {exc}")
+            return False
+        if return_code != 0:
+            print(f"[pycolmap] GPU bridge {label} failed (exit {return_code}) - "
+                  f"falling back to the CPU path")
+            for line in (output or "").strip().splitlines()[-4:]:
+                print(f"    {line}")
+            return False
+        self._emit(1, 1, label)
+        return True
+
+    def _bridge_extract(self, camera_model: str, single_camera: bool, max_image_size: int,
+                        max_num_features: int, mask_path: Optional[str],
+                        estimate_affine_shape: bool, domain_size_pooling: bool) -> bool:
+        """``colmap feature_extractor`` with ``SiftExtraction.use_gpu 1`` - the whole folder at once.
+
+        One call means COLMAP's own single-camera mode spans every frame (the chunked pycolmap path
+        needs `_import_once` for that), and its "Processed file [n/m]" records drive the bar.
+        """
+        args = ["feature_extractor",
+                "--database_path", str(self.database_path),
+                "--image_path", str(self.image_dir),
+                "--ImageReader.camera_model", str(camera_model),
+                "--ImageReader.single_camera", "1" if single_camera else "0",
+                "--SiftExtraction.max_image_size", str(int(max_image_size)),
+                "--SiftExtraction.max_num_features", str(int(max_num_features)),
+                "--SiftExtraction.estimate_affine_shape",
+                "1" if estimate_affine_shape else "0",
+                "--SiftExtraction.domain_size_pooling", "1" if domain_size_pooling else "0",
+                "--SiftExtraction.use_gpu", "1"]
+        if mask_path:
+            args.extend(["--ImageReader.mask_path", str(mask_path)])
+            print(f"[pycolmap] Using masks from: {mask_path}")
+        return self._bridge_run(args, "feature extraction (GPU)")
+
+    def _bridge_match(self, kind: str, overlap: int = 10) -> bool:
+        """``colmap sequential_matcher`` / ``exhaustive_matcher`` with ``SiftMatching.use_gpu 1``."""
+        if kind == "sequential":
+            args = ["sequential_matcher",
+                    "--database_path", str(self.database_path),
+                    "--SequentialMatching.overlap", str(int(overlap)),
+                    "--SequentialMatching.loop_detection", "0",
+                    "--SiftMatching.use_gpu", "1"]
+        else:
+            args = ["exhaustive_matcher",
+                    "--database_path", str(self.database_path),
+                    "--SiftMatching.use_gpu", "1"]
+        return self._bridge_run(args, f"{kind} matching (GPU)")
+
     # ------------------------------------------------------- pipeline stages
     def feature_extractor(self, camera_model: str = "SIMPLE_RADIAL",
                           single_camera: bool = True, max_image_size: int = 3200,
@@ -229,7 +412,15 @@ class PyColmapWrapper(GLOMAPWrapper):
                           mask_path: Optional[str] = None,
                           estimate_affine_shape: bool = False,
                           domain_size_pooling: bool = False) -> bool:
-        """``colmap feature_extractor`` -> ``pycolmap.extract_features``."""
+        """``colmap feature_extractor`` -> ``pycolmap.extract_features``.
+
+        With `use_gpu` set and a pycolmap build that has no CUDA (every Windows wheel), the work is
+        delegated to the downloaded CUDA COLMAP build - see `resolve_gpu_bridge`.
+        """
+        if self._bridge_active(use_gpu) and self._bridge_extract(
+                camera_model, single_camera, max_image_size, max_num_features, mask_path,
+                estimate_affine_shape, domain_size_pooling):
+            return True
         module = self._module()
         if module is None:
             return False
@@ -386,11 +577,15 @@ class PyColmapWrapper(GLOMAPWrapper):
         return True
 
     def sequential_matcher(self, use_gpu: bool = True, overlap: int = 10) -> bool:
-        """``colmap sequential_matcher`` -> ``pycolmap.match_sequential``."""
+        """``colmap sequential_matcher`` -> ``pycolmap.match_sequential`` (or the GPU bridge)."""
+        if self._bridge_active(use_gpu) and self._bridge_match("sequential", overlap):
+            return True
         return self._match("sequential", use_gpu, overlap)
 
     def exhaustive_matcher(self, use_gpu: bool = True) -> bool:
-        """``colmap exhaustive_matcher`` -> ``pycolmap.match_exhaustive``."""
+        """``colmap exhaustive_matcher`` -> ``pycolmap.match_exhaustive`` (or the GPU bridge)."""
+        if self._bridge_active(use_gpu) and self._bridge_match("exhaustive"):
+            return True
         return self._match("exhaustive", use_gpu)
 
     def mapper(self, backend: str = "glomap", min_num_matches: int = 15,

@@ -318,6 +318,150 @@ class PyColmapWrapperTests(unittest.TestCase):
                                 "cuda": False})
 
 
+class GpuBridgeTests(unittest.TestCase):
+    """The CUDA bridge: the SIFT stages go to the downloaded CUDA COLMAP build on the GPU."""
+
+    def setUp(self):
+        self.fake = FakePycolmap(image_names=("a.png", "b.png", "c.png"))
+        self.patch = mock.patch.object(pycolmap_wrapper, "import_pycolmap",
+                                       return_value=self.fake)
+        self.patch.start()
+        self.addCleanup(self.patch.stop)
+        self.bridge = pycolmap_wrapper.GpuBridge("C:/bin/colmap-3.11.1-cuda/COLMAP.bat", "download",
+                                                 cuda=True)
+        self.runs = []
+
+    def _wrapper(self, bridge=None):
+        wrapper = pycolmap_wrapper.PyColmapWrapper(bridge=bridge)
+        wrapper.setup_workspace()
+        self.addCleanup(wrapper.cleanup_workspace)
+        for name in ("a.png", "b.png", "c.png"):
+            (wrapper.image_dir / name).write_bytes(b"")
+        return wrapper
+
+    def _fake_cli(self, return_code=0, output="I... feature_extractor.cc] Processed file [2/3]"):
+        """Stand in for `run_streaming_command`: record the command and replay COLMAP's output."""
+        def run(command, desc, timeout, progress_callback=None, env=None):
+            self.runs.append({"command": [str(part) for part in command], "desc": desc,
+                              "env": env, "callback": progress_callback})
+            if progress_callback is not None:
+                for line in output.splitlines():
+                    progress_callback(line)
+            return return_code, output
+        return run
+
+    def test_extraction_and_matching_go_to_the_cuda_build(self):
+        wrapper = self._wrapper(self.bridge)
+        progress = []
+        wrapper.set_progress_hook(lambda value, total, label: progress.append((value, total, label)))
+        with mock.patch.object(pycolmap_wrapper, "run_streaming_command",
+                               side_effect=self._fake_cli()):
+            self.assertTrue(wrapper.feature_extractor(camera_model="SIMPLE_PINHOLE",
+                                                      max_num_features=10000,
+                                                      max_image_size=2048, use_gpu=True,
+                                                      mask_path="C:/masks"))
+            self.assertTrue(wrapper.sequential_matcher(use_gpu=True, overlap=15))
+        extract = self.runs[0]["command"]
+        self.assertEqual(extract[0], str(self.bridge.executable))
+        self.assertEqual(extract[1], "feature_extractor")
+        self.assertEqual(extract[extract.index("--SiftExtraction.use_gpu") + 1], "1")
+        self.assertEqual(extract[extract.index("--ImageReader.single_camera") + 1], "1")
+        self.assertEqual(extract[extract.index("--SiftExtraction.max_num_features") + 1], "10000")
+        self.assertEqual(extract[extract.index("--ImageReader.mask_path") + 1], "C:/masks")
+        # COLMAP's own progress record drives the bar, and the child runs at INFO to have it
+        self.assertIn((2, 3, "feature extraction (GPU) 2/3"), progress)
+        self.assertEqual(self.runs[0]["env"].get("GLOG_minloglevel"),
+                         pycolmap_wrapper.GLOG_LEVEL_INFO)
+        self.assertEqual(self.fake.calls, [])          # ... the CPU path was not used
+        match = self.runs[1]["command"]
+        self.assertEqual(match[1], "sequential_matcher")
+        self.assertEqual(match[match.index("--SequentialMatching.overlap") + 1], "15")
+        self.assertEqual(match[match.index("--SiftMatching.use_gpu") + 1], "1")
+
+    def test_native_cuda_pycolmap_wins_over_the_bridge(self):
+        self.fake.has_cuda = True
+        wrapper = self._wrapper(self.bridge)
+        with mock.patch.object(pycolmap_wrapper, "run_streaming_command",
+                               side_effect=self._fake_cli()) as cli:
+            self.assertTrue(wrapper.feature_extractor(use_gpu=True))
+        cli.assert_not_called()
+        self.fake.call("extract")                      # pycolmap did the work, in-process
+
+    def test_use_gpu_false_keeps_the_cpu_path(self):
+        wrapper = self._wrapper(self.bridge)
+        with mock.patch.object(pycolmap_wrapper, "run_streaming_command",
+                               side_effect=self._fake_cli()) as cli:
+            self.assertTrue(wrapper.feature_extractor(use_gpu=False))
+        cli.assert_not_called()
+        self.fake.call("extract")
+
+    def test_no_bridge_keeps_the_cpu_path(self):
+        wrapper = self._wrapper(None)
+        self.assertIsNone(wrapper.colmap_path)
+        self.assertFalse(wrapper._bridge_active(True))
+        self.assertTrue(wrapper.feature_extractor(use_gpu=True))
+        self.fake.call("extract")
+
+    def test_a_failed_bridge_falls_back_to_pycolmap(self):
+        wrapper = self._wrapper(self.bridge)
+        with mock.patch.object(pycolmap_wrapper, "run_streaming_command",
+                               side_effect=self._fake_cli(return_code=1, output="ERROR: no GPU")):
+            self.assertTrue(wrapper.feature_extractor(use_gpu=True))
+        self.fake.call("extract")                      # the CPU path took over
+
+
+    def test_the_switch_disables_the_bridge(self):
+        with mock.patch.dict("os.environ", {pycolmap_wrapper.BRIDGE_ENV: "0"}):
+            self.assertFalse(pycolmap_wrapper.gpu_bridge_enabled())
+            self.assertIsNone(pycolmap_wrapper.resolve_gpu_bridge(auto_install=False))
+        with mock.patch.dict("os.environ", {pycolmap_wrapper.BRIDGE_ENV: "1"}):
+            self.assertTrue(pycolmap_wrapper.gpu_bridge_enabled())
+
+    def test_resolution_downloads_once_and_reports_the_source(self):
+        manager = types.SimpleNamespace(
+            resolve_binary=mock.Mock(side_effect=[None, "C:/bin/colmap-3.11.1-cuda/COLMAP.bat"]),
+            ensure_binaries=mock.Mock(),
+            source_of=mock.Mock(return_value="download"))
+        with mock.patch.dict("os.environ", {"ENNDEE_AUTO_DOWNLOAD": "1"}), \
+                mock.patch.object(pycolmap_wrapper, "_bin_manager", return_value=manager):
+            bridge = pycolmap_wrapper.resolve_gpu_bridge(auto_install=True, log=lambda text: None)
+        self.assertIsNotNone(bridge)
+        self.assertEqual(bridge.executable, Path("C:/bin/colmap-3.11.1-cuda/COLMAP.bat"))
+        self.assertEqual(bridge.source, "download")
+        self.assertTrue(bridge.cuda)                   # <kind>-<version>-<flavor> folder
+        manager.ensure_binaries.assert_called_once()
+        self.assertEqual(manager.ensure_binaries.call_args.kwargs["flavor"], "cuda")
+
+    def test_a_cpu_build_is_reported_as_such(self):
+        manager = types.SimpleNamespace(resolve_binary=mock.Mock(
+            return_value="C:/bin/colmap-3.11.1-nocuda/COLMAP.bat"),
+            ensure_binaries=mock.Mock(), source_of=mock.Mock(return_value="pack bin/ folder"))
+        with mock.patch.object(pycolmap_wrapper, "_bin_manager", return_value=manager):
+            bridge = pycolmap_wrapper.resolve_gpu_bridge(auto_install=False, log=lambda text: None)
+        self.assertIsNotNone(bridge)
+        self.assertFalse(bridge.cuda)                  # never claim a GPU we do not have
+        manager.ensure_binaries.assert_not_called()
+
+    def test_auto_download_zero_blocks_the_download(self):
+        manager = types.SimpleNamespace(resolve_binary=mock.Mock(return_value=None),
+                                        ensure_binaries=mock.Mock(),
+                                        source_of=mock.Mock(return_value=""))
+        with mock.patch.dict("os.environ", {"ENNDEE_AUTO_DOWNLOAD": "0"}), \
+                mock.patch.object(pycolmap_wrapper, "_bin_manager", return_value=manager):
+            self.assertIsNone(pycolmap_wrapper.resolve_gpu_bridge(auto_install=True,
+                                                                  log=lambda text: None))
+        manager.ensure_binaries.assert_not_called()
+
+    def test_resolution_without_download_uses_what_is_there(self):
+        manager = types.SimpleNamespace(resolve_binary=mock.Mock(return_value=None),
+                                        ensure_binaries=mock.Mock(),
+                                        source_of=mock.Mock(return_value=""))
+        with mock.patch.object(pycolmap_wrapper, "_bin_manager", return_value=manager):
+            self.assertIsNone(pycolmap_wrapper.resolve_gpu_bridge(auto_install=False,
+                                                                  log=lambda text: None))
+        manager.ensure_binaries.assert_not_called()
+
+
 class CpuNoticeTests(unittest.TestCase):
     """The "no CUDA build" explanation is a build property - one line, not one per stage."""
 
@@ -398,18 +542,60 @@ class NativeNodeTests(unittest.TestCase):
                   "cuda": {"available": True, "version": "13.0", "device": "RTX 5090"},
                   "cuda_major": 13, "optional_attention": {"flash_attn": False,
                                                            "sageattention": True}}
-        with mock.patch.object(native, "ensure_accelerators", return_value=report) as call:
+        with mock.patch.object(native, "ensure_accelerators", return_value=report) as call, \
+                mock.patch.object(native, "resolve_gpu_bridge", return_value=None) as bridge:
             colmap_exe, glomap_exe = native.ColmapLichtfeldTracker()._setup_binaries(
                 "", "", "global", True, "native")
         self.assertEqual((colmap_exe, glomap_exe), ("pycolmap", None))
         self.assertTrue(call.call_args.kwargs["auto_install"])
+        self.assertTrue(bridge.call_args.kwargs["auto_install"])   # may fetch the CUDA build
+
+    def test_the_bridge_reaches_the_header_and_the_wrapper(self):
+        report = {"pycolmap": {"available": True, "version": "4.2.1", "cuda": False,
+                               "mode": "cpu-fallback", "reason": "Windows wheel has no CUDA"},
+                  "onnxruntime": {"version": "1.30.0", "providers": ["CUDAExecutionProvider"],
+                                  "cuda": True},
+                  "cuda": {"available": True, "version": "13.0", "device": "RTX 5090"},
+                  "cuda_major": 13, "optional_attention": {}}
+        bridge = pycolmap_wrapper.GpuBridge("C:/bin/colmap-3.11.1-cuda/COLMAP.bat", "download",
+                                            cuda=True)
+        node = native.ColmapLichtfeldTracker()
+        header = []
+        node._status = types.SimpleNamespace(set_stage=lambda *a: None,
+                                             set_header=lambda lines: header.extend(lines),
+                                             progress=lambda *a: None)
+        node._use_gpu = True
+        with mock.patch.object(native, "ensure_accelerators", return_value=report), \
+                mock.patch.object(native, "resolve_gpu_bridge", return_value=bridge) as resolve:
+            node._setup_binaries("", "", "global", True, "native")
+        resolve.assert_called_once()
+        self.assertIs(node._gpu_bridge, bridge)
+        self.assertIn("+ CUDA bridge", node._backend_note)
+        self.assertTrue(any("CUDA COLMAP bridge" in line for line in header))
+        self.assertTrue(any("feature extraction + matching run on the GPU" in line
+                            for line in header))
+        self.assertIs(node._create_wrapper("pycolmap", None, "global").gpu_bridge, bridge)
+
+    def test_the_bridge_is_not_fetched_without_use_gpu(self):
+        report = {"pycolmap": {"available": True, "version": "4.2.1", "cuda": False,
+                               "mode": "cpu", "reason": "no CUDA device"},
+                  "onnxruntime": {"version": "1.30.0", "providers": [], "cuda": False},
+                  "cuda_major": 13, "optional_attention": {}}
+        node = native.ColmapLichtfeldTracker()
+        node._use_gpu = False
+        with mock.patch.object(native, "ensure_accelerators", return_value=report), \
+                mock.patch.object(native, "resolve_gpu_bridge") as resolve:
+            node._setup_binaries("", "", "global", True, "native")
+        resolve.assert_not_called()
+        self.assertIsNone(node._gpu_bridge)
 
     def test_setup_aborts_without_pycolmap(self):
         report = {"pycolmap": {"available": False, "version": "", "cuda": False,
                                "mode": "missing", "reason": "not installed"},
                   "onnxruntime": {"version": "", "providers": [], "cuda": False},
                   "cuda_major": 13, "optional_attention": {}}
-        with mock.patch.object(native, "ensure_accelerators", return_value=report):
+        with mock.patch.object(native, "ensure_accelerators", return_value=report), \
+                mock.patch.object(native, "resolve_gpu_bridge", return_value=None):
             self.assertEqual(
                 native.ColmapLichtfeldTracker()._setup_binaries("", "", "global", False,
                                                                 "native"),
@@ -420,7 +606,8 @@ class NativeNodeTests(unittest.TestCase):
                                "mode": "cpu", "reason": "no CUDA device"},
                   "onnxruntime": {"version": "1.30.0", "providers": [], "cuda": False},
                   "cuda_major": 13, "optional_attention": {}}
-        with mock.patch.object(native, "ensure_accelerators", return_value=report) as call:
+        with mock.patch.object(native, "ensure_accelerators", return_value=report) as call, \
+                mock.patch.object(native, "resolve_gpu_bridge", return_value=None):
             native.ColmapLichtfeldTracker()._setup_binaries("", "", "global", False,
                                                             "native")
         self.assertFalse(call.call_args.kwargs["auto_install"])
