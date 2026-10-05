@@ -9,6 +9,14 @@ pack a real *all-in-one* package: it downloads the tested COLMAP + GLOMAP
 binaries into ``<Enndees-Nodepack>/bin/`` so the "GLOMAP Lichtfeld Tracker
 (Enndee)" node works right away - no manual COLMAP/GLOMAP installation needed.
 
+It also installs/repairs the python accelerators used by the pack:
+
+    pycolmap         - COLMAP's native Python API ("COLMAP for Lichtfeld" node,
+                       no binaries at all - GLOMAP is part of COLMAP >= 3.12)
+    onnxruntime-gpu  - CUDA ONNX runtime for the RMBG/ONNX nodes, matched to the
+                       CUDA version of the installed torch; the shadowing CPU
+                       wheel (``onnxruntime``) is removed if it is present
+
 Manual usage::
 
     python install.py                  # download what is missing
@@ -18,6 +26,7 @@ Manual usage::
     python install.py --only glomap    # single component
     python install.py --pin glomap="D:\\Tools\\glomap-1.2.0\\bin\\glomap.exe"
     python install.py --skip-binaries  # do not download anything
+    python install.py --skip-accelerators   # leave the python packages alone
 
 Pinned versions (see ``enndee_bin.py`` for the URLs and checksums):
 
@@ -66,6 +75,40 @@ def install_requirements(verbose: bool = True) -> int:
     return result.returncode
 
 
+def setup_accelerators(auto_install: bool = True) -> int:
+    """Install/repair pycolmap and a CUDA-matching onnxruntime-gpu.
+
+    Shared with the "COLMAP for Lichtfeld (Enndee)" node - see
+    ``nodes/enndee_accelerators.py``. Never fatal: the pack works without them
+    (the native COLMAP node needs pycolmap, the ONNX nodes fall back to the CPU).
+    """
+    # ``enndee_accelerators`` imports ``enndee_colmap.pycolmap_wrapper``, so both
+    # the pack root and nodes/ have to be importable (same as __init__.py does).
+    sys.path.insert(0, str(PACK_DIR / "nodes"))
+    sys.path.insert(0, str(PACK_DIR))
+    try:
+        from enndee_accelerators import ensure_accelerators
+    except Exception as exc:  # noqa: BLE001
+        step(f"Could not load the accelerator helper: {exc}")
+        return 1
+
+    step("Checking the python accelerators (pycolmap, onnxruntime-gpu)")
+    try:
+        report = ensure_accelerators(auto_install=auto_install, log=step)
+    except Exception as exc:  # noqa: BLE001
+        step(f"Accelerator setup failed: {exc}")
+        return 1
+
+    colmap = report["pycolmap"]
+    onnx = report["onnxruntime"]
+    step(f"pycolmap    : {colmap['version'] or 'missing'}")
+    step(f"onnxruntime : {onnx['version'] or 'missing'} "
+         f"[{', '.join(onnx['providers']) or 'no providers'}]")
+    if not auto_install and (not colmap["available"] or not onnx["cuda"]):
+        step("(check only - run without --check to install what is missing)")
+    return 0
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         prog="install.py",
@@ -85,6 +128,8 @@ def parse_args(argv=None):
                              "--pin colmap=C:\\Tools\\colmap-x64-windows-cuda\\COLMAP.bat")
     parser.add_argument("--skip-binaries", action="store_true",
                         help="do not download or resolve any binary")
+    parser.add_argument("--skip-accelerators", action="store_true",
+                        help="do not install/repair pycolmap and onnxruntime-gpu")
     parser.add_argument("--with-requirements", action="store_true",
                         help="also run pip install -r requirements.txt")
     return parser.parse_args(argv)
@@ -101,6 +146,12 @@ def main(argv=None) -> int:
 
     if args.with_requirements:
         install_requirements(verbose=True)
+
+    if args.skip_accelerators:
+        step("Skipping the python accelerators (--skip-accelerators)")
+    else:
+        setup_accelerators(auto_install=not args.check)
+        print(BANNER)
 
     if args.skip_binaries:
         step("Skipping COLMAP/GLOMAP setup (--skip-binaries)")

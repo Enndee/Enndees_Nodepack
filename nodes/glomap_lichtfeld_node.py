@@ -391,6 +391,10 @@ class GLOMAPLichtfeldTracker:
                    "with automatic binary setup and a complete Lichtfeld Studio "
                    "dataset export.")
 
+    # The native pycolmap node ("COLMAP for Lichtfeld (Enndee)") overrides these
+    # two hooks; everything below the backend setup is shared verbatim.
+    BACKEND_READY_MESSAGE = "Binary setup complete"
+
     # =======================================================================
     # Main entry point
     # =======================================================================
@@ -418,7 +422,7 @@ class GLOMAPLichtfeldTracker:
                      "'python install.py' inside the Enndees-Nodepack folder "
                      "or set ENNDEE_COLMAP_PATH.")
             return self._empty(1)
-        log("Binary setup complete")
+        log(self.BACKEND_READY_MESSAGE)
 
         # ---------- 2. Load the input images -----------------------------
         export_images, sf_images, images_from_path = self._load_input_images(
@@ -495,16 +499,8 @@ class GLOMAPLichtfeldTracker:
         wrapper = None
         frames_out = int(export_images.shape[0])
         try:
-            wrapper = GLOMAPWrapper(
-                colmap_path=str(colmap_exe),
-                glomap_path=str(glomap_exe) if glomap_exe else None,
-            )
+            wrapper = self._create_wrapper(colmap_exe, glomap_exe, mapper_backend)
             wrapper.progress_callback = log
-            log(f"COLMAP : {colmap_exe}  [{source_of('colmap')}]")
-            if mapper_backend == "glomap":
-                log(f"GLOMAP : {glomap_exe}  [{source_of('glomap')}]")
-            else:
-                log("Mapper : COLMAP global_mapper")
 
             log(f"Starting SfM: {int(sf_images.shape[0])} frames; "
                 f"feature extraction -> {matcher} matching -> "
@@ -584,6 +580,21 @@ class GLOMAPLichtfeldTracker:
     # =======================================================================
     # Helpers: binaries
     # =======================================================================
+
+    def _create_wrapper(self, colmap_exe, glomap_exe, mapper_backend):
+        """Create the SfM wrapper and log which executables are used.
+
+        The native pycolmap node overrides this (no executables at all).
+        """
+        log(f"COLMAP : {colmap_exe}  [{source_of('colmap')}]")
+        if mapper_backend == "glomap":
+            log(f"GLOMAP : {glomap_exe}  [{source_of('glomap')}]")
+        else:
+            log("Mapper : COLMAP global_mapper")
+        return GLOMAPWrapper(
+            colmap_path=str(colmap_exe),
+            glomap_path=str(glomap_exe) if glomap_exe else None,
+        )
 
     def _setup_binaries(self, colmap_path, glomap_path, mapper_backend,
                         auto_install_binaries, binary_flavor):

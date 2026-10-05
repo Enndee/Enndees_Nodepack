@@ -9,6 +9,13 @@ requests>=2.28.0        # MiniMax H3 Direct Promptor (LLM providers)
 # working without it, only 'use_rmbg' is disabled):
 # transparent_background>=1.2.16
 
+# Installed on demand instead of here, because they are platform/GPU specific
+# and large - both 'install.py' and the "COLMAP for Lichtfeld (Enndee)" node
+# take care of them automatically:
+#   pycolmap         - native COLMAP python API (the native tracker node)
+#   onnxruntime-gpu  - CUDA ONNX runtime, matched to torch's CUDA version
+#                      (never install the CPU wheel 'onnxruntime' next to it!)
+
 # Optional (Depth-Anything-3 variants in Meridian Geometry's fast-depth mode).
 # Install WITHOUT dependency resolution: the wheel pins numpy<2 and would pull
 # xformers/open3d/pycolmap/moviepy/gsplat/evo into ComfyUI's environment. The

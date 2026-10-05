@@ -86,6 +86,14 @@ except Exception as _e:
     print(f"\033[31m[Enndee] MeridianPromptComposer unavailable: {_e}\033[0m")
     MeridianPromptComposer = None
 
+# COLMAP for Lichtfeld: the GLOMAP tracker through COLMAP's native Python API
+# (pycolmap) - no COLMAP/GLOMAP binaries are downloaded.
+try:
+    from colmap_lichtfeld_node import ColmapLichtfeldTracker
+except Exception as _e:
+    print(f"\033[31m[Enndee] ColmapLichtfeldTracker unavailable: {_e}\033[0m")
+    ColmapLichtfeldTracker = None
+
 # Global save-behavior hook (no node): strip ComfyUI's running counter and
 # number files only when the target name is already taken. Opt out with the
 # environment variable ENNDEE_KEEP_FILE_COUNTER=1.
@@ -148,6 +156,10 @@ if Enndee_SharpFrameSelector is not None:
 if MeridianPromptComposer is not None:
     NODE_CLASS_MAPPINGS["MeridianPromptComposer"] = MeridianPromptComposer
     NODE_DISPLAY_NAME_MAPPINGS["MeridianPromptComposer"] = "Meridian Prompt Composer (conditional pictures)"
+
+if ColmapLichtfeldTracker is not None:
+    NODE_CLASS_MAPPINGS["Enndee_ColmapLichtfeldTracker"] = ColmapLichtfeldTracker
+    NODE_DISPLAY_NAME_MAPPINGS["Enndee_ColmapLichtfeldTracker"] = "COLMAP for Lichtfeld (Enndee)"
 
 WEB_DIRECTORY = os.path.join(_pack_dir, "web")
 

@@ -29,6 +29,7 @@ Lichtfeld Studio dataset in a single step.
 | Node | ID | Purpose |
 |------|----|---------|
 | **GLOMAP Lichtfeld Tracker (Enndee)** | `Enndee_GLOMAPLichtfeldTracker` | Global SfM camera tracking + Lichtfeld dataset export |
+| **COLMAP for Lichtfeld (Enndee)** | `Enndee_ColmapLichtfeldTracker` | The same tracker through COLMAP's **native Python API** (pycolmap) - GLOMAP is part of COLMAP >= 3.12, so **nothing is downloaded**; installs/repairs `pycolmap` + `onnxruntime-gpu` on demand |
 | **Video Frame Extractor + Audio (Enndee)** | `Enndee_VideoFrameExtractorWithAudio` | Frame/audio extraction with an in-node timeline widget |
 | **MiniMax H3 Direct Promptor (Enndee)** | `H3_Multimodal_Promptor_Enndee` | Official-format MiniMax H3 prompts from reference images (vision LLM) |
 | **Resolution Selector (Enndee)** | `Enndee_ResolutionSelector` | Aspect-ratio + megapixel sizing plus the nine core resize types and a resized image output |
@@ -560,6 +561,61 @@ enter the SfM dataset.
 * Fast camera motion / shaky footage: increase `sequential_overlap` (20-30) and
   `max_features`, lower `frame_step` to 1.
 * Very large images (> 4K): `downscale_factor=0.5` - the export stays full res.
+
+---
+
+## Node: COLMAP for Lichtfeld (Enndee)
+
+The same tracker as above, but the Structure-from-Motion backend is **COLMAP's own
+Python API** (`pycolmap`) instead of downloaded executables. GLOMAP was merged into
+COLMAP (COLMAP >= 3.12 ships the global mapper), so `pycolmap.global_mapping()` *is*
+the GLOMAP pipeline - nothing is downloaded, pinned or searched for.
+
+| binary tracker | native tracker |
+| --- | --- |
+| `colmap feature_extractor` | `pycolmap.extract_features` |
+| `colmap sequential_matcher` | `pycolmap.match_sequential` |
+| `colmap exhaustive_matcher` | `pycolmap.match_exhaustive` |
+| `colmap global_mapper` / `glomap mapper` | `pycolmap.global_mapping` |
+
+Everything else - RMBG background removal, masks, frame stepping, the complete
+Lichtfeld Studio dataset export (`images/`, `masks/`, `sparse/` incl. the TXT model)
+and the trajectory / point-cloud outputs - is shared verbatim with the binary node.
+
+### Widgets
+
+Identical to the GLOMAP tracker **except**:
+
+* `colmap_path`, `glomap_path` and `binary_flavor` are gone - there is no binary to
+  point at.
+* `mapper_backend` is `global` (default) or `incremental` (COLMAP's classic mapper,
+  slower but sometimes more forgiving); the old names `glomap` and `colmap_global`
+  are still accepted.
+* `auto_install_binaries` now means "install/repair the python accelerators" - see
+  below.
+
+### Environment / accelerators
+
+With `auto_install_binaries=True` (default) the node checks and, if needed, installs
+
+* `pycolmap` - this node's backend, and
+* `onnxruntime-gpu` - the CUDA ONNX runtime for the RMBG / ONNX nodes, matched to
+  the CUDA version of your torch (CUDA 13 -> `>= 1.30`, CUDA 12 -> `1.19 .. 1.29`).
+  A shadowing CPU wheel (`onnxruntime`) is removed, because it silently makes
+  `get_available_providers()` lose `CUDAExecutionProvider`.
+
+`python install.py` does the same at setup time (`--skip-accelerators` opts out), and
+`ENNDEE_AUTO_DOWNLOAD=0` disables every automatic download/install.
+
+### CPU vs CUDA (read this)
+
+The official `pycolmap` wheels are built **without CUDA on Windows** (CUDA wheels are
+Linux only), so SIFT extraction, matching and the bundle adjustment run on the CPU.
+The binary tracker with its CUDA COLMAP build is faster in exactly those stages; the
+native node wins on setup (no ~1 GB download, no version pinning) and a 100+ frame
+orbit still finishes in a couple of minutes. `use_gpu` switches to the GPU
+automatically as soon as a CUDA-enabled pycolmap is installed
+(`pycolmap.has_cuda`).
 
 ---
 
