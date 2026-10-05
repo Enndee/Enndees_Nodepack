@@ -1,0 +1,18 @@
+8: import json
+9: import math
+10: import sys
+11: import unittest
+12: from pathlib import Path
+14: import torch
+20: import enndee_meridian_fast_depth as fast_depth  # noqa: E402
+21: from enndee_meridian_auto_camera import (  # noqa: E402
+182: class AutoCameraSurfaceTests(unittest.TestCase):
+234: class AutoCameraProbeTests(unittest.TestCase):
+256: class AutoCameraPathTests(unittest.TestCase):
+649: class AutoCameraGuardTests(unittest.TestCase):
+674: class AutoCameraEstimateTests(unittest.TestCase):
+926: class AutoCameraVisibilityTests(unittest.TestCase):
+1207: class AutoCameraSceneTests(unittest.TestCase):
+1299: class AutoCameraOrbitShapeTests(unittest.TestCase):
+1617: class AutoCameraOrbitAngleTests(unittest.TestCase):
+1656: class AutoCameraSpiralCoverageTests(unittest.TestCase):

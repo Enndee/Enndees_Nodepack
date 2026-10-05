@@ -1,0 +1,24 @@
+keys = json.loads(document)["path"]
+        self.assertGreater(unit, 0.0)
+        for key in keys:
+            self.assertAlmostEqual(math.dist(key["pos"], key["look"]),
+                                   summary["orbit_radius"] / unit, delta=0.05)
+base_keys = json.loads(base)["path"]
+        scaled_keys = json.loads(scaled)["path"]
+        self.assertEqual(len(base_keys), len(scaled_keys))
+        for left, right in zip(base_keys, scaled_keys):
+            for axis in range(3):
+scaled_keys = json.loads(scaled)["path"]
+        self.assertEqual(len(base_keys), len(scaled_keys))
+        for left, right in zip(base_keys, scaled_keys):
+            for axis in range(3):
+                self.assertAlmostEqual(left["pos"][axis], right["pos"][axis], places=2)
+for key in json.loads(document)["path"]:
+            position = [value * unit for value in key["pos"]]
+            self.assertAlmostEqual(math.dist(position, summary["orbit_centre"]),
+                                   summary["orbit_radius"], delta=0.05)
+
+keys = json.loads(document)["path"]
+        self.assertGreaterEqual(len(keys), 5)
+        unit = summary["median_depth"]
+        for key in keys:                                  # the keys are median-depth relative

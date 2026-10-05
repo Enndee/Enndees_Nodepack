@@ -1,0 +1,39 @@
+def _reference(height=64, width=64):
+    return torch.zeros(1, height, width, 3)
+
+
+def _depth_with_subject(height=64, width=64, background=4.0, near=1.0, far=1.0, size=24):
+    """Background with a near square 'subject'; its left 3/4 sit at `near`, the rest at `far`.
+
+    The two tones let a test push the subject's depth profile apart (the geometric pivot must
+    then sit between them); the default keeps the plate flat so the subject heuristic is not part
+    of what is being measured.
+    """
+    depth = torch.full((height, width), background)
+    top, left = (height - size) // 2, (width - size) // 2
+def _depth_with_subject(height=64, width=64, background=4.0, near=1.0, far=1.0, size=24):
+    """Background with a near square 'subject'; its left 3/4 sit at `near`, the rest at `far`.
+
+    The two tones let a test push the subject's depth profile apart (the geometric pivot must
+    then sit between them); the default keeps the plate flat so the subject heuristic is not part
+    of what is being measured.
+    """
+    depth = torch.full((height, width), background)
+    top, left = (height - size) // 2, (width - size) // 2
+    depth[top:top + size, left:left + size] = far
+    split = left + int(size * 0.75)
+    depth[top:top + size, left:split] = near
+    return depth
+def _estimate(depth, **overrides):
+    options = dict(frames=73, target=SUBJECT_TARGET, max_speed=DEFAULT_MAX_SPEED,
+                   depth_fn=lambda reference: depth)
+    options.update(overrides)
+    return estimate_camera_path(_reference(), **options)
+
+
+def _orbit_angles(position, pivot):
+    """(azimuth, elevation) of a camera position around a pivot; yaw 0 = in front of it."""
+    delta = [position[axis] - pivot[axis] for axis in range(3)]
+    horizontal = math.hypot(delta[0], delta[2])
+    return (math.degrees(math.atan2(delta[0], -delta[2])),
+            math.degrees(math.atan2(-delta[1], horizontal)))

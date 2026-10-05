@@ -1529,7 +1529,12 @@ def _spiral_motion_samples(frames, pivot, radius, scale, size, centre, mirror, p
     if p95 is None:
         return lead + coil[1:coil_frames + 1]
     motion = torch.where(counts >= 8, p95, p95.new_full((), 0.0)).to(torch.float64)
-    cumulative = torch.cumsum(motion, dim=0)
+    # The cumulative-motion bookkeeping is a few thousand numbers, so it runs on the *CPU*: the
+    # pool - and with it `p95`/`counts` - lives on the GPU whenever the depth map came from a CUDA
+    # model, while `torch.linspace` always builds on the CPU. Mixing them is a hard RuntimeError in
+    # `torch.searchsorted` ("got self is on cpu, different from other tensors on cuda:0" - `self` is
+    # ATen's name for the *values* argument, i.e. the CPU `targets`).
+    cumulative = torch.cumsum(motion.detach().cpu(), dim=0)
     total = float(cumulative[-1])
     if total <= 1e-9:
         return lead + coil[1:coil_frames + 1]

@@ -1761,6 +1761,36 @@ class AutoCameraSpiralCoverageTests(unittest.TestCase):
                                    coverage=SPIRAL_COVERAGE)
         self.assertEqual(len(fallback), 73)
 
+    @unittest.skipUnless(torch.cuda.is_available(), "needs a CUDA device")
+    def test_the_motion_even_split_survives_a_cuda_surface(self):
+        """A depth model on the GPU hands us CUDA points - the sampler must not mix devices.
+
+        `torch.linspace` always builds on the CPU, while the pool (and with it the cumulative
+        motion) lives on `cuda:0` when the depth map came from a CUDA model. That combination is a
+        hard RuntimeError in `torch.searchsorted`: "got self is on cpu, different from other tensors
+        on cuda:0" (`self` is ATen's name for the *values* argument).
+        """
+        surface = probe_surface(_reference(), depth_fn=lambda reference: _depth_with_subject())
+        surface = {key: value.cuda() if torch.is_tensor(value) else value
+                   for key, value in surface.items()}
+        distance, pivot, _metrics = subject_framing(surface, 40.0)
+        pool = _decimate(surface["content_cloud"], DRIFT_POOL)
+        self.assertTrue(pool.is_cuda)                       # the fixture really is on the GPU
+        even = subject_samples(73, pivot, distance, 1.0, 1.0, None, ORBIT_DIRECTION_DEFAULT,
+                               coverage=SPIRAL_COVERAGE, motion_pool=pool, motion_surface=surface)
+        self.assertEqual(len(even), 73)
+        self.assertAlmostEqual(math.dist(even[-1], pivot), distance, places=6)
+        # ... and the full entry point the node calls, with a CUDA image *and* a CUDA depth map
+        depth = _depth_with_subject().cuda()
+        signal, summary = estimate_camera_path(_reference().cuda(), 73, target=SUBJECT_TARGET,
+                                               max_speed=DEFAULT_MAX_SPEED,
+                                               depth_fn=lambda image: depth, subject_fill=40.0,
+                                               coverage=SPIRAL_COVERAGE)
+        keys = json.loads(signal)["path"]
+        self.assertGreater(len(keys), 5)               # a real path came back (keys are sparse)
+        self.assertEqual(summary["frames"], 73)
+        self.assertTrue(summary["visibility_ok"])
+
     def test_envelope_and_fit_report_the_spiral(self):
         surface = probe_surface(_reference(), depth_fn=lambda reference: _depth_with_subject())
         distance, pivot, metrics = subject_framing(surface, 40.0)

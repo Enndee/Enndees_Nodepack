@@ -1,0 +1,36 @@
+83: subject_samples,
+262: samples = subject_samples(73, pivot, 5.0, 1.0)
+400: tight = subject_samples(73, pivot, radius, 1.0, 0.5)
+401: wide = subject_samples(73, pivot, radius, 1.0, 1.2)   # 1.2 * 62 deg stays inside the limit
+413: samples = subject_samples(73, pivot, 5.0, 4.0, 4.0)        # absurd amplitudes on purpose
+970: positions = subject_samples(73, pivot, close, visibility["amplitude_cap"], 1.0)
+1021: positions = subject_samples(summary["frames"], summary["pivot"], summary["orbit_radius"],
+1059: samples = subject_samples(73, pivot, 5.0, 1.0, 1.0, 180.0)
+1075: o_only = subject_samples(73, pivot, 5.0, 1.0, 1.0, 0.0)
+1090: samples = subject_samples(73, pivot, 5.0, 1.0, 1.0, 0.0, ORBIT_DIRECTION_DEFAULT)
+1107: mirrored = subject_samples(73, pivot, 5.0, 1.0, 1.0, 0.0, "clockwise")
+1144: ccw = subject_samples(73, pivot, 5.0, 1.0, 1.0, 360.0, ORBIT_DIRECTION_DEFAULT)
+1145: cw = subject_samples(73, pivot, 5.0, 1.0, 1.0, 360.0, "clockwise")
+1178: positions = subject_samples(summary["frames"], summary["pivot"], summary["orbit_radius"],
+1198: positions = subject_samples(73, pivot, 5.0, 1.0)      # the built-in amplitudes
+1211: def _surface(self, half_width=1.0, aspect=16.0 / 9.0):
+1313: plain = subject_samples(73, pivot, 5.0, 1.0, 1.0, None, ORBIT_DIRECTION_DEFAULT,
+1315: turned = subject_samples(73, pivot, 5.0, 1.0, 1.0, None, ORBIT_DIRECTION_DEFAULT,
+1331: samples = subject_samples(73, pivot, 5.0, 1.0, 1.0, None, ORBIT_DIRECTION_DEFAULT,
+1348: samples = subject_samples(73, pivot, 5.0, 1.0, 1.0, None, ORBIT_DIRECTION_DEFAULT,
+1391: samples = subject_samples(73, pivot, 5.0, 1.0, 1.0, None, ORBIT_DIRECTION_DEFAULT,
+1452: samples = subject_samples(73, pivot, 5.0, 1.0, 1.0, None, ORBIT_DIRECTION_DEFAULT,
+1497: alone = subject_samples(73, pivot, 5.0, 1.0, 1.0, None, ORBIT_DIRECTION_DEFAULT,
+1499: both = subject_samples(73, pivot, 5.0, 1.0, 1.0, None, ORBIT_DIRECTION_DEFAULT,
+1501: legacy = subject_samples(73, pivot, 5.0, 1.0, 1.0, FULL_CIRCLE, ORBIT_DIRECTION_DEFAULT)
+1520: samples = subject_samples(73, pivot, 5.0, 1.0, 1.0, None, "clockwise",
+1606: legacy = subject_samples(73, pivot, 5.0, 1.0, 1.0, 270.0, ORBIT_DIRECTION_DEFAULT)
+1659: def test_spiral_is_a_coverage_option(self):
+1672: def test_spiral_starts_on_the_view_axis_and_ends_in_the_picture_plane(self):
+1716: samples = subject_samples(73, pivot, 5.0, 1.0, 1.0, None, ORBIT_DIRECTION_DEFAULT,
+1741: def test_the_motion_even_split_keeps_the_ends_and_costs_less_motion(self):
+1746: linear = subject_samples(73, pivot, distance, 1.0, 1.0, None, ORBIT_DIRECTION_DEFAULT,
+1748: even = subject_samples(73, pivot, distance, 1.0, 1.0, None, ORBIT_DIRECTION_DEFAULT,
+1749: coverage=SPIRAL_COVERAGE, motion_pool=pool, motion_surface=surface)
+1760: fallback = subject_samples(73, pivot, distance, 1.0, 1.0, None, ORBIT_DIRECTION_DEFAULT,
+1764: def test_envelope_and_fit_report_the_spiral(self):
