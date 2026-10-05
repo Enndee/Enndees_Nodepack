@@ -239,16 +239,18 @@ image the Geometry node receives. The estimator:
        plus a glide in to the far dial's centre: both sides without a full lap.
        When the budget cannot pay for the back part, *it* is cut - the front O keeps
        the radius the fit found (the console names the cut).
-     - `Spiral` - a rising helix, for a splat that wants the top as well. It opens
-       on the same framed front pose (frame 0 is the middle of the O), leads in
-       along the O's 2 o'clock direction until the elevation reaches 10 degrees and
-       then winds **two rounds** in Auto Orbit Direction (counter-clockwise by
-       default) while the elevation climbs to the zenith (clamped to 88 deg so the
-       up vector stays stable) - the clip ends looking *down* on the subject from
-       above, on the clock's 9 o'clock side. Every side *and* the top are shown.
-       The rounds are the floor: the fit winds further when the budget allows and
-       the speed cap cuts them when it cannot pay (the console and the path
-       description name it, e.g. "1.35 rounds (cut from 2 by the speed cap)").
+     - `Spiral` - a rising **coil around the view axis** (x = the depth of the source
+       picture). Frame 0 is the framed front pose with the camera *on* that axis,
+       looking straight at the picture (the middle of the frame); the lead-in follows
+       the 2 o'clock direction until the arc between the camera and the axis reaches
+       10 degrees; then the coil winds **two rounds** in Auto Orbit Direction
+       (counter-clockwise by default) while that arc climbs to **90 degrees** - the
+       camera ends *in the picture's own plane*, on the clock's 9 o'clock side,
+       looking at the scene from the side, orthogonally to the original view. The
+       front, every side and the top are covered on the way. The rounds are the
+       floor: the fit winds further when the budget allows and the speed cap cuts
+       them when it cannot pay (the console and the path description name it, e.g.
+       "1.35 rounds (cut from 2 by the speed cap)").
    - **Manual** - the manual styles below, but aimed at the estimated pivot
      instead of the absolute look-pivot (the `path_pivot_*` widgets are ignored
      and hidden then; every other path widget applies as usual).

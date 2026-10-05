@@ -67,9 +67,9 @@ from enndee_meridian_auto_camera import (
     ORBIT_VIEW_ANGLE_MAX,
     ORBIT_VIEW_ANGLE_MIN,
     SCENE_FILL,
-    SPIRAL_LEAD_ELEVATION,
+    SPIRAL_END_ARC,
+    SPIRAL_LEAD_ARC,
     SPIRAL_ROUNDS,
-    SPIRAL_TOP_ELEVATION,
     SUBJECT_FILL,
     SUBJECT_FILL_DEFAULT,
     SUBJECT_FILL_MAX,
@@ -411,16 +411,18 @@ class MeridianParametersAndCamera:
                         f"whole loop CLOCKWISE: 9 -> 12 (over the subject's back head) -> 3 (the far "
                         f"level point) -> 6 (under the back) -> 8, one hour short of its start so no "
                         f"frame is shown twice - the clip shows both sides without a full lap. "
-                        f"'{ORBIT_COVERAGES[2]}' flies a RISING HELIX instead: it starts on the same "
-                        f"framed front pose (the middle of the O), leads in along the O's 2 o'clock "
-                        f"direction until the elevation reaches {SPIRAL_LEAD_ELEVATION:g} deg, and then "
-                        f"winds {SPIRAL_ROUNDS:g} rounds in the Auto Orbit Direction "
-                        f"(counter-clockwise by default) while the elevation climbs to "
-                        f"{SPIRAL_TOP_ELEVATION:g} deg - the clip ends looking DOWN on the subject "
-                        f"from above, on the clock's 9 o'clock side. It shows every side AND the top, "
-                        f"which is what a splat wants. Auto "
+                        f"'{ORBIT_COVERAGES[2]}' flies a RISING COIL around the view axis instead: "
+                        f"it starts on the same framed front pose - the camera ON the view axis, "
+                        f"looking straight at the picture (the middle of the frame) - leads in along "
+                        f"the 2 o'clock direction until the arc between the camera and that axis "
+                        f"reaches {SPIRAL_LEAD_ARC:g} deg, and then winds {SPIRAL_ROUNDS:g} rounds in "
+                        f"the Auto Orbit Direction (counter-clockwise by default) while the arc "
+                        f"climbs to {SPIRAL_END_ARC:g} deg. At the end the camera sits IN the "
+                        f"picture's own plane on the clock's 9 o'clock side, so the clip finishes "
+                        f"looking at the scene from the side, orthogonally to the original view - "
+                        f"the front, every side and the top are covered on the way. Auto "
                         f"Max Speed always wins: when the budget cannot pay for the loop (or for the "
-                        f"spiral's rounds) it is cut short and the console line says so (more Output "
+                        f"coil's rounds) it is cut short and the console line says so (more Output "
                         f"Frames or a higher Auto Max Speed buy it back)."
                     ),
                 }),

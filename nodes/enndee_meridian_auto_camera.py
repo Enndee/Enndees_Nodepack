@@ -208,29 +208,31 @@ ORBIT_CUT_STEPS = 3
 ORBIT_DIRECTIONS = ("counter-clockwise", "clockwise")
 ORBIT_DIRECTION_DEFAULT = ORBIT_DIRECTIONS[0]
 
-# The Spiral coverage (2026-10-05): the front O's opening pose starts the move, but instead of
-# closing a circle the camera keeps climbing - a helix that shows every side *and* the top of the
-# subject, which is what a Lichtfeld/splat capture wants at the end of a clip.
-#   * frame 0 is the middle of the O (the framed pose, elevation 0), exactly like the front O's
-#     opening - "starts in the centre",
-#   * the lead-in follows the dial's 2 o'clock direction (the front O's own crane) and stops as soon
-#     as the elevation reaches `SPIRAL_LEAD_ELEVATION`, so the camera leaves the centre up and to
-#     the side without already flying the whole first quarter,
-#   * the helix then advances the azimuth monotonically in the Auto Orbit Direction
-#     (counter-clockwise by default) while the elevation climbs linearly to `SPIRAL_TOP_ELEVATION` -
-#     `SPIRAL_ROUNDS` revolutions in total, and the last pose lands on the 9 o'clock side
-#     (`SPIRAL_END_CLOCK_DEGREES` off the view-angle centre), i.e. the clip ends high above the
-#     subject looking down.
-# The azimuth advance is what the amplitude ladder scales: when frames x speed cap cannot pay for
-# the whole helix the *rounds* give way (never the cap), and the console/description names the cut -
-# the same rule the front/back modes apply to the back connection.
-SPIRAL_LEAD_ELEVATION = 10.0      # deg, the lead-in ends when the elevation reaches this
+# The Spiral coverage (2026-10-05, corrected): the camera starts ON the view axis - looking
+# straight at the picture, the middle of the frame - and unwinds around that axis like a coil
+# spring. Two angles describe it (the user's picture: z up, y horizontal, x = depth = the view
+# axis; theta = the arc from z, phi = the arc between the camera and x):
+#   * `phi` - the arc between the camera and the view axis - starts at 0 (the camera sits on the
+#     axis, the frontal view) and climbs to `SPIRAL_END_ARC` (90 deg), which puts the camera IN
+#     the picture's own plane: the clip ends looking at the scene from the side,
+#   * `psi` - the clock angle around that axis (12 = up, 3 = the subject's right, 6 = down,
+#     9 = left, i.e. the dial the front O uses) - winds `SPIRAL_ROUNDS` times and lands on
+#     `SPIRAL_END_CLOCK` (the clock's 9 = the subject's left).
+# So frame 0 is the framed frontal pose, the lead-in follows the 2 o'clock direction until the
+# arc reaches `SPIRAL_LEAD_ARC`, and the coil then circles the view axis with the arc rising
+# linearly to 90 deg. In the module's own `_place` terms:
+#   yaw = atan2(sin phi * sin psi, cos phi),  elevation = asin(sin phi * cos psi)
+# (see `spiral_pose`/`spiral_arc`/`spiral_clock`). The clock angle advance is what the amplitude
+# ladder scales: when frames x speed cap cannot pay for the whole coil the *rounds* give way
+# (never the cap), and the console/description names the cut - the same rule the front/back
+# modes apply to the back connection.
+SPIRAL_LEAD_ARC = 10.0            # deg, the lead-in ends when the arc from the view axis is this
 SPIRAL_LEAD_CLOCK = FRONT_ORBIT_START_CLOCK   # 2 o'clock - the lead-in's direction on the dial
-SPIRAL_ROUNDS = 2.0               # revolutions of the helix at amplitude scale 1
-SPIRAL_MIN_ROUNDS = 0.05          # the ladder's floor: below this the helix is a plain sweep
-SPIRAL_TOP_ELEVATION = 90.0       # deg, where the climb ends (straight above the subject) ...
-SPIRAL_ELEVATION_CEILING = 88.0   # ... clamped here: exactly at the zenith the up vector degenerates
-SPIRAL_END_CLOCK_DEGREES = 90.0   # deg, the azimuth side the last pose lands on (the clock's 9)
+SPIRAL_ROUNDS = 2.0               # revolutions around the view axis at amplitude scale 1
+SPIRAL_MIN_ROUNDS = 0.05          # the ladder's floor: below this the coil is a plain tilt
+SPIRAL_END_ARC = 90.0             # deg, where the arc ends - the picture's own plane (side view)
+SPIRAL_END_CLOCK = 9.0            # o'clock the last pose lands on (9 = the subject's left)
+SPIRAL_ELEVATION_CEILING = 88.0   # deg: the coil passes over the top - keep the up vector sane
 
 # Scene target: a lateral survey instead of a lap around the scene. Meridian's scene renders are
 # depth reprojections, so what a walk-in VR viewer needs is *side* coverage: rows of viewpoints
@@ -1362,57 +1364,108 @@ def _back_orbit_point(progress, centre, amplitude, mirror):
     return centre + mirror * amplitude * math.cos(angle), amplitude * math.sin(angle)
 
 
-def _spiral_geometry(centre, mirror, scale=1.0):
-    """(lead_yaw, end_yaw, sweep, top) of the Spiral coverage at amplitude scale `scale`.
+def spiral_pose(phi_degrees, psi_degrees):
+    """(yaw, elevation) of the point whose arc from the view axis is `phi` at clock `psi`.
 
-    The lead-in's direction is the dial's 2 o'clock ray (`SPIRAL_LEAD_CLOCK`, the same opening the
-    front O uses) and its length is set so the elevation reaches exactly `SPIRAL_LEAD_ELEVATION`
-    there. From that point the azimuth winds `SPIRAL_ROUNDS * scale` times around the subject and
-    then on to the 9 o'clock side (`SPIRAL_END_CLOCK_DEGREES` off the centre, mirrored like
-    everything else), so the total azimuth advance is the rounds *plus* that closing offset - which
-    is what makes the last pose land on the 9 o'clock side after the whole number of rounds. `top`
-    is the elevation the climb ends at: `SPIRAL_TOP_ELEVATION`, clamped to the gimbal-safe
-    `SPIRAL_ELEVATION_CEILING`.
+    `phi` 0 = the camera ON the view axis (the frontal view, the middle of the picture), 90 = the
+    picture's own plane; `psi` is the clock angle around that axis (12 = up, 3 = the subject's
+    right, 6 = down, 9 = left). The camera keeps its distance and always aims at the pivot, so the
+    subject keeps its place in the frame.
     """
-    clock = math.radians(90.0 - 30.0 * SPIRAL_LEAD_CLOCK)     # the O's own 2 o'clock angle
-    reach = SPIRAL_LEAD_ELEVATION / max(1e-6, math.sin(clock))
-    lead_yaw = centre + mirror * reach * math.cos(clock)
-    end_yaw = centre - mirror * SPIRAL_END_CLOCK_DEGREES
-    rounds = max(SPIRAL_MIN_ROUNDS, SPIRAL_ROUNDS * max(1e-6, float(scale)))
-    sweep = rounds * 360.0 + abs(lead_yaw - end_yaw)
-    return lead_yaw, end_yaw, sweep, min(SPIRAL_TOP_ELEVATION, SPIRAL_ELEVATION_CEILING)
+    phi = math.radians(float(phi_degrees))
+    psi = math.radians(float(psi_degrees))
+    horizontal = math.sin(phi) * math.sin(psi)      # the picture's horizontal (y in the sketch)
+    vertical = math.sin(phi) * math.cos(psi)        # the picture's vertical (z, up)
+    elevation = math.degrees(math.asin(max(-1.0, min(1.0, vertical))))
+    return math.degrees(math.atan2(horizontal, math.cos(phi))), elevation
+
+
+def spiral_arc(yaw_degrees, elevation_degrees):
+    """The arc between a (yaw, elevation) pose and the view axis, in degrees (inverse of above)."""
+    return math.degrees(math.acos(max(-1.0, min(1.0,
+        math.cos(math.radians(elevation_degrees)) * math.cos(math.radians(yaw_degrees))))))
+
+
+def spiral_clock(yaw_degrees, elevation_degrees):
+    """The clock angle of a (yaw, elevation) pose around the view axis (12 = up, 3 = right)."""
+    elevation = math.radians(elevation_degrees)
+    yaw = math.radians(yaw_degrees)
+    return math.degrees(math.atan2(math.cos(elevation) * math.sin(yaw), math.sin(elevation)))
+
+
+def _clock_degrees(clock):
+    """A clock position as the angle from 12 o'clock, in degrees (2 -> 60, 9 -> 270)."""
+    return 30.0 * float(clock)
+
+
+def _spiral_rounds(scale=1.0):
+    """The revolutions the coil flies at amplitude scale `scale` (the ladder's floor applies)."""
+    return max(SPIRAL_MIN_ROUNDS, SPIRAL_ROUNDS * max(1e-6, float(scale)))
+
+
+def _spiral_sweep(scale=1.0):
+    """Total clock-angle advance of the coil: the rounds plus the closing offset to 9 o'clock."""
+    closing = (-(_clock_degrees(SPIRAL_END_CLOCK)
+                 - _clock_degrees(SPIRAL_LEAD_CLOCK))) % 360.0
+    return _spiral_rounds(scale) * 360.0 + closing
+
+
+def _spiral_geometry(centre, mirror, scale=1.0):
+    """(lead_yaw, end_yaw, sweep, end_arc) of the Spiral coverage at amplitude scale `scale`.
+
+    The lead-in follows the dial's 2 o'clock direction (`SPIRAL_LEAD_CLOCK`) until the arc between
+    the camera and the view axis reaches `SPIRAL_LEAD_ARC`; the coil then winds `SPIRAL_ROUNDS *
+    scale` times around that axis and closes on `SPIRAL_END_CLOCK` (the clock's 9, mirrored with the
+    direction), where the arc is `SPIRAL_END_ARC` - the picture's own plane. `sweep` is the total
+    clock-angle advance (the rounds *plus* the closing offset, which is what makes the last pose
+    land on 9 o'clock after whole rounds).
+    """
+    lead_yaw, _lead_elevation = spiral_pose(SPIRAL_LEAD_ARC,
+                                            mirror * _clock_degrees(SPIRAL_LEAD_CLOCK))
+    end_yaw, _end_elevation = _spiral_point(1.0, centre, scale, mirror)
+    return lead_yaw + centre, end_yaw, _spiral_sweep(scale), SPIRAL_END_ARC
 
 
 def _spiral_point(progress, centre, scale=1.0, mirror=1.0):
-    """(yaw, elevation) of the Spiral coverage at `progress` 0..1: middle of the O -> up -> round.
+    """(yaw, elevation) of the Spiral coverage at `progress` 0..1: view axis -> coil -> side view.
 
-    Progress 0 is the *middle of the circle* (the framed pose, elevation 0) and the first
-    `FRONT_ORBIT_RISE` of the path is the eased lead-in along the dial's 2 o'clock direction, ending
-    at `SPIRAL_LEAD_ELEVATION`; the rest is the helix - the azimuth advances linearly (a constant
-    angular speed keeps the synthesis artefacts low, the same reason the manual Spiral Sweep is a
-    monotone ramp) while the elevation climbs linearly to the top. `mirror` = +1 winds
-    counter-clockwise (the Auto Orbit Direction default), -1 clockwise.
+    Progress 0 is the *middle of the picture* - the camera sits ON the view axis and looks straight
+    at the scene - and the first `FRONT_ORBIT_RISE` of the path is the eased lead-in along the dial's
+    2 o'clock direction, ending where the arc between the camera and the axis reaches
+    `SPIRAL_LEAD_ARC`. The rest is the coil: the clock angle winds `SPIRAL_ROUNDS * scale` times
+    around the view axis (counter-clockwise with `mirror` = +1, the Auto Orbit Direction default)
+    while the arc climbs linearly to `SPIRAL_END_ARC`, so the last pose lands in the picture's own
+    plane on `SPIRAL_END_CLOCK` (the clock's 9) - the clip ends looking at the scene from the side.
     """
     progress = min(1.0, max(0.0, float(progress)))
-    lead_yaw, _end_yaw, sweep, top = _spiral_geometry(centre, mirror, scale)
+    lead_clock = mirror * _clock_degrees(SPIRAL_LEAD_CLOCK)
     if progress <= FRONT_ORBIT_RISE:
         phase = progress / FRONT_ORBIT_RISE
         eased = (1.0 - math.cos(math.pi * phase)) / 2.0
-        return centre + (lead_yaw - centre) * eased, SPIRAL_LEAD_ELEVATION * eased
+        yaw, elevation = spiral_pose(SPIRAL_LEAD_ARC * eased, lead_clock)
+        return yaw + centre, elevation
     phase = (progress - FRONT_ORBIT_RISE) / max(1e-9, 1.0 - FRONT_ORBIT_RISE)
-    return (lead_yaw - mirror * sweep * phase,
-            SPIRAL_LEAD_ELEVATION + (top - SPIRAL_LEAD_ELEVATION) * phase)
+    wind = -1.0 if mirror >= 0.0 else 1.0          # counter-clockwise = the clock angle falls
+    end_clock = mirror * _clock_degrees(SPIRAL_END_CLOCK)
+    closing = (wind * (end_clock - lead_clock)) % 360.0
+    sweep = _spiral_rounds(scale) * 360.0 + closing
+    phi = SPIRAL_LEAD_ARC + (SPIRAL_END_ARC - SPIRAL_LEAD_ARC) * phase
+    psi = lead_clock + wind * sweep * phase
+    yaw, elevation = spiral_pose(phi, psi)
+    # the coil passes over the top on its way round; keep the up vector well defined there
+    return (yaw + centre,
+            max(-SPIRAL_ELEVATION_CEILING, min(SPIRAL_ELEVATION_CEILING, elevation)))
 
 
 def _spiral_info(view_angle=None, direction=ORBIT_DIRECTION_DEFAULT, scale=1.0):
-    """The `info` fields the Spiral coverage reports: lead-in reach, rounds, top, coverage."""
+    """The `info` fields the Spiral coverage reports: lead-in reach, rounds, end arc, coverage."""
     centre = ORBIT_VIEW_ANGLE_DEFAULT if view_angle is None else float(view_angle)
     mirror = direction_mirror(direction)
-    lead_yaw, _end_yaw, sweep, top = _spiral_geometry(centre, mirror, scale)
+    lead_yaw, _end_yaw, sweep, end_arc = _spiral_geometry(centre, mirror, scale)
     return {"front_yaw": abs(lead_yaw - centre), "orbit_end": sweep, "front_share": 1.0,
             "back_span": 0.0, "back_orbit": False,
-            "spiral_rounds": max(SPIRAL_MIN_ROUNDS, SPIRAL_ROUNDS * max(1e-6, float(scale))),
-            "spiral_top_elevation": top, "orbit_coverage": min(FULL_CIRCLE, sweep),
+            "spiral_rounds": _spiral_rounds(scale), "spiral_end_arc": end_arc,
+            "orbit_coverage": min(FULL_CIRCLE, sweep),
             "view_angle": None if view_angle is None else float(view_angle)}
 
 
@@ -2126,7 +2179,7 @@ def automatic_keys(frames, pivot, radius, content_radius, target, max_speed=DEFA
                      "coverage": coverage, "back_orbit": bool(meta.get("back_orbit")),
                      "front_floor": meta.get("front_floor"),
                      "spiral_rounds": meta.get("spiral_rounds"),
-                     "spiral_top_elevation": meta.get("spiral_top_elevation"),
+                     "spiral_end_arc": meta.get("spiral_end_arc"),
                      "orbit_coverage": min(FULL_CIRCLE, meta.get(
                          "orbit_coverage",
                          amplitude + max(amplitude, meta["orbit_end"])))})
@@ -2546,13 +2599,13 @@ def _estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DE
                       + f", covering {info['orbit_coverage']:.0f} deg around the subject")
         elif info.get("coverage") == SPIRAL_COVERAGE:
             rounds = float(info.get("spiral_rounds") or SPIRAL_ROUNDS)
-            top = float(info.get("spiral_top_elevation") or SPIRAL_TOP_ELEVATION)
-            beyond = (f", then a rising spiral {direction_label(info['orbit_direction'])}: "
-                      f"{rounds:.2f} rounds of azimuth while the elevation climbs to {top:.0f} deg "
-                      f"above the subject"
+            arc = float(info.get("spiral_end_arc") or SPIRAL_END_ARC)
+            beyond = (f", then a rising coil {direction_label(info['orbit_direction'])} around "
+                      f"the view axis: {rounds:.2f} rounds while the arc between the camera and "
+                      f"that axis climbs to {arc:.0f} deg - the clip ends in the picture's own "
+                      f"plane, looking at the scene from the side"
                       + (f" (cut from {SPIRAL_ROUNDS:.0f} rounds by the speed cap)"
-                         if rounds < SPIRAL_ROUNDS - 1e-6 else "")
-                      + f", covering {info['orbit_coverage']:.0f} deg around the subject")
+                         if rounds < SPIRAL_ROUNDS - 1e-6 else ""))
         elif info.get("coverage"):
             beyond = (f", the back visit giving way to the speed cap: the path ends at "
                       f"{info['orbit_end']:.0f} deg of the requested "
@@ -2764,10 +2817,10 @@ def _estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DE
         # None while the deprecated `orbit_end` path is in charge (saved callers).
         "view_angle_deg": info.get("view_angle"), "coverage": info.get("coverage"),
         "back_orbit": info.get("back_orbit"),
-        # Spiral coverage only: the rounds the fit could pay for and the elevation the climb ends at
+        # Spiral coverage only: the rounds the fit could pay for and the arc the coil ends at
         # (SPIRAL_ROUNDS is the request; the speed cap may cut it).
         "spiral_rounds": info.get("spiral_rounds"),
-        "spiral_top_elevation_deg": info.get("spiral_top_elevation"),
+        "spiral_end_arc_deg": info.get("spiral_end_arc"),
     }
     if info.get("fit") == "subject pixels":
         summary.update({"drift_px": info["drift_px"], "drift_typical_px": info["drift_typical_px"],
@@ -2939,8 +2992,8 @@ def format_summary(summary):
                               "where the sweep stopped)"))
         elif summary.get("coverage") == SPIRAL_COVERAGE:
             rounds = summary.get("spiral_rounds") or SPIRAL_ROUNDS
-            top = summary.get("spiral_top_elevation_deg") or SPIRAL_TOP_ELEVATION
-            beyond = (f"rising spiral, {rounds:.2f} rounds up to {top:.0f} deg"
+            arc = summary.get("spiral_end_arc_deg") or SPIRAL_END_ARC
+            beyond = (f"rising coil, {rounds:.2f} rounds to {arc:.0f} deg off the view axis"
                       + (f" (cut from {SPIRAL_ROUNDS:.0f} by the speed cap)"
                          if rounds < SPIRAL_ROUNDS - 1e-6 else ""))
         elif summary.get("coverage"):

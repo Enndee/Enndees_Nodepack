@@ -91,13 +91,18 @@ from enndee_meridian_auto_camera import (  # noqa: E402
     _shrink_amplitude,
     _spiral_geometry,
     _spiral_point,
+    _spiral_sweep,
     SPIRAL_COVERAGE,
     SPIRAL_ELEVATION_CEILING,
-    SPIRAL_END_CLOCK_DEGREES,
-    SPIRAL_LEAD_ELEVATION,
+    SPIRAL_END_ARC,
+    SPIRAL_END_CLOCK,
+    SPIRAL_LEAD_ARC,
+    SPIRAL_LEAD_CLOCK,
     SPIRAL_MIN_ROUNDS,
     SPIRAL_ROUNDS,
-    SPIRAL_TOP_ELEVATION,
+    spiral_arc,
+    spiral_clock,
+    spiral_pose,
 )
 
 
@@ -1651,48 +1656,56 @@ class AutoCameraSpiralCoverageTests(unittest.TestCase):
         self.assertIn(SPIRAL_COVERAGE, ORBIT_COVERAGES)
         self.assertEqual(ORBIT_COVERAGES[-1], SPIRAL_COVERAGE)
 
-    def test_geometry_leads_in_along_two_oclock_and_closes_on_nine(self):
-        lead_yaw, end_yaw, sweep, top = _spiral_geometry(0.0, 1.0, 1.0)
-        self.assertGreater(lead_yaw, 0.0)                       # up and to the side ...
-        self.assertLess(lead_yaw, FRONT_ORBIT_AMPLITUDE)        # ... a gentle lead-in (the 2 o'clock
-        self.assertGreater(lead_yaw, SPIRAL_LEAD_ELEVATION)     # ray is mostly azimuth, hence the
-        self.assertAlmostEqual(end_yaw, -SPIRAL_END_CLOCK_DEGREES, places=9)   # bigger yaw reach)
-        self.assertAlmostEqual(sweep, SPIRAL_ROUNDS * 360.0 + abs(lead_yaw - end_yaw), places=9)
-        self.assertAlmostEqual(top, min(SPIRAL_TOP_ELEVATION, SPIRAL_ELEVATION_CEILING), places=9)
+    def test_pose_round_trip_matches_the_sketch(self):
+        """phi = the arc from the view axis, psi = the clock around it (the user's sketch)."""
+        for phi, psi in ((0.0, 0.0), (SPIRAL_LEAD_ARC, 60.0), (45.0, 120.0), (90.0, 270.0),
+                         (70.0, -30.0)):
+            yaw, elevation = spiral_pose(phi, psi)
+            self.assertAlmostEqual(spiral_arc(yaw, elevation), phi, places=6)
+            delta = (spiral_clock(yaw, elevation) - psi + 180.0) % 360.0 - 180.0
+            self.assertAlmostEqual(delta, 0.0, places=6)
 
-    def test_spiral_starts_in_the_centre_and_leads_in_to_the_lead_elevation(self):
-        self.assertEqual(_spiral_point(0.0, 0.0), (0.0, 0.0))
-        lead_yaw, _end_yaw, _sweep, _top = _spiral_geometry(0.0, 1.0, 1.0)
-        yaw, elevation = _spiral_point(FRONT_ORBIT_RISE, 0.0)
-        self.assertAlmostEqual(elevation, SPIRAL_LEAD_ELEVATION, places=6)
-        self.assertAlmostEqual(yaw, lead_yaw, places=6)
+    def test_spiral_starts_on_the_view_axis_and_ends_in_the_picture_plane(self):
+        self.assertEqual(_spiral_point(0.0, 0.0), (0.0, 0.0))      # the middle of the picture
+        lead_yaw, lead_elevation = _spiral_point(FRONT_ORBIT_RISE, 0.0)
+        self.assertAlmostEqual(spiral_arc(lead_yaw, lead_elevation), SPIRAL_LEAD_ARC, places=6)
+        self.assertGreater(lead_yaw, 0.0)         # the lead-in follows 2 o'clock: up ...
+        self.assertGreater(lead_elevation, 0.0)   # ... and to the subject's right
+        end_yaw, end_elevation = _spiral_point(1.0, 0.0)
+        self.assertAlmostEqual(spiral_arc(end_yaw, end_elevation), SPIRAL_END_ARC, places=6)
+        self.assertAlmostEqual(end_elevation, 0.0, places=6)       # level with the pivot ...
+        self.assertAlmostEqual(spiral_clock(end_yaw, end_elevation) % 360.0,
+                               (30.0 * SPIRAL_END_CLOCK) % 360.0, places=6)   # ... at 9 o'clock
 
-    def test_helix_climbs_monotonically_and_ends_on_the_nine_oclock_side(self):
-        steps = 24
+    def test_arc_rises_monotonically_and_the_clock_winds(self):
+        steps = 60
         points = [_spiral_point(index / steps, 0.0) for index in range(steps + 1)]
-        climb = points[steps // 4:]                                  # the helix, without the lead-in
-        elevations = [elevation for _yaw, elevation in climb]
-        self.assertEqual(elevations, sorted(elevations))              # the climb never turns back
-        self.assertAlmostEqual(elevations[-1], SPIRAL_ELEVATION_CEILING, places=6)
-        yaws = [yaw for yaw, _elevation in climb]
-        self.assertEqual(yaws, sorted(yaws, reverse=True))            # counter-clockwise (default)
-        self.assertAlmostEqual(points[-1][0] % 360.0,
-                               (-SPIRAL_END_CLOCK_DEGREES) % 360.0, places=6)
+        arcs = [spiral_arc(yaw, elevation) for yaw, elevation in points]
+        self.assertEqual(arcs, sorted(arcs))                      # the arc never turns back
+        self.assertAlmostEqual(arcs[-1], SPIRAL_END_ARC, places=6)
+        # unwrap the clock angle: the coil winds the whole sweep, counter-clockwise (falling)
+        clocks = [spiral_clock(yaw, elevation) for yaw, elevation in points[steps // 4:]]
+        unwrapped = [clocks[0]]
+        for value in clocks[1:]:
+            unwrapped.append(unwrapped[-1] + ((value - unwrapped[-1] + 180.0) % 360.0 - 180.0))
+        self.assertLess(unwrapped[-1] - unwrapped[0], 0.0)
+        self.assertAlmostEqual(abs(unwrapped[-1] - unwrapped[0]), _spiral_sweep(1.0), delta=1.0)
 
-    def test_direction_mirrors_the_winding_but_not_the_climb(self):
-        ccw = _spiral_point(1.0, 0.0, 1.0, 1.0)
-        cw = _spiral_point(1.0, 0.0, 1.0, -1.0)
-        self.assertAlmostEqual(ccw[0], -cw[0], places=6)              # mirrored azimuths
-        self.assertAlmostEqual(ccw[1], cw[1], places=9)               # same climb
+    def test_direction_mirrors_the_winding(self):
+        ccw = [_spiral_point(index / 12, 0.0, 1.0, 1.0) for index in range(13)]
+        cw = [_spiral_point(index / 12, 0.0, 1.0, -1.0) for index in range(13)]
+        self.assertAlmostEqual(ccw[-1][0], -cw[-1][0], places=6)   # mirrored yaw ...
+        self.assertAlmostEqual(ccw[-1][1], cw[-1][1], places=6)    # ... same elevation
+        self.assertGreater(ccw[3][1], 0.0)                         # both start up and to the side
+        self.assertAlmostEqual(ccw[3][0], -cw[3][0], places=6)
 
     def test_the_amplitude_scale_cuts_the_rounds(self):
-        _lead, _end, full, _top = _spiral_geometry(0.0, 1.0, 1.0)
-        _lead, _end, half, _top = _spiral_geometry(0.0, 1.0, 0.5)
-        _lead, _end, floor, _top = _spiral_geometry(0.0, 1.0, 0.0)
+        _lead, _end, full, arc = _spiral_geometry(0.0, 1.0, 1.0)
+        _lead, _end, half, _arc = _spiral_geometry(0.0, 1.0, 0.5)
+        _lead, _end, floor, _arc = _spiral_geometry(0.0, 1.0, 0.0)
+        self.assertEqual(arc, SPIRAL_END_ARC)
         self.assertAlmostEqual(full - half, SPIRAL_ROUNDS * 0.5 * 360.0, places=6)
         self.assertLess(floor, half)
-        self.assertAlmostEqual(floor - half, -SPIRAL_ROUNDS * 0.5 * 360.0 + SPIRAL_MIN_ROUNDS * 360.0,
-                               places=6)
 
     def test_samples_keep_the_distance_and_the_frame_count(self):
         pivot = [0.0, 0.0, 3.0]
@@ -1702,16 +1715,8 @@ class AutoCameraSpiralCoverageTests(unittest.TestCase):
         for sample in samples:
             self.assertAlmostEqual(math.dist(sample, pivot), 5.0, places=6)
         angles = [_orbit_angles(sample, pivot) for sample in samples]
-        self.assertAlmostEqual(angles[0][1], 0.0, places=6)           # the framed front pose
-        self.assertGreater(angles[-1][1], 0.8 * SPIRAL_ELEVATION_CEILING)
-        # ... and it really winds: unwrapping the azimuth shows more than the two rounds
-        unwrapped = [angles[0][0]]
-        for yaw, _elevation in angles[1:]:
-            delta = (yaw - unwrapped[-1] + 180.0) % 360.0 - 180.0
-            unwrapped.append(unwrapped[-1] + delta)
-        wound = abs(unwrapped[-1] - unwrapped[0])
-        self.assertGreater(wound, SPIRAL_ROUNDS * 360.0)
-        self.assertLess(wound, SPIRAL_ROUNDS * 360.0 + 200.0)
+        self.assertAlmostEqual(spiral_arc(*angles[0]), 0.0, places=4)      # the front pose
+        self.assertAlmostEqual(spiral_arc(*angles[-1]), SPIRAL_END_ARC, places=4)
 
     def test_envelope_and_fit_report_the_spiral(self):
         surface = probe_surface(_reference(), depth_fn=lambda reference: _depth_with_subject())
@@ -1724,26 +1729,28 @@ class AutoCameraSpiralCoverageTests(unittest.TestCase):
         self.assertGreater(info["spiral_rounds"], 0.0)
         self.assertFalse(info["back_orbit"])
         self.assertEqual(info["lap_span"], 0.0)
-        self.assertGreater(info["spiral_top_elevation"], 45.0)
+        self.assertEqual(info["spiral_end_arc"], SPIRAL_END_ARC)
         self.assertLessEqual(info["drift_px"], info["drift_cap_px"] + 1e-9)
-        elevations = [_orbit_angles(key["pos"], pivot)[1] for key in keys]
-        self.assertGreater(max(elevations), SPIRAL_LEAD_ELEVATION)    # the keys really climb
-        # the room/fill envelope sees the helix's own poses, not the front O's
+        # the emitted keys really leave the view axis
+        arcs = [spiral_arc(*_orbit_angles(key["pos"], pivot)) for key in keys]
+        self.assertGreater(max(arcs), SPIRAL_LEAD_ARC)
+        # the room/fill envelope sees the coil's own poses, not the front O's
         envelope = _envelope_angles(1.0, coverage=SPIRAL_COVERAGE)
         self.assertEqual(len(envelope), 5)
-        self.assertAlmostEqual(max(elevation for _yaw, elevation in envelope),
-                               SPIRAL_ELEVATION_CEILING, places=6)
-        self.assertAlmostEqual(min(elevation for _yaw, elevation in envelope), 0.0, places=6)
+        envelope_arcs = [spiral_arc(yaw, elevation) for yaw, elevation in envelope]
+        self.assertEqual(envelope_arcs, sorted(envelope_arcs))
+        self.assertAlmostEqual(envelope_arcs[-1], SPIRAL_END_ARC, places=6)
 
-    def test_estimate_describes_the_rising_spiral(self):
+    def test_estimate_describes_the_rising_coil(self):
         document, summary = _estimate(_depth_with_subject(), coverage=SPIRAL_COVERAGE)
         description = json.loads(document)["description"]
-        self.assertIn("rising spiral", description)
+        self.assertIn("rising coil", description)
+        self.assertIn("from the side", description)
         self.assertIn("the spiral (+/-", description)
         self.assertNotIn("the front O", description)
         self.assertEqual(summary.get("coverage"), SPIRAL_COVERAGE)
         self.assertIsNotNone(summary.get("spiral_rounds"))
-        self.assertIsNotNone(summary.get("spiral_top_elevation_deg"))
+        self.assertIsNotNone(summary.get("spiral_end_arc_deg"))
 
 
 if __name__ == "__main__":
