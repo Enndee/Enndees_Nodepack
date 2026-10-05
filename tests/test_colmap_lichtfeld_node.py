@@ -5,6 +5,7 @@ real bindings nor a GPU - it checks the option/argument mapping, the backend hoo
 and the accelerator logic.
 """
 
+import os
 import sys
 import types
 import unittest
@@ -24,12 +25,15 @@ from enndee_colmap import pycolmap_wrapper      # noqa: E402
 class FakePycolmap:
     """Records every call the wrapper makes and returns fake models."""
 
-    def __init__(self, has_cuda=False, models=(0,), image_names=(), pair_error=False):
+    def __init__(self, has_cuda=False, models=(0,), image_names=(), pair_error=False,
+                 camera_id=1):
         self.has_cuda = has_cuda
         self.__version__ = "9.9.9-test"
         self.models = models
         self.image_names = list(image_names)
         self.pair_error = pair_error
+        self.camera_id = camera_id
+        self.import_error = False
         self.calls = []
         self.closed_databases = []
         self.pair_options = []
@@ -61,16 +65,23 @@ class FakePycolmap:
         class Database:
             def read_all_images(self):
                 class Image:
-                    def __init__(self, name):
+                    def __init__(self, name, camera_id, index):
                         self.name = name
+                        self.camera_id = camera_id
+                        self.image_id = index
 
-                return {index + 1: Image(name)
-                        for index, name in enumerate(fake.image_names)}
+                return [Image(name, fake.camera_id, index + 1)
+                        for index, name in enumerate(fake.image_names)]
 
             def close(self):
                 fake.closed_databases.append(str(path))
 
         return Database()
+
+    def import_images(self, database, images, **kwargs):
+        self.calls.append(("import_images", str(database), str(images), kwargs))
+        if self.import_error:
+            raise RuntimeError("import exploded")
 
     # ------------------------------------------------------------- pairing
     def _pair_generator(self, options, database):
@@ -198,6 +209,30 @@ class PyColmapWrapperTests(unittest.TestCase):
         self.fake.has_cuda = True
         self.wrapper.feature_extractor(use_gpu=True)
         self.assertEqual(self.fake.call("extract")[3]["device"], "cuda")
+
+    def test_chunked_extraction_pins_one_camera(self):
+        """113 frames came out with 13 cameras before: import once, pin that camera."""
+        self.assertTrue(self.wrapper.feature_extractor(camera_model="SIMPLE_PINHOLE"))
+        _, _, _, kwargs = self.fake.call("import_images")
+        self.assertEqual(kwargs["camera_mode"], "SINGLE")
+        self.assertEqual(kwargs["options"]["camera_model"], "SIMPLE_PINHOLE")
+        extracts = [entry for entry in self.fake.calls if entry[0] == "extract"]
+        self.assertEqual(len(extracts), 2)
+        for entry in extracts:                     # every chunk reuses the imported camera
+            self.assertEqual(entry[3]["reader_options"]["existing_camera_id"], 1)
+
+    def test_one_chunk_needs_no_extra_import(self):
+        for name in self.IMAGES:
+            (self.wrapper.image_dir / name).unlink()
+        (self.wrapper.image_dir / "only.png").write_bytes(b"")
+        self.assertTrue(self.wrapper.feature_extractor())
+        self.assertEqual([entry for entry in self.fake.calls if entry[0] == "import_images"], [])
+        self.assertNotIn("existing_camera_id", self.fake.call("extract")[3]["reader_options"])
+
+    def test_import_failure_falls_back_to_per_chunk_cameras(self):
+        self.fake.import_error = True
+        self.assertTrue(self.wrapper.feature_extractor())
+        self.assertNotIn("existing_camera_id", self.fake.call("extract")[3]["reader_options"])
 
     def test_sequential_matching_uses_colmaps_own_pairing(self):
         self.assertTrue(self.wrapper.sequential_matcher(use_gpu=False, overlap=15))
@@ -587,6 +622,50 @@ class PycolmapCudaTests(unittest.TestCase):
         self.assertTrue(state["available"])
         self.assertEqual(state["source"], "torch")
         self.assertEqual(state["device"], "RTX 5090")
+
+
+class ColmapLoggingTests(unittest.TestCase):
+    """COLMAP's INFO flood is silenced unless ENNDEE_COLMAP_VERBOSE is set."""
+
+    def test_import_sets_the_glog_level_before_importing(self):
+        with mock.patch.dict("os.environ", {}, clear=True):
+            module = pycolmap_wrapper.import_pycolmap()
+            level = os.environ.get("GLOG_minloglevel")
+        self.assertIsNotNone(module)                      # pycolmap is installed here
+        self.assertEqual(level, pycolmap_wrapper.GLOG_LEVEL_WARNING)
+
+    def test_child_env_is_quiet_by_default(self):
+        with mock.patch.dict("os.environ", {}, clear=True):
+            self.assertFalse(pycolmap_wrapper.colmap_verbose())
+            env = pycolmap_wrapper.colmap_child_env()
+        values = {key.upper(): value for key, value in env.items()}
+        self.assertEqual(values.get("GLOG_MINLOGLEVEL"), "1")
+
+    def test_existing_glog_level_is_left_alone(self):
+        with mock.patch.dict("os.environ", {"GLOG_minloglevel": "0"}, clear=True):
+            env = pycolmap_wrapper.colmap_child_env()
+        matching = {key: value for key, value in env.items()
+                    if key.upper() == "GLOG_MINLOGLEVEL"}
+        self.assertEqual(list(matching.values()), ["0"])
+
+    def test_verbose_env_keeps_the_full_output(self):
+        with mock.patch.dict("os.environ", {"ENNDEE_COLMAP_VERBOSE": "1"}, clear=True):
+            self.assertTrue(pycolmap_wrapper.colmap_verbose())
+            env = pycolmap_wrapper.colmap_child_env()
+        # verbose adds nothing of its own - whatever the user set stays untouched
+        self.assertFalse(any(key.upper() == "GLOG_MINLOGLEVEL" for key in env))
+
+    def test_runtime_level_is_set_on_the_module(self):
+        fake = types.SimpleNamespace(logging=types.SimpleNamespace(WARNING=1, minloglevel=0))
+        with mock.patch.dict("os.environ", {}, clear=True):
+            pycolmap_wrapper.silence_colmap_logging(fake)
+        self.assertEqual(fake.logging.minloglevel, 1)
+
+    def test_verbose_skips_the_runtime_level(self):
+        fake = types.SimpleNamespace(logging=types.SimpleNamespace(WARNING=1, minloglevel=0))
+        with mock.patch.dict("os.environ", {"ENNDEE_COLMAP_VERBOSE": "1"}, clear=True):
+            pycolmap_wrapper.silence_colmap_logging(fake)
+        self.assertEqual(fake.logging.minloglevel, 0)
 
 
 if __name__ == "__main__":

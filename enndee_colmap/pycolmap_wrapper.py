@@ -28,9 +28,12 @@ Nothing is downloaded and no executable is needed - only ``pip install pycolmap`
 """
 
 from pathlib import Path
+import os
+import sys
 from typing import Callable, List, Optional, Sequence, Tuple
 
-from .colmap_wrapper import COLMAPWrapper
+from .colmap_wrapper import (COLMAPWrapper, GLOG_LEVEL_WARNING, VERBOSE_ENV,
+                             colmap_child_env, colmap_verbose)
 from .glomap_wrapper import GLOMAPWrapper
 
 #: ``callable(value, total, label)`` - drives ComfyUI's progress bar.
@@ -47,13 +50,44 @@ GLOBAL_BACKENDS = ("glomap", "colmap_global", "global", "global_mapper")
 #: ``mapper_backend`` value for COLMAP's classic incremental mapper.
 INCREMENTAL_BACKEND = "incremental"
 
+#: Set this to get COLMAP's full INFO flood back (its default is warnings only).
+VERBOSE_ENV = "ENNDEE_COLMAP_VERBOSE"
+#: glog level 1 = WARNING: keep the warnings, drop the "I2026... " progress spam.
+GLOG_LEVEL_WARNING = "1"
+
+
+def silence_colmap_logging(module=None) -> None:
+    """Keep COLMAP's INFO flood out of the ComfyUI console.
+
+    COLMAP logs through glog: every SIFT thread setup, every processed image and every
+    pairing step lands on stderr as an ``I<date>`` line - hundreds of lines per run that
+    bury the actual node output. The glog flag is read when the library initialises, so
+    the environment variable has to be set *before* the import (``import_pycolmap`` does
+    that) and the runtime level is set as well for good measure.
+    ``ENNDEE_COLMAP_VERBOSE=1`` restores everything.
+    """
+    if colmap_verbose():
+        return
+    os.environ.setdefault("GLOG_minloglevel", GLOG_LEVEL_WARNING)
+    module = module if module is not None else sys.modules.get("pycolmap")
+    if module is None:
+        return
+    try:
+        module.logging.minloglevel = module.logging.WARNING
+    except Exception:  # noqa: BLE001 - older/newer bindings may differ
+        pass
+
 
 def import_pycolmap():
     """Return the ``pycolmap`` module or None (never raises)."""
+    if not colmap_verbose():
+        # must happen before the import: glog reads the flag at initialisation
+        os.environ.setdefault("GLOG_minloglevel", GLOG_LEVEL_WARNING)
     try:
         import pycolmap  # type: ignore
     except Exception:  # noqa: BLE001 - any import problem means "not available"
         return None
+    silence_colmap_logging(pycolmap)
     return pycolmap
 
 
@@ -109,6 +143,36 @@ class PyColmapWrapper(GLOMAPWrapper):
             return sorted(p.name for p in Path(self.image_dir).iterdir() if p.is_file())
         except Exception:  # noqa: BLE001
             return []
+
+    def _import_once(self, module, reader_options: dict) -> Optional[int]:
+        """Import every frame up front so all extraction chunks share ONE camera.
+
+        ``extract_features`` imports whatever images it is handed, and COLMAP's
+        ``CameraMode.SINGLE`` means "one camera for the images of *this* call" - so the
+        chunked extraction created one camera per chunk (113 frames came out with 13
+        cameras, each with its own intrinsics block, and the global mapper then warned
+        about missing focal priors). Importing the whole folder once and pinning that
+        camera for every chunk keeps the single shared camera a video orbit needs.
+
+        Returns the camera id to pin, or None when the import was not possible (the
+        caller then keeps the old per-chunk behaviour).
+        """
+        try:
+            module.Database.open(self.database_path).close()   # import_images wants the file
+            module.import_images(self.database_path, self.image_dir,
+                                 camera_mode=module.CameraMode.SINGLE,
+                                 options=reader_options)
+            database = module.Database.open(self.database_path)
+            images = database.read_all_images()
+            if hasattr(images, "values"):        # older builds hand out a dict
+                images = list(images.values())
+            camera_id = int(images[0].camera_id) if images else None
+            database.close()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[pycolmap] single-camera import failed ({exc}) - every chunk will "
+                  f"create its own camera")
+            return None
+        return camera_id
 
     # ------------------------------------------------------------------ utils
     def _module(self):
@@ -170,6 +234,12 @@ class PyColmapWrapper(GLOMAPWrapper):
         batches: List[Optional[Sequence[str]]] = [
             names[start:start + chunk] for start in range(0, len(names), chunk)
         ] or [None]
+        # ONE camera for the whole set: chunked extraction would otherwise create a camera
+        # per chunk (COLMAP's SINGLE camera mode applies to the images of each call).
+        if single_camera and len(batches) > 1:
+            camera_id = self._import_once(module, reader_options)
+            if camera_id is not None:
+                reader_options = dict(reader_options, existing_camera_id=camera_id)
         done = 0
         try:
             for batch in batches:
@@ -206,8 +276,13 @@ class PyColmapWrapper(GLOMAPWrapper):
                 generator = module.ExhaustivePairGenerator(
                     module.ExhaustivePairingOptions(), database)
             pairs = list(generator.all_pairs())
-            names = {int(key): value.name
-                     for key, value in database.read_all_images().items()}
+            images = database.read_all_images()
+            # pycolmap 4.x returns a *list* of Image objects here (older builds a dict).
+            if hasattr(images, "items"):
+                names = {int(key): value.name for key, value in images.items()}
+            else:
+                names = {int(getattr(image, "image_id", index + 1)): image.name
+                         for index, image in enumerate(images)}
         except Exception as exc:  # noqa: BLE001
             print(f"[pycolmap] pair generation failed ({exc})")
             return None

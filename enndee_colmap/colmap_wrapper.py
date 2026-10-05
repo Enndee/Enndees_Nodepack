@@ -42,6 +42,35 @@ def _timeout_from_env(name: str, default: int) -> int:
         return default
 
 
+#: Set this to get COLMAP's/GLOMAP's full INFO flood back (their default here: warnings only).
+VERBOSE_ENV = "ENNDEE_COLMAP_VERBOSE"
+#: glog level 1 = WARNING: keep the warnings, drop the "I2026... " progress spam.
+GLOG_LEVEL_WARNING = "1"
+
+
+def colmap_verbose() -> bool:
+    """True when the user asked for COLMAP's/GLOMAP's raw INFO output."""
+    return bool((os.environ.get(VERBOSE_ENV) or "").strip())
+
+
+def colmap_child_env() -> dict:
+    """Environment for COLMAP/GLOMAP child processes: quiet unless asked otherwise.
+
+    COLMAP and GLOMAP log through glog; at INFO level they print every SIFT thread setup,
+    every processed image and every pairing step - hundreds of lines per run that bury the
+    node's own output in ComfyUI's console. glog reads ``GLOG_minloglevel`` when the
+    process starts, so the flag goes into the child's environment; warnings and errors
+    (missing focal priors, "compiled without CUDA support", failures) still come through.
+    ``ENNDEE_COLMAP_VERBOSE=1`` restores the full output.
+    """
+    env = dict(os.environ)
+    # Windows' os.environ upper-cases its keys, and a *copy* is case sensitive again - so
+    # look for the flag without caring about case before adding it.
+    if not colmap_verbose() and not any(key.upper() == "GLOG_MINLOGLEVEL" for key in env):
+        env["GLOG_minloglevel"] = GLOG_LEVEL_WARNING
+    return env
+
+
 def run_streaming_command(cmd, desc: str, timeout: int,
                           progress_callback=None) -> Tuple[int, str]:
     """Run a CLI process while forwarding its combined output as it arrives.
@@ -70,6 +99,7 @@ def run_streaming_command(cmd, desc: str, timeout: int,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             bufsize=0,
+            env=colmap_child_env(),
             **subprocess_window_kwargs(),
         )
     except Exception:

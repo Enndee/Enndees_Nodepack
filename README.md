@@ -628,6 +628,29 @@ With `auto_install_binaries=True` (default) the node checks and, if needed, inst
 `python install.py` does the same at setup time (`--skip-accelerators` opts out), and
 `ENNDEE_AUTO_DOWNLOAD=0` disables every automatic download/install.
 
+### Console output
+
+COLMAP logs through glog, and at INFO level that is a *lot*: every SIFT thread setup,
+every processed image, every pairing step. A 113 frame run printed **2455** such lines
+around the 4 warnings that actually mattered. The node therefore runs COLMAP at
+**WARNING** level:
+
+* warnings and errors still appear (missing focal priors, "compiled without CUDA
+  support", failures),
+* the progress chatter is gone - the node's own status label and progress bar carry that
+  information now,
+* `ENNDEE_COLMAP_VERBOSE=1` restores the full output for debugging.
+
+The binary tracker passes the same setting to the COLMAP/GLOMAP executables, so
+`glomap mapper` is quiet too (verified: `COLMAP feature_extractor` prints 3 INFO lines
+without it and 0 with it).
+
+The chunked feature extraction imports the frames **once** and pins that camera for every
+chunk: `extract_features` imports what it is handed, and COLMAP's "single camera" mode is
+per call - so a chunked run used to produce one camera per chunk (113 frames came out
+with 13 cameras, each with its own intrinsics block, and the global mapper warned about
+missing focal priors). The Lichtfeld export now always contains a single camera.
+
 ### CUDA first, CPU only as the fallback
 
 The node always tries to run on the GPU and only then falls back - and it **shows
