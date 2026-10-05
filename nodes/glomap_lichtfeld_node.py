@@ -89,6 +89,9 @@ SPLAT_SUBDIR = "Splat_Frames"
 
 # Cached RMBG remover (transparent_background)
 _rmbg_remover = None
+# Set when the GPU could not initialise the RMBG model (then stay on the CPU
+# instead of retrying the failed CUDA load on every run).
+_rmbg_device_fallback = False
 
 
 def log(message: str) -> None:
@@ -104,23 +107,6 @@ def auto_download_enabled() -> bool:
     """ENNDEE_AUTO_DOWNLOAD=0 disables the on demand binary download."""
     value = (os.environ.get("ENNDEE_AUTO_DOWNLOAD") or "").strip().lower()
     return value not in ("0", "false", "no", "off")
-
-
-def onnx_cuda_available() -> bool:
-    """
-    True when the installed onnxruntime can really use CUDA.
-
-    ``transparent_background`` (RMBG) runs through onnxruntime, so asking for a
-    CUDA device without onnxruntime-gpu would fail - this check keeps the node
-    working with a CPU-only onnxruntime.
-    """
-    try:
-        import onnxruntime  # type: ignore
-
-        providers = onnxruntime.get_available_providers()
-        return any("CUDA" in provider for provider in providers)
-    except Exception:
-        return False
 
 
 def tooltip(text: str) -> Dict[str, str]:
@@ -277,7 +263,7 @@ class GLOMAPLichtfeldTracker:
                     "default": True,
                     **tooltip(
                         "GPU acceleration for COLMAP SIFT extraction/matching "
-                        "and for RMBG (when onnxruntime-gpu is available)."
+                        "and for RMBG (torch CUDA)."
                     ),
                 }),
                 "keep_workspace": ("BOOLEAN", {
@@ -1120,7 +1106,7 @@ class GLOMAPLichtfeldTracker:
         Returns an RGBA float tensor [N,H,W,4] where alpha = foreground, or None
         when the optional dependency is missing / the model fails to load.
         """
-        global _rmbg_remover
+        global _rmbg_remover, _rmbg_device_fallback
 
         try:
             from transparent_background import Remover
@@ -1129,22 +1115,32 @@ class GLOMAPLichtfeldTracker:
                 "(pip install transparent_background)")
             return None
 
+        # `transparent_background` is a PyTorch model (InSPyReNet) - it does NOT use
+        # onnxruntime, so only torch decides whether the RMBG pass can use the GPU.
+        # (The old onnxruntime check here forced the CPU whenever onnxruntime-gpu was
+        # missing, which made a 113 frame run take ~10 minutes instead of ~25 seconds.)
         want_gpu = bool(use_gpu) and torch.cuda.is_available()
-        if want_gpu and not onnx_cuda_available():
-            log_warn("onnxruntime has no CUDA provider - RMBG runs on the CPU "
-                     "(install onnxruntime-gpu for GPU acceleration)")
+        if want_gpu and _rmbg_device_fallback:
             want_gpu = False
+        if bool(use_gpu) and not want_gpu:
+            log_warn("torch reports no CUDA device - RMBG runs on the CPU")
         device = "cuda" if want_gpu else "cpu"
 
         cache_key = (mode, resize, device)
         if _rmbg_remover is None or getattr(_rmbg_remover, "_enndee_key", None) != cache_key:
-            try:
-                _rmbg_remover = Remover(mode=mode, device=device, resize=resize)
-                _rmbg_remover._enndee_key = cache_key
-                log(f"RMBG model loaded (mode={mode}, device={device}, "
-                    f"resize={resize})")
-            except Exception as exc:  # noqa: BLE001
-                log_warn(f"Could not load the RMBG model: {exc}")
+            for candidate in ([device, "cpu"] if device != "cpu" else ["cpu"]):
+                try:
+                    _rmbg_remover = Remover(mode=mode, device=candidate, resize=resize)
+                    _rmbg_remover._enndee_key = (mode, resize, candidate)
+                    log(f"RMBG model loaded (mode={mode}, device={candidate}, "
+                        f"resize={resize})")
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    _rmbg_remover = None
+                    if candidate != "cpu":
+                        _rmbg_device_fallback = True
+                    log_warn(f"RMBG could not start on {candidate}: {exc}")
+            if _rmbg_remover is None:
                 return None
 
         batch = self._as_image_batch(images)
