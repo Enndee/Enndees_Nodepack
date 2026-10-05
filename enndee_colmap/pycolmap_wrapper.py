@@ -27,10 +27,20 @@ Nothing is downloaded and no executable is needed - only ``pip install pycolmap`
    as soon as a CUDA-enabled pycolmap build is installed (``pycolmap.has_cuda``).
 """
 
-from typing import Optional
+from pathlib import Path
+from typing import Callable, List, Optional, Sequence, Tuple
 
 from .colmap_wrapper import COLMAPWrapper
 from .glomap_wrapper import GLOMAPWrapper
+
+#: ``callable(value, total, label)`` - drives ComfyUI's progress bar.
+ProgressHook = Callable[[int, int, str], None]
+
+#: extraction runs in a handful of chunks: a call per image would be ~5x slower
+#: (SIFT thread setup + database reopen) while one call gives no progress at all.
+EXTRACTION_UPDATES = 12
+#: matching chunks - roughly this many progress updates per matcher run.
+MATCHING_UPDATES = 40
 
 #: ``mapper_backend`` values that mean "global SfM" (GLOMAP).
 GLOBAL_BACKENDS = ("glomap", "colmap_global", "global", "global_mapper")
@@ -62,7 +72,8 @@ def pycolmap_info() -> dict:
 class PyColmapWrapper(GLOMAPWrapper):
     """Global SfM through COLMAP's native Python API (no executables at all)."""
 
-    def __init__(self, device: Optional[str] = None):
+    def __init__(self, device: Optional[str] = None,
+                 progress_hook: Optional[ProgressHook] = None):
         # No COLMAP/GLOMAP binaries: set up the base attributes by hand because
         # COLMAPWrapper.__init__ insists on a real colmap_path.
         self.colmap_path = None
@@ -76,6 +87,28 @@ class PyColmapWrapper(GLOMAPWrapper):
         self.glomap_path = None
         self.native_device = device
         self.native_cuda = False
+        self.progress_hook: Optional[ProgressHook] = progress_hook
+
+    # -------------------------------------------------------------- progress
+    def set_progress_hook(self, hook: Optional[ProgressHook]) -> None:
+        """Install the ``callable(value, total, label)`` used for progress."""
+        self.progress_hook = hook
+
+    def _emit(self, value: int, total: int, label: str) -> None:
+        """Report progress - a broken hook must never break a reconstruction."""
+        if self.progress_hook is None:
+            return
+        try:
+            self.progress_hook(int(value), max(1, int(total)), str(label))
+        except Exception:  # noqa: BLE001
+            self.progress_hook = None
+
+    def _image_names(self) -> List[str]:
+        """The staged frames, sorted (the order COLMAP would use)."""
+        try:
+            return sorted(p.name for p in Path(self.image_dir).iterdir() if p.is_file())
+        except Exception:  # noqa: BLE001
+            return []
 
     # ------------------------------------------------------------------ utils
     def _module(self):
@@ -127,18 +160,76 @@ class PyColmapWrapper(GLOMAPWrapper):
         }
         camera_mode = (module.CameraMode.SINGLE if single_camera
                        else module.CameraMode.AUTO)
+        device = self._device(module, self._effective_gpu(module, use_gpu))
+
+        # Extract in chunks: one call per image is ~5x slower (thread setup +
+        # database reopen per call), one call for everything shows no progress.
+        names = self._image_names()
+        total = max(1, len(names))
+        chunk = max(4, total // EXTRACTION_UPDATES)
+        batches: List[Optional[Sequence[str]]] = [
+            names[start:start + chunk] for start in range(0, len(names), chunk)
+        ] or [None]
+        done = 0
         try:
-            module.extract_features(
-                self.database_path, self.image_dir,
-                camera_mode=camera_mode,
-                reader_options=reader_options,
-                extraction_options=extraction_options,
-                device=self._device(module, self._effective_gpu(module, use_gpu)),
-            )
+            for batch in batches:
+                module.extract_features(
+                    self.database_path, self.image_dir,
+                    camera_mode=camera_mode,
+                    reader_options=reader_options,
+                    extraction_options=extraction_options,
+                    device=device,
+                    **({"image_names": list(batch)} if batch else {}),
+                )
+                done += len(batch) if batch else 1
+                self._emit(done, total, f"feature extraction {done}/{total} images")
         except Exception as exc:  # noqa: BLE001
             print(f"[pycolmap] feature extraction failed: {exc}")
             return False
         return True
+
+    def _pair_names(self, module, kind: str,
+                    overlap: int) -> Optional[List[Tuple[str, str]]]:
+        """COLMAP's own pairing, as image-name pairs (None when unavailable)."""
+        try:
+            database = module.Database.open(self.database_path)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[pycolmap] cannot open the database for pairing: {exc}")
+            return None
+        try:
+            if kind == "sequential":
+                options = module.SequentialPairingOptions()
+                options.overlap = int(overlap)
+                options.loop_detection = False
+                generator = module.SequentialPairGenerator(options, database)
+            else:
+                generator = module.ExhaustivePairGenerator(
+                    module.ExhaustivePairingOptions(), database)
+            pairs = list(generator.all_pairs())
+            names = {int(key): value.name
+                     for key, value in database.read_all_images().items()}
+        except Exception as exc:  # noqa: BLE001
+            print(f"[pycolmap] pair generation failed ({exc})")
+            return None
+        finally:
+            try:
+                database.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+        converted: List[Tuple[str, str]] = []
+        for pair in pairs:
+            try:
+                first, second = int(pair.image_id1), int(pair.image_id2)
+            except Exception:  # noqa: BLE001 - tolerate other binding shapes
+                try:
+                    first, second = int(pair[0]), int(pair[1])
+                except Exception:  # noqa: BLE001
+                    continue
+            name1, name2 = names.get(first), names.get(second)
+            if name1 and name2:
+                converted.append((name1, name2))
+        return converted or None
 
     def _match(self, kind: str, use_gpu: bool, overlap: int = 10) -> bool:
         module = self._module()
@@ -146,6 +237,35 @@ class PyColmapWrapper(GLOMAPWrapper):
             return False
         matching_options = {"use_gpu": bool(use_gpu)}
         device = self._device(module, self._effective_gpu(module, use_gpu))
+
+        # Matching in batches of pairs keeps COLMAP's pairing exactly (the pair
+        # list comes from pycolmap's own generator) while feeding the progress
+        # bar; the built-in matcher stays as the fallback.
+        pairs = self._pair_names(module, kind, overlap)
+        if pairs:
+            total = len(pairs)
+            batch_size = max(1, total // MATCHING_UPDATES)
+            done = 0
+            try:
+                for start in range(0, total, batch_size):
+                    chunk = pairs[start:start + batch_size]
+                    listing = Path(self.workspace) / f"match_list_{kind}_{start:06d}.txt"
+                    listing.write_text("\n".join(f"{a} {b}" for a, b in chunk),
+                                       encoding="utf-8")
+                    module.match_image_pairs(
+                        self.database_path,
+                        matching_options=matching_options,
+                        pairing_options={"match_list_path": str(listing)},
+                        device=device,
+                    )
+                    done += len(chunk)
+                    self._emit(done, total, f"{kind} matching {done}/{total} pairs")
+                return True
+            except Exception as exc:  # noqa: BLE001
+                print(f"[pycolmap] chunked {kind} matching failed ({exc}) - "
+                      f"falling back to the built-in matcher")
+                self._emit(0, 1, f"{kind} matching (built-in)")
+
         try:
             if kind == "sequential":
                 module.match_sequential(
@@ -162,6 +282,7 @@ class PyColmapWrapper(GLOMAPWrapper):
         except Exception as exc:  # noqa: BLE001
             print(f"[pycolmap] {kind} matching failed: {exc}")
             return False
+        self._emit(1, 1, f"{kind} matching")
         return True
 
     def sequential_matcher(self, use_gpu: bool = True, overlap: int = 10) -> bool:
@@ -187,6 +308,7 @@ class PyColmapWrapper(GLOMAPWrapper):
         options = {"min_num_matches": int(min_num_matches)}
         if num_threads:
             options["num_threads"] = int(num_threads)
+        self._emit(0, 1, f"{backend} mapping")
         try:
             if backend == INCREMENTAL_BACKEND:
                 models = module.incremental_mapping(self.database_path, self.image_dir,
@@ -205,6 +327,7 @@ class PyColmapWrapper(GLOMAPWrapper):
         if not models:
             print(f"[pycolmap] {backend} mapping produced no reconstruction")
             return False
+        self._emit(1, 1, f"{backend} mapping")
         # pycolmap writes the models into <sparse>/<index> itself; make sure a
         # readable model directory exists either way.
         model_path = self.get_sparse_model_path()

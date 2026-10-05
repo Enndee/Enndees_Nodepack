@@ -34,12 +34,87 @@ overrides the backend hooks.
    pycolmap is installed (``pycolmap.has_cuda``).
 """
 
+from typing import List, Optional
+
 from enndee_accelerators import ensure_accelerators
 from enndee_colmap.pycolmap_wrapper import PyColmapWrapper, pycolmap_info
 from glomap_lichtfeld_node import GLOMAPLichtfeldTracker, log, log_warn, tooltip
 
 #: ``mapper_backend`` names of the binary node, mapped to the native options.
 LEGACY_MAPPER_BACKENDS = {"glomap": "global", "colmap_global": "global"}
+
+#: custom websocket event carrying the live status text to the node
+STATUS_EVENT = "enndee-colmap-status"
+
+
+class NodeStatus:
+    """Live status text plus ComfyUI's progress bar for one node execution.
+
+    * the text ends up on the node twice: live through ``STATUS_EVENT`` (see
+      ``web/js/enndee_colmap_status.js``) and, when the node finishes, through the
+      built-in ``{"ui": {"text": [...]}}`` output;
+    * the bar is ``comfy.utils.ProgressBar`` - 0-90 % for the SfM pipeline (which
+      reports per chunk of images / pairs) and the rest for export + parsing.
+    """
+
+    def __init__(self, node_id=None, total: int = 100):
+        self.node_id: Optional[str] = None if node_id in (None, "") else str(node_id)
+        self.header: List[str] = []
+        self.stage: str = ""
+        self.text: str = ""
+        self._last_percent: float = 0.0
+        try:
+            import comfy.utils
+
+            self.pbar = comfy.utils.ProgressBar(total)
+        except Exception:  # noqa: BLE001 - running outside ComfyUI (tests)
+            self.pbar = None
+
+    # ------------------------------------------------------------------ text
+    def set_header(self, lines) -> None:
+        self.header = [str(line) for line in lines]
+        self._publish()
+
+    def set_stage(self, text: str) -> None:
+        self.stage = str(text)
+        self._publish()
+
+    def _publish(self) -> None:
+        parts = list(self.header)
+        if self.stage:
+            parts.append(f"status  : {self.stage}")
+        self.text = "\n".join(parts)
+        if self.node_id is None:
+            return
+        try:
+            from server import PromptServer
+
+            PromptServer.instance.send_sync(STATUS_EVENT,
+                                            {"node": self.node_id, "text": self.text})
+        except Exception:  # noqa: BLE001 - no server (tests) or client gone
+            pass
+
+    # -------------------------------------------------------------- progress
+    def set_percent(self, percent: float) -> None:
+        """Advance the bar - it never moves backwards (stage markers emit 0)."""
+        percent = max(self._last_percent, float(percent))
+        self._last_percent = percent
+        if self.pbar is None:
+            return
+        try:
+            self.pbar.update_absolute(max(0, min(100, int(round(percent)))))
+        except Exception:  # noqa: BLE001
+            self.pbar = None
+
+    def progress(self, value: int, total: int, label: str) -> None:
+        """Progress hook of the wrapper: the pipeline owns the first 90 %."""
+        fraction = (float(value) / float(total)) if total else 0.0
+        self.set_stage(label)
+        self.set_percent(fraction * 90.0)
+
+    def finish(self, label: str = "finished") -> None:
+        self.set_percent(100.0)
+        self.set_stage(label)
 
 
 class ColmapLichtfeldTracker(GLOMAPLichtfeldTracker):
@@ -78,6 +153,8 @@ class ColmapLichtfeldTracker(GLOMAPLichtfeldTracker):
                 "ENNDEE_AUTO_DOWNLOAD=0 disables it."
             ),
         })
+        # Hidden: the node id routes the live status events to this node.
+        spec.setdefault("hidden", {})["unique_id"] = "UNIQUE_ID"
         return spec
 
     DESCRIPTION = (
@@ -93,18 +170,43 @@ class ColmapLichtfeldTracker(GLOMAPLichtfeldTracker):
 
     def _setup_binaries(self, colmap_path, glomap_path, mapper_backend,
                         auto_install_binaries, binary_flavor):
-        """No executables: make sure the python accelerators are installed."""
+        """No executables: make sure the **CUDA** python accelerators are installed."""
+        status = getattr(self, "_status", None)
+        if status is not None:
+            status.set_stage("checking the python environment")
         report = ensure_accelerators(auto_install=bool(auto_install_binaries), log=log)
         colmap = report["pycolmap"]
         onnx = report["onnxruntime"]
+        cuda = report.get("cuda") or {}
         attention = report.get("optional_attention") or {}
+        self._backend_note = f"pycolmap {colmap['version'] or 'missing'} [{colmap['mode']}]"
 
-        log(f"pycolmap    : {colmap['version'] or 'missing'}"
-            f"{'' if colmap['cuda'] else ' (CPU build - Windows wheels have no CUDA)'}")
-        log(f"onnxruntime : {onnx['version'] or 'missing'} "
-            f"[{', '.join(onnx['providers']) or 'no providers'}]")
-        log("attention   : " + ", ".join(
+        lines = ["COLMAP for Lichtfeld (Enndee) - native pycolmap backend",
+                 f"pycolmap : {colmap['version'] or 'missing'} [{colmap['mode']}]"]
+        if colmap["mode"] == "cpu-fallback":
+            lines.append(f"           CUDA {cuda.get('version') or '?'} "
+                         f"({cuda.get('device') or 'GPU'}) is available, but pycolmap "
+                         f"has to run on the CPU here:")
+            lines.append(f"           {colmap['reason']}")
+        elif colmap["mode"] == "cpu":
+            lines.append("           no CUDA device/driver detected - the CPU build is correct")
+        try:
+            import torch
+
+            torch_line = f"torch    : {torch.__version__}"
+            torch_line += (f" (CUDA {torch.version.cuda}, {torch.cuda.get_device_name(0)})"
+                           if torch.cuda.is_available() else " (no CUDA device)")
+        except Exception:  # noqa: BLE001
+            torch_line = "torch    : unavailable"
+        lines.append(torch_line)
+        lines.append(f"onnx     : {onnx['version'] or 'missing'} "
+                     f"[{', '.join(onnx['providers']) or 'no providers'}]")
+        lines.append("attention: " + ", ".join(
             f"{name}={'yes' if state else 'no'}" for name, state in attention.items()))
+        for line in lines:
+            log(line)
+        if status is not None:
+            status.set_header(lines)
 
         if not colmap["available"]:
             log_warn("pycolmap is not available - aborting. Run 'python install.py' "
@@ -124,7 +226,11 @@ class ColmapLichtfeldTracker(GLOMAPLichtfeldTracker):
             f"{'CUDA' if info['cuda'] else 'CPU'} build)")
         log("Mapper : " + ("incremental_mapping" if mapper_backend == "incremental"
                            else "global_mapping (GLOMAP)"))
-        return PyColmapWrapper()
+        wrapper = PyColmapWrapper()
+        status = getattr(self, "_status", None)
+        if status is not None:
+            wrapper.set_progress_hook(status.progress)
+        return wrapper
 
     # =======================================================================
     # Entry point: same widgets as the binary node, minus the two paths
@@ -138,11 +244,15 @@ class ColmapLichtfeldTracker(GLOMAPLichtfeldTracker):
               sequential_overlap=15, max_image_size=5120, frame_step=2,
               downscale_factor=1.0, offset_glomap=4, offset_splat=12,
               mapper_backend="global", auto_install_binaries=True,
-              embed_alpha_in_images=False, image_format="PNG", jpeg_quality=90):
-        """Run the shared pipeline with the native backend."""
+              embed_alpha_in_images=False, image_format="PNG", jpeg_quality=90,
+              unique_id=None):
+        """Run the shared pipeline with the native backend (plus live status)."""
         backend = LEGACY_MAPPER_BACKENDS.get(str(mapper_backend).lower(),
                                              str(mapper_backend).lower())
-        return GLOMAPLichtfeldTracker.track(
+        self._status = NodeStatus(unique_id)
+        self._backend_note = "pycolmap"
+        self._status.set_stage("starting")
+        result = GLOMAPLichtfeldTracker.track(
             self,
             colmap_path=None,
             glomap_path=None,
@@ -175,4 +285,20 @@ class ColmapLichtfeldTracker(GLOMAPLichtfeldTracker):
             image_format=image_format,
             jpeg_quality=jpeg_quality,
         )
+        self._status.finish(self._summary(result))
+        # ``ui.text`` is ComfyUI's built-in text preview (see PreviewAny); the live
+        # updates during the run go through the STATUS_EVENT websocket message.
+        return {"ui": {"text": [self._status.text]}, "result": result}
+
+    def _summary(self, result) -> str:
+        """One line describing what the run produced (shown on the node)."""
+        try:
+            trajectory, point_cloud = result[0], result[1]
+            frames = trajectory.get("reconstructed_frames")
+            if not frames:
+                return f"no reconstruction - {self._backend_note}"
+            return (f"done - {frames}/{trajectory.get('num_frames')} frames registered, "
+                    f"{point_cloud.get('num_points')} points, {self._backend_note}")
+        except Exception:  # noqa: BLE001
+            return f"done - {self._backend_note}"
 

@@ -598,7 +598,8 @@ Identical to the GLOMAP tracker **except**:
 
 With `auto_install_binaries=True` (default) the node checks and, if needed, installs
 
-* `pycolmap` - this node's backend, and
+* `pycolmap` - this node's backend, **the CUDA build whenever one is available** (see
+  below), and
 * `onnxruntime-gpu` - the CUDA ONNX runtime for the RMBG / ONNX nodes, matched to
   the CUDA version of your torch (CUDA 13 -> `>= 1.30`, CUDA 12 -> `1.19 .. 1.29`).
   A shadowing CPU wheel (`onnxruntime`) is removed, because it silently makes
@@ -607,15 +608,47 @@ With `auto_install_binaries=True` (default) the node checks and, if needed, inst
 `python install.py` does the same at setup time (`--skip-accelerators` opts out), and
 `ENNDEE_AUTO_DOWNLOAD=0` disables every automatic download/install.
 
-### CPU vs CUDA (read this)
+### CUDA first, CPU only as the fallback
 
-The official `pycolmap` wheels are built **without CUDA on Windows** (CUDA wheels are
-Linux only), so SIFT extraction, matching and the bundle adjustment run on the CPU.
-The binary tracker with its CUDA COLMAP build is faster in exactly those stages; the
-native node wins on setup (no ~1 GB download, no version pinning) and a 100+ frame
-orbit still finishes in a couple of minutes. `use_gpu` switches to the GPU
-automatically as soon as a CUDA-enabled pycolmap is installed
-(`pycolmap.has_cuda`).
+The node always tries to run on the GPU and only then falls back - and it **shows
+which one it is using** (see below). The order is:
+
+1. an installed CUDA pycolmap (`pycolmap.has_cuda`) - used as is,
+2. `ENNDEE_PYCOLMAP_CUDA_WHEEL=<path|url>` - a wheel you built or downloaded yourself,
+3. `pycolmap-cuda12` - when pip finds a wheel for this platform (Linux so far).
+
+The CPU build is only kept when there is no CUDA device/driver, no CUDA wheel for
+this platform, or auto install is switched off. The verdict is cached per session
+(the first check costs about a second, later ones are free).
+
+Reality check: the official **Windows** wheels of `pycolmap` have no CUDA and the
+CUDA wheels are Linux only, so on Windows the CPU fallback is the normal case - the
+label says so, including the reason. A CUDA build can be created from source (COLMAP
++ vcpkg + CUDA SDK) and then either installed normally or dropped in via
+`ENNDEE_PYCOLMAP_CUDA_WHEEL`; `use_gpu` starts using the GPU automatically.
+
+### Live status and progress
+
+* **Status label** - a read-only text area on the node
+  (`web/js/enndee_colmap_status.js`) that is updated while the node runs: the
+  environment check (backend, CUDA device, torch, onnxruntime, attention
+  accelerators) plus the current stage. The final summary also goes through
+  ComfyUI's built-in `ui.text` output.
+* **Progress bar** - `comfy.utils.ProgressBar`: 0-90 % for the reconstruction
+  (feature extraction per chunk of frames, matching per batch of image pairs - the
+  pairs come from COLMAP's own pair generator, so chunking does not change the
+  result) and the rest for the dataset export and the model parsing.
+
+While it runs the label looks like this:
+
+    COLMAP for Lichtfeld (Enndee) - native pycolmap backend
+    pycolmap : 4.2.1 [cpu-fallback]
+               CUDA 13.0 (NVIDIA GeForce RTX 5090) is available, but pycolmap has to run on the CPU here:
+               no 'pycolmap-cuda12' wheel exists for this platform; build pycolmap from source with CUDA, or set ENNDEE_PYCOLMAP_CUDA_WHEEL=<wheel|url>
+    torch    : 2.14.1+cu130 (CUDA 13.0, NVIDIA GeForce RTX 5090)
+    onnx     : 1.30.0 [Tensorrt, CUDA, CPU]
+    attention: flash_attn=yes, sageattention=yes
+    status   : feature extraction 42/113 images
 
 ---
 
