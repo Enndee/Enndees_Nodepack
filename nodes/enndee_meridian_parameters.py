@@ -67,6 +67,9 @@ from enndee_meridian_auto_camera import (
     ORBIT_VIEW_ANGLE_MAX,
     ORBIT_VIEW_ANGLE_MIN,
     SCENE_FILL,
+    SPIRAL_LEAD_ELEVATION,
+    SPIRAL_ROUNDS,
+    SPIRAL_TOP_ELEVATION,
     SUBJECT_FILL,
     SUBJECT_FILL_DEFAULT,
     SUBJECT_FILL_MAX,
@@ -407,10 +410,18 @@ class MeridianParametersAndCamera:
                         f"can reach (that orbit's '9 o'clock') - and then that far orbit runs its "
                         f"whole loop CLOCKWISE: 9 -> 12 (over the subject's back head) -> 3 (the far "
                         f"level point) -> 6 (under the back) -> 8, one hour short of its start so no "
-                        f"frame is shown twice - the clip shows both sides without a full lap. Auto "
-                        f"Max Speed always wins: when the budget cannot pay for the loop it is cut "
-                        f"short and the console line says so (more Output Frames or a higher Auto "
-                        f"Max Speed buy it back)."
+                        f"frame is shown twice - the clip shows both sides without a full lap. "
+                        f"'{ORBIT_COVERAGES[2]}' flies a RISING HELIX instead: it starts on the same "
+                        f"framed front pose (the middle of the O), leads in along the O's 2 o'clock "
+                        f"direction until the elevation reaches {SPIRAL_LEAD_ELEVATION:g} deg, and then "
+                        f"winds {SPIRAL_ROUNDS:g} rounds in the Auto Orbit Direction "
+                        f"(counter-clockwise by default) while the elevation climbs to "
+                        f"{SPIRAL_TOP_ELEVATION:g} deg - the clip ends looking DOWN on the subject "
+                        f"from above, on the clock's 9 o'clock side. It shows every side AND the top, "
+                        f"which is what a splat wants. Auto "
+                        f"Max Speed always wins: when the budget cannot pay for the loop (or for the "
+                        f"spiral's rounds) it is cut short and the console line says so (more Output "
+                        f"Frames or a higher Auto Max Speed buy it back)."
                     ),
                 }),
                 # The front O's angular radius, appended last (same reason as the shape widgets

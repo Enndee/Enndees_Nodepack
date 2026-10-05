@@ -175,7 +175,7 @@ BACK_ORBIT_HOME_FACTOR = 1.0                         # the 8 o'clock -> dial-cen
 #     subject, +90 = its viewer-left side, 180 = its back, 270/-90 = its right side. The aim stays
 #     the pivot, so the subject keeps its place in the picture - only the side the camera visits
 #     first moves.
-#   * Auto Orbit Coverage - "Front only" (the front O alone, ending on the circle's side) or
+#   * Auto Orbit Coverage - "Front only" (the front O alone, ending on the circle's side),
 #     "Front and Back" (the front O, the SHORTEST level connection - 180 deg minus the O's own
 #     DIAMETER, straight to the back orbit's near edge - and that back orbit: a full clockwise loop
 #     from the connection's first contact point, the back clock's "9 o'clock", over the subject's
@@ -184,11 +184,14 @@ BACK_ORBIT_HOME_FACTOR = 1.0                         # the 8 o'clock -> dial-cen
 #     subject). The frames are split between the phases by their travel, so all of them run at the
 #     same per-frame subject drift. When frames x speed cap cannot pay for the whole back part, the
 #     BACK gives way (its sweep is cut and the console names it) - the front O is protected.
+#     Or "Spiral": a rising helix - the middle of the O, a lead-in along the dial's 2 o'clock
+#     direction and then a winding climb to a top-down view (see the SPIRAL_* constants).
 ORBIT_VIEW_ANGLE_DEFAULT = 0.0    # deg, 0 = the orbit is centred on the frontal view
 ORBIT_VIEW_ANGLE_MIN = -180.0
 ORBIT_VIEW_ANGLE_MAX = 360.0
-ORBIT_COVERAGES = ("Front only", "Front and Back")
+ORBIT_COVERAGES = ("Front only", "Front and Back", "Spiral")
 ORBIT_COVERAGE_DEFAULT = ORBIT_COVERAGES[1]
+SPIRAL_COVERAGE = ORBIT_COVERAGES[2]
 ORBIT_COVERAGE_DEGREES = 180.0    # deg from the front circle's middle to the back circle's middle
                                   # (the level connection stops one O radius short of this, at the
                                   # back orbit's own edge - see `_back_orbit_point`)
@@ -204,6 +207,30 @@ ORBIT_CUT_TARGET = 0.96           # the cut aims a touch *below* the cap: the an
 ORBIT_CUT_STEPS = 3
 ORBIT_DIRECTIONS = ("counter-clockwise", "clockwise")
 ORBIT_DIRECTION_DEFAULT = ORBIT_DIRECTIONS[0]
+
+# The Spiral coverage (2026-10-05): the front O's opening pose starts the move, but instead of
+# closing a circle the camera keeps climbing - a helix that shows every side *and* the top of the
+# subject, which is what a Lichtfeld/splat capture wants at the end of a clip.
+#   * frame 0 is the middle of the O (the framed pose, elevation 0), exactly like the front O's
+#     opening - "starts in the centre",
+#   * the lead-in follows the dial's 2 o'clock direction (the front O's own crane) and stops as soon
+#     as the elevation reaches `SPIRAL_LEAD_ELEVATION`, so the camera leaves the centre up and to
+#     the side without already flying the whole first quarter,
+#   * the helix then advances the azimuth monotonically in the Auto Orbit Direction
+#     (counter-clockwise by default) while the elevation climbs linearly to `SPIRAL_TOP_ELEVATION` -
+#     `SPIRAL_ROUNDS` revolutions in total, and the last pose lands on the 9 o'clock side
+#     (`SPIRAL_END_CLOCK_DEGREES` off the view-angle centre), i.e. the clip ends high above the
+#     subject looking down.
+# The azimuth advance is what the amplitude ladder scales: when frames x speed cap cannot pay for
+# the whole helix the *rounds* give way (never the cap), and the console/description names the cut -
+# the same rule the front/back modes apply to the back connection.
+SPIRAL_LEAD_ELEVATION = 10.0      # deg, the lead-in ends when the elevation reaches this
+SPIRAL_LEAD_CLOCK = FRONT_ORBIT_START_CLOCK   # 2 o'clock - the lead-in's direction on the dial
+SPIRAL_ROUNDS = 2.0               # revolutions of the helix at amplitude scale 1
+SPIRAL_MIN_ROUNDS = 0.05          # the ladder's floor: below this the helix is a plain sweep
+SPIRAL_TOP_ELEVATION = 90.0       # deg, where the climb ends (straight above the subject) ...
+SPIRAL_ELEVATION_CEILING = 88.0   # ... clamped here: exactly at the zenith the up vector degenerates
+SPIRAL_END_CLOCK_DEGREES = 90.0   # deg, the azimuth side the last pose lands on (the clock's 9)
 
 # Scene target: a lateral survey instead of a lap around the scene. Meridian's scene renders are
 # depth reprojections, so what a walk-in VR viewer needs is *side* coverage: rows of viewpoints
@@ -675,6 +702,12 @@ def _envelope_angles(size, include_back=True, orbit_end=None, direction=ORBIT_DI
     mode = ORBIT_COVERAGE_DEFAULT if coverage is None else str(coverage)
     if coverage is None and orbit_end is not None:
         mode = coverage_for_end(orbit_end)
+    if mode == SPIRAL_COVERAGE:
+        # The helix's own poses: the level middle of the O is the tightest pose (the tallest subject
+        # box) and the top the smallest, so sampling the whole climb covers both ends - the room
+        # check and the fill envelope need exactly that.
+        return [_spiral_point(fraction, centre, 1.0, direction_mirror(direction))
+                for fraction in (0.0, 0.25, 0.5, 0.75, 1.0)]
     if mode != ORBIT_COVERAGES[1]:
         return angles                      # "Front only": no back poses to make room for
     full = max(0.0, ORBIT_COVERAGE_DEGREES - 2.0 * amplitude)   # level, to the back orbit's edge
@@ -1329,6 +1362,60 @@ def _back_orbit_point(progress, centre, amplitude, mirror):
     return centre + mirror * amplitude * math.cos(angle), amplitude * math.sin(angle)
 
 
+def _spiral_geometry(centre, mirror, scale=1.0):
+    """(lead_yaw, end_yaw, sweep, top) of the Spiral coverage at amplitude scale `scale`.
+
+    The lead-in's direction is the dial's 2 o'clock ray (`SPIRAL_LEAD_CLOCK`, the same opening the
+    front O uses) and its length is set so the elevation reaches exactly `SPIRAL_LEAD_ELEVATION`
+    there. From that point the azimuth winds `SPIRAL_ROUNDS * scale` times around the subject and
+    then on to the 9 o'clock side (`SPIRAL_END_CLOCK_DEGREES` off the centre, mirrored like
+    everything else), so the total azimuth advance is the rounds *plus* that closing offset - which
+    is what makes the last pose land on the 9 o'clock side after the whole number of rounds. `top`
+    is the elevation the climb ends at: `SPIRAL_TOP_ELEVATION`, clamped to the gimbal-safe
+    `SPIRAL_ELEVATION_CEILING`.
+    """
+    clock = math.radians(90.0 - 30.0 * SPIRAL_LEAD_CLOCK)     # the O's own 2 o'clock angle
+    reach = SPIRAL_LEAD_ELEVATION / max(1e-6, math.sin(clock))
+    lead_yaw = centre + mirror * reach * math.cos(clock)
+    end_yaw = centre - mirror * SPIRAL_END_CLOCK_DEGREES
+    rounds = max(SPIRAL_MIN_ROUNDS, SPIRAL_ROUNDS * max(1e-6, float(scale)))
+    sweep = rounds * 360.0 + abs(lead_yaw - end_yaw)
+    return lead_yaw, end_yaw, sweep, min(SPIRAL_TOP_ELEVATION, SPIRAL_ELEVATION_CEILING)
+
+
+def _spiral_point(progress, centre, scale=1.0, mirror=1.0):
+    """(yaw, elevation) of the Spiral coverage at `progress` 0..1: middle of the O -> up -> round.
+
+    Progress 0 is the *middle of the circle* (the framed pose, elevation 0) and the first
+    `FRONT_ORBIT_RISE` of the path is the eased lead-in along the dial's 2 o'clock direction, ending
+    at `SPIRAL_LEAD_ELEVATION`; the rest is the helix - the azimuth advances linearly (a constant
+    angular speed keeps the synthesis artefacts low, the same reason the manual Spiral Sweep is a
+    monotone ramp) while the elevation climbs linearly to the top. `mirror` = +1 winds
+    counter-clockwise (the Auto Orbit Direction default), -1 clockwise.
+    """
+    progress = min(1.0, max(0.0, float(progress)))
+    lead_yaw, _end_yaw, sweep, top = _spiral_geometry(centre, mirror, scale)
+    if progress <= FRONT_ORBIT_RISE:
+        phase = progress / FRONT_ORBIT_RISE
+        eased = (1.0 - math.cos(math.pi * phase)) / 2.0
+        return centre + (lead_yaw - centre) * eased, SPIRAL_LEAD_ELEVATION * eased
+    phase = (progress - FRONT_ORBIT_RISE) / max(1e-9, 1.0 - FRONT_ORBIT_RISE)
+    return (lead_yaw - mirror * sweep * phase,
+            SPIRAL_LEAD_ELEVATION + (top - SPIRAL_LEAD_ELEVATION) * phase)
+
+
+def _spiral_info(view_angle=None, direction=ORBIT_DIRECTION_DEFAULT, scale=1.0):
+    """The `info` fields the Spiral coverage reports: lead-in reach, rounds, top, coverage."""
+    centre = ORBIT_VIEW_ANGLE_DEFAULT if view_angle is None else float(view_angle)
+    mirror = direction_mirror(direction)
+    lead_yaw, _end_yaw, sweep, top = _spiral_geometry(centre, mirror, scale)
+    return {"front_yaw": abs(lead_yaw - centre), "orbit_end": sweep, "front_share": 1.0,
+            "back_span": 0.0, "back_orbit": False,
+            "spiral_rounds": max(SPIRAL_MIN_ROUNDS, SPIRAL_ROUNDS * max(1e-6, float(scale))),
+            "spiral_top_elevation": top, "orbit_coverage": min(FULL_CIRCLE, sweep),
+            "view_angle": None if view_angle is None else float(view_angle)}
+
+
 def _legacy_samples(frames, pivot, radius, scale=1.0, size=1.0, orbit_end=None,
                     direction=ORBIT_DIRECTION_DEFAULT, share=None):
     """The pre-`coverage` choreography: the front O, then the concluding orbit to `orbit_end`.
@@ -1415,6 +1502,12 @@ def subject_samples(frames, pivot, radius, scale=1.0, size=1.0, orbit_end=None,
     mode = ORBIT_COVERAGE_DEFAULT if coverage is None else str(coverage)
     if coverage is None and orbit_end is not None:
         mode = coverage_for_end(orbit_end)
+    if mode == SPIRAL_COVERAGE:
+        # A rising helix: one continuous phase, so every frame is a step along it - the amplitude
+        # ladder scales the *rounds* instead of splitting the frames between phases.
+        return [_place(pivot, radius,
+                       *_spiral_point(index / max(1, frames - 1), centre, scale, mirror))
+                for index in range(frames)]
     back = mode == ORBIT_COVERAGES[1]
     # The level connection ends where the back orbit begins: its near edge, one O radius (half the
     # circle's span) short of the back circle's middle. That is the shortest way to reach the back
@@ -1611,6 +1704,13 @@ def _orbit_candidate(pool, surface, frames, pivot, radius, scale, size, end, dir
         info = {"front_yaw": amplitude, "orbit_end": end,
                 "front_share": balanced_front_share(amplitude, max(0.0, end - amplitude))}
         return scale, samples, drift, typical, info
+    if str(coverage) == SPIRAL_COVERAGE:
+        # Nothing to cut here: the amplitude ladder *is* the cut for the helix (it scales the
+        # rounds), so one sample run and one drift measurement describe the whole path.
+        samples = subject_samples(frames, pivot, radius, scale, size, None, direction,
+                                  **path_options(view_angle, coverage))
+        drift, typical = subject_drift(pool, samples, pivot, surface)
+        return scale, samples, drift, typical, _spiral_info(view_angle, direction, scale)
     span, samples, drift, typical = _cut_back_span(pool, surface, frames, pivot, radius, scale, size,
                                                    direction, cap_px, view_angle, coverage)
     amplitude = front_amplitudes(scale, size)[0]
@@ -1754,6 +1854,12 @@ def _fit_orbit_world(frames, pivot, radius, surface, size, budget, orbit_end=Non
         info = {"front_yaw": amplitude, "orbit_end": end,
                 "front_share": balanced_front_share(amplitude, max(0.0, end - amplitude))}
         return scale, samples, travel, info
+    if str(coverage) == SPIRAL_COVERAGE:
+        options = path_options(view_angle, coverage)
+        samples_of = lambda scale: subject_samples(frames, pivot, radius, scale, size, None,
+                                                   direction, **options)
+        scale, samples, travel = _fit_amplitude(samples_of, budget)
+        return scale, samples, travel, _spiral_info(view_angle, direction, scale)
     options = path_options(view_angle, coverage)
     # The connection ends at the back orbit's near edge (the clock's 9 o'clock), so the azimuth it
     # has to cover is the circle-to-circle distance MINUS the O's own diameter - the back orbit's
@@ -2007,6 +2113,9 @@ def automatic_keys(frames, pivot, radius, content_radius, target, max_speed=DEFA
             requested = ORBIT_END_DEFAULT if orbit_end is None else max(ORBIT_END_MIN,
                                                                         float(orbit_end))
             span = max(0.0, meta["orbit_end"] - amplitude)
+        elif str(coverage) == SPIRAL_COVERAGE:  # the helix: the request is SPIRAL_ROUNDS rounds
+            requested = SPIRAL_ROUNDS * 360.0
+            span = 0.0
         else:                                  # the front/back path: the request is the full back
             requested = amplitude + max(0.0, ORBIT_COVERAGE_DEGREES - 2.0 * amplitude)
             span = max(0.0, meta.get("back_span", 0.0))
@@ -2016,6 +2125,8 @@ def automatic_keys(frames, pivot, radius, content_radius, target, max_speed=DEFA
                      "view_angle": None if view_angle is None else float(view_angle),
                      "coverage": coverage, "back_orbit": bool(meta.get("back_orbit")),
                      "front_floor": meta.get("front_floor"),
+                     "spiral_rounds": meta.get("spiral_rounds"),
+                     "spiral_top_elevation": meta.get("spiral_top_elevation"),
                      "orbit_coverage": min(FULL_CIRCLE, meta.get(
                          "orbit_coverage",
                          amplitude + max(amplitude, meta["orbit_end"])))})
@@ -2433,6 +2544,15 @@ def _estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DE
                       + (" - cut there by the speed cap"
                          if info['orbit_end'] < info['orbit_end_requested'] - 0.5 else "")
                       + f", covering {info['orbit_coverage']:.0f} deg around the subject")
+        elif info.get("coverage") == SPIRAL_COVERAGE:
+            rounds = float(info.get("spiral_rounds") or SPIRAL_ROUNDS)
+            top = float(info.get("spiral_top_elevation") or SPIRAL_TOP_ELEVATION)
+            beyond = (f", then a rising spiral {direction_label(info['orbit_direction'])}: "
+                      f"{rounds:.2f} rounds of azimuth while the elevation climbs to {top:.0f} deg "
+                      f"above the subject"
+                      + (f" (cut from {SPIRAL_ROUNDS:.0f} rounds by the speed cap)"
+                         if rounds < SPIRAL_ROUNDS - 1e-6 else "")
+                      + f", covering {info['orbit_coverage']:.0f} deg around the subject")
         elif info.get("coverage"):
             beyond = (f", the back visit giving way to the speed cap: the path ends at "
                       f"{info['orbit_end']:.0f} deg of the requested "
@@ -2446,6 +2566,14 @@ def _estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DE
                          else f" of the requested {info['orbit_end_requested']:.0f} deg (speed cap)")
                       + (", back at the start point" if closed_round else "")
                       + f", covering {info['orbit_coverage']:.0f} deg around the subject")
+    # The spiral replaces the front O as the *opening* move (it starts on the same framed pose), so
+    # the description names it instead of the circle it never closes. Only the subject path has a
+    # `front_yaw` (the scene survey reports rows instead), hence the guard.
+    opening = ""
+    if info.get("orbit_coverage"):
+        opening = (f"the spiral (+/-{info['front_yaw']:.0f} deg lead-in)"
+                   if info.get("coverage") == SPIRAL_COVERAGE
+                   else f"the front O (+/-{info['front_yaw']:.0f} deg)")
     description = (
         f"Estimated from the still's surface ({surface['source']}): pivot "
         f"[{pivot[0]:.3g}, {pivot[1]:.3g}, {pivot[2]:.3g}] is the cylindrical centre of the "
@@ -2465,7 +2593,7 @@ def _estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DE
         + (f", the Auto Pivot offset ({offset_values[0]:g}, {offset_values[1]:g}, "
            f"{offset_values[2]:g}) content radii shifted the final aim"
            if any(abs(value) > 1e-9 for value in offset_values) else "")
-        + (f", the front O (+/-{info['front_yaw']:.0f} deg)" + beyond
+        + (f", {opening}" + beyond
            if info.get("orbit_coverage") else "")
         + (f"; survey {info['rows']} rows across +/-{info['half_yaw']:.0f} deg "
            f"({info['lane_overlap'] * 100:.0f} % side overlap, {info['lane_step']:.3g} units "
@@ -2636,6 +2764,10 @@ def _estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DE
         # None while the deprecated `orbit_end` path is in charge (saved callers).
         "view_angle_deg": info.get("view_angle"), "coverage": info.get("coverage"),
         "back_orbit": info.get("back_orbit"),
+        # Spiral coverage only: the rounds the fit could pay for and the elevation the climb ends at
+        # (SPIRAL_ROUNDS is the request; the speed cap may cut it).
+        "spiral_rounds": info.get("spiral_rounds"),
+        "spiral_top_elevation_deg": info.get("spiral_top_elevation"),
     }
     if info.get("fit") == "subject pixels":
         summary.update({"drift_px": info["drift_px"], "drift_typical_px": info["drift_typical_px"],
@@ -2805,11 +2937,18 @@ def format_summary(summary):
                          if summary.get("back_orbit")
                          else " (the speed cap could not pay for the back O loop, so the path ends "
                               "where the sweep stopped)"))
+        elif summary.get("coverage") == SPIRAL_COVERAGE:
+            rounds = summary.get("spiral_rounds") or SPIRAL_ROUNDS
+            top = summary.get("spiral_top_elevation_deg") or SPIRAL_TOP_ELEVATION
+            beyond = (f"rising spiral, {rounds:.2f} rounds up to {top:.0f} deg"
+                      + (f" (cut from {SPIRAL_ROUNDS:.0f} by the speed cap)"
+                         if rounds < SPIRAL_ROUNDS - 1e-6 else ""))
         elif summary.get("coverage"):
             beyond = "front circle only"
         else:
             beyond = f"+ {summary['lap_span_deg']:.0f} deg lap"
-        orbit = (f", O +/-{summary['front_yaw_deg']:.0f} deg "
+        shape = "spiral lead-in" if summary.get("coverage") == SPIRAL_COVERAGE else "O"
+        orbit = (f", {shape} +/-{summary['front_yaw_deg']:.0f} deg "
                  f"{summary.get('orbit_direction', '')} "
                  f"centred on {summary.get('view_angle_deg') or 0.0:.0f} deg {beyond} "
                  f"to {summary['orbit_end_deg']:.0f} deg "
