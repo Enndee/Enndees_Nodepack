@@ -239,28 +239,34 @@ image the Geometry node receives. The estimator:
        plus a glide in to the far dial's centre: both sides without a full lap.
        When the budget cannot pay for the back part, *it* is cut - the front O keeps
        the radius the fit found (the console names the cut).
-     - `Spiral` - a rising **coil around the view axis** (x = the depth of the source
-       picture). Frame 0 is the framed front pose with the camera *on* that axis,
-       looking straight at the picture (the middle of the frame); the lead-in follows
-       the 2 o'clock direction until the arc between the camera and the axis reaches
-       10 degrees; then the coil winds **two whole rounds** in Auto Orbit Direction
-       (counter-clockwise by default) plus the **closing arc to the clock's 9**
-       (150 degrees), while that arc climbs to **90 degrees** - the camera ends *in the
-       picture's own plane*, level with the pivot, looking at the scene from the side,
-       orthogonally to the original view. The front, every side and the top are
-       covered on the way. Whole rounds are what keeps that end pose: the clock has to
-       advance `150 + 360k` degrees to arrive on 9 o'clock, so a fractional winding
-       ended somewhere else on the dial (0.70 rounds ended at 0.6 o'clock - straight
-       above the subject). The coil's frames follow the *measured* subject motion
-       rather than a linear clock, exactly like the front/back path splits its phases
-       by travel: passing over (or under) the subject turns the picture several times
-       faster than a step at 3/9 o'clock, and a linear clock spent the whole speed
-       budget on those few steep frames - which is what used to cut the coil down to
-       0.2-0.7 rounds. With the motion-even split the full 2 rounds + closing fit the
-       same speed cap (measured: 30 px/frame vs a 37 px cap on a 243 frame run). The
-       rounds are still the thing that gives way when frames x speed cap cannot pay for
-       them (never the cap), and the console and the path description name it, e.g.
-       "1 of the 2 whole rounds + the 150 deg closing arc to the clock's 9".
+     - `Spiral` - a **spherical spiral** around the pivot. The camera travels on a
+       sphere whose centre is the pivot (constant distance, always aiming at it, so the
+       subject keeps its place in the frame) along a spiral that unwinds out of the view
+       axis (x = the depth of the source picture):
+       * `phi` - the arc between the camera and the view axis - starts at **0 at the
+         first frame** (the camera sits *on* the axis, looking straight at the picture:
+         the middle of the frame) and reaches **90 degrees at the end** of the path,
+         which puts the camera *in the picture's own plane* - the clip finishes with a
+         **side view** of the picture,
+       * `psi` - the clock angle around that axis (12 = up, 3 = the subject's right,
+         6 = down, 9 = left) - winds from 0 to the **Spiral End** widget
+         (`spiral_end`, degrees, default **840** = two and a third rounds), in Auto
+         Orbit Direction (counter-clockwise by default).
+       The winding alone decides *where* in that plane the last frame looks from: with
+       the default 840 deg it is `cos 840 deg = -0.5`, i.e. a side view 30 degrees
+       *below* the pivot; **810 deg** ends level on the side (`cos 810 deg = 0`), and
+       0 flies the plain quarter circle (front view -> straight up, the top of the
+       plane). The console line and the path description name the end pose
+       (clock/elevation), so the number can be dialled in. The spiral's frames follow
+       the *measured* subject motion rather than the linear parameter - passing over
+       (or under) the subject turns the picture several times faster than a step at
+       3/9 o'clock - which is what keeps the per-frame picture motion as even as the
+       path allows. **The winding is your parameter, not the fit's**: Max Speed never
+       shortens it. When the frames x speed cap cannot pay for the path, the console
+       line reports the per-frame drift against the cap instead (more Output Frames or
+       a higher Auto Max Speed are the levers). Measured on the built-in fixture:
+       243 frames x 840 deg run at 18.6 px/frame against a 38.1 px cap - the requested
+       coil fits; 73 frames land at 67.9 px/frame, which the console names.
    - **Manual** - the manual styles below, but aimed at the estimated pivot
      instead of the absolute look-pivot (the `path_pivot_*` widgets are ignored
      and hidden then; every other path widget applies as usual).

@@ -68,8 +68,9 @@ from enndee_meridian_auto_camera import (
     ORBIT_VIEW_ANGLE_MIN,
     SCENE_FILL,
     SPIRAL_END_ARC,
-    SPIRAL_LEAD_ARC,
-    SPIRAL_ROUNDS,
+    SPIRAL_END_DEFAULT,
+    SPIRAL_END_MAX,
+    SPIRAL_END_MIN,
     SUBJECT_FILL,
     SUBJECT_FILL_DEFAULT,
     SUBJECT_FILL_MAX,
@@ -135,7 +136,8 @@ PATH_WIDGET_NAMES = (
 AUTO_WIDGET_NAMES = ("auto_target", "auto_max_speed", "auto_path_mode", "auto_subject_fill",
                      "auto_orbit_distance", "auto_orbit_size", "auto_orbit_end",
                      "auto_orbit_direction", "auto_orbit_view_angle", "auto_orbit_coverage",
-                     "auto_pivot_x", "auto_pivot_y", "auto_pivot_z", "auto_orbit_angle")
+                     "auto_pivot_x", "auto_pivot_y", "auto_pivot_z", "auto_orbit_angle",
+                     "spiral_end")
 
 
 def build_meridian_arguments(output_frames):
@@ -411,23 +413,25 @@ class MeridianParametersAndCamera:
                         f"whole loop CLOCKWISE: 9 -> 12 (over the subject's back head) -> 3 (the far "
                         f"level point) -> 6 (under the back) -> 8, one hour short of its start so no "
                         f"frame is shown twice - the clip shows both sides without a full lap. "
-                        f"'{ORBIT_COVERAGES[2]}' flies a RISING COIL around the view axis instead: "
-                        f"it starts on the same framed front pose - the camera ON the view axis, "
-                        f"looking straight at the picture (the middle of the frame) - leads in along "
-                        f"the 2 o'clock direction until the arc between the camera and that axis "
-                        f"reaches {SPIRAL_LEAD_ARC:g} deg, and then winds {SPIRAL_ROUNDS:g} whole "
-                        f"rounds in the Auto Orbit Direction (counter-clockwise by default) plus the "
-                        f"closing arc to the clock's 9 (150 deg) while the arc climbs to "
-                        f"{SPIRAL_END_ARC:g} deg. Whole rounds are what puts the last pose IN the "
-                        f"picture's own plane on the clock's 9 o'clock side, level with the pivot - "
-                        f"the clip finishes looking at the scene from the side, orthogonally to the "
-                        f"original view, and the front, every side and the top are covered on the "
-                        f"way. The coil's frames follow the measured subject motion (like the "
-                        f"front/back phases are split by travel), so the steep passes over/under the "
-                        f"subject do not eat the speed budget. Auto "
-                        f"Max Speed always wins: when the budget cannot pay for the loop (or for the "
-                        f"coil's rounds) it is cut short and the console line says so (more Output "
-                        f"Frames or a higher Auto Max Speed buy it back)."
+                        f"'{ORBIT_COVERAGES[2]}' flies a SPHERICAL SPIRAL instead: the camera "
+                        f"travels on a sphere around the pivot (its centre) along a spiral that "
+                        f"unwinds out of the view axis. It starts on the framed front pose - the "
+                        f"camera ON the view axis, looking straight at the picture (the middle of "
+                        f"the frame), phi = 0 - and phi reaches {SPIRAL_END_ARC:g} deg at the END of "
+                        f"the path, i.e. the camera ends up IN the picture's own plane and the clip "
+                        f"finishes with a side view of the picture. While phi climbs, psi - the clock "
+                        f"angle around that axis - winds from 0 to the 'Spiral End' value in the Auto "
+                        f"Orbit Direction (counter-clockwise by default), so {SPIRAL_END_DEFAULT:g} "
+                        f"deg (the default) is two and a third rounds: the front, every side and the "
+                        f"top are covered on the way. The winding alone decides where in the "
+                        f"picture's plane the last frame looks from (with {SPIRAL_END_DEFAULT:g} deg "
+                        f"it is 30 deg BELOW the pivot; 810 deg would end level on the side) - the "
+                        f"console line names the end pose. The spiral's frames follow the measured "
+                        f"subject motion, so the steep passes over/under the subject do not eat the "
+                        f"speed budget. Auto "
+                        f"Max Speed never shortens the spiral (the winding is your parameter, not the "
+                        f"fit's): the console line reports the per-frame drift against the cap "
+                        f"instead, so more Output Frames or a higher Auto Max Speed are the levers."
                     ),
                 }),
                 # The front O's angular radius, appended last (same reason as the shape widgets
@@ -448,6 +452,26 @@ class MeridianParametersAndCamera:
                         f"(up to the gimbal-safe ceiling). Clamped to "
                         f"{FRONT_ORBIT_ANGLE_MIN:g}-{FRONT_ORBIT_LIMIT:g} deg. This is the live shape "
                         f"control - Auto Orbit Size / End are deprecated."
+                    ),
+                }),
+                # The Spiral coverage's winding, appended after the O Orbit Angle (same reason: the
+                # JS panel hides it with the automatic group). Only the 'Spiral' coverage reads it.
+                "spiral_end": ("INT", {
+                    "default": int(round(SPIRAL_END_DEFAULT)),
+                    "min": int(SPIRAL_END_MIN), "max": int(SPIRAL_END_MAX), "step": 10,
+                    "tooltip": (
+                        f"Automatic camera, '{ORBIT_COVERAGES[2]}' coverage: the END of the spiral "
+                        f"path - how many degrees the clock angle winds around the view axis from the "
+                        f"first frame to the last ({SPIRAL_END_DEFAULT:g} deg by default = two and a "
+                        f"third rounds). Phi - the arc between the camera and the view axis - always "
+                        f"runs 0 -> {SPIRAL_END_ARC:g} deg over the same path, so the first frame is "
+                        f"the framed frontal view and the last one is a side view (the camera in the "
+                        f"picture's own plane). Every 360 deg adds one round; 0 flies the plain "
+                        f"quarter circle (no winding). The winding decides where in that plane the "
+                        f"last frame looks from: with {SPIRAL_END_DEFAULT:g} deg it is 30 deg below "
+                        f"the pivot, with 810 deg it ends level on the side. The fit never shortens "
+                        f"it - the console line reports the per-frame drift against Auto Max Speed "
+                        f"instead. Clamped to {SPIRAL_END_MIN:g}-{SPIRAL_END_MAX:g} deg."
                     ),
                 }),
             },
@@ -546,6 +570,10 @@ class MeridianParametersAndCamera:
                 coverage=kwargs["auto_orbit_coverage"],
                 # O Orbit Angle: the front O's angular radius (swing AND rise). Smaller = flatter.
                 orbit_amplitude=float(kwargs["auto_orbit_angle"]),
+                # Spiral End: the 'Spiral' coverage's winding around the view axis (deg). Phi still
+                # runs 0 -> SPIRAL_END_ARC over the same path, so this decides where the last frame
+                # looks from - and the fit never shortens it.
+                spiral_end=float(kwargs["spiral_end"]),
             )
             print(f"[Enndee] Meridian {format_summary(summary)}", flush=True)
             return signal

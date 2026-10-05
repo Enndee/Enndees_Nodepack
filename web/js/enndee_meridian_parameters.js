@@ -25,7 +25,7 @@ const SPIRAL_SWEEP_PANEL = ["path_start_yaw", "path_target_yaw", "path_spiral_st
 const PATH_SHARED = ["path_camera_mode", "path_dolly", "path_pivot_x", "path_pivot_y", "path_pivot_z"];
 const PATH_PIVOTS = ["path_pivot_x", "path_pivot_y", "path_pivot_z"];
 const PATH_PANEL = [...O_ORBIT_PANEL, ...HEIGHT_SWEEP_PANEL, ...SPIRAL_SWEEP_PANEL, ...PATH_SHARED];
-const AUTO_PANEL = ["auto_target", "auto_max_speed", "auto_path_mode", "auto_subject_fill", "auto_orbit_view_angle", "auto_orbit_coverage", "auto_orbit_direction", "auto_pivot_x", "auto_pivot_y", "auto_pivot_z", "auto_orbit_angle"];
+const AUTO_PANEL = ["auto_target", "auto_max_speed", "auto_path_mode", "auto_subject_fill", "auto_orbit_view_angle", "auto_orbit_coverage", "auto_orbit_direction", "auto_pivot_x", "auto_pivot_y", "auto_pivot_z", "auto_orbit_angle", "spiral_end"];
 // Deprecated widgets: never visible (the saved value survives in the graph, the backend ignores it).
 // `auto_orbit_distance` was the fixed camera stand-off; the distance follows Auto Subject Fill now.
 // `auto_orbit_end` was where the concluding orbit stopped and `auto_orbit_size` scaled the O - the
