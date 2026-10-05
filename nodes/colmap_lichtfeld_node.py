@@ -161,7 +161,10 @@ class ColmapLichtfeldTracker(GLOMAPLichtfeldTracker):
         "Global SfM camera tracking through COLMAP's native Python API (pycolmap) - "
         "GLOMAP is part of COLMAP >= 3.12, so nothing is downloaded. Same widgets, "
         "same Lichtfeld Studio dataset export as the binary tracker; installs/repairs "
-        "pycolmap and the CUDA ONNX runtime on demand."
+        "pycolmap and the CUDA ONNX runtime on demand. Note: the official Windows "
+        "pycolmap wheel has no CUDA build, so the SIFT work runs on the CPU here - "
+        "the binary tracker (COLMAP CUDA build) is the faster choice for long frame "
+        "sequences."
     )
 
     # =======================================================================

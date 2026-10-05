@@ -630,6 +630,32 @@ With `auto_install_binaries=True` (default) the node checks and, if needed, inst
 `python install.py` does the same at setup time (`--skip-accelerators` opts out), and
 `ENNDEE_AUTO_DOWNLOAD=0` disables every automatic download/install.
 
+### Speed: on Windows the native backend is CPU only
+
+The native node is **not** a speed replacement for the binary tracker - the difference
+is the SIFT work. The binary tracker downloads *CUDA* builds of COLMAP/GLOMAP
+(`colmap.exe` links `cudart64_12.dll`) and runs extraction, matching and the bundle
+adjustment on the GPU. The official `pycolmap` wheel for Windows is compiled without
+CUDA (`pycolmap.has_cuda == False`), so the same stages run on the CPU there.
+
+Measured on this machine (RTX 5090, 12 synthetic frames at 2048 px with ~11.5k features
+each, sequential overlap 5, identical settings in both nodes):
+
+| stage | binary tracker (COLMAP CUDA) | native tracker (pycolmap CPU) |
+| --- | --- | --- |
+| feature extraction, 12 frames | 1.0 s | 4.8 s |
+| feature matching, 50 pairs | 0.6 s (incl. process start) | 22.1 s |
+
+Both pipelines extracted the same features (138k vs 140k), so this is pure compute
+time. On a real 113 frame workflow the same ratio shows up end to end:
+**121.8 s (native) vs 65.8 s (binary)** - the extraction is ~5x and the matching far
+more expensive on the CPU, while the global mapper itself is CPU-bound in both nodes.
+
+Rule of thumb: **binary tracker for speed, native tracker for "nothing to download"**
+plus the live status label and progress bar. If you build a CUDA pycolmap yourself
+(COLMAP + vcpkg + CUDA SDK) and drop it in via `ENNDEE_PYCOLMAP_CUDA_WHEEL`, the native
+node switches to the GPU automatically and `use_gpu` really means GPU.
+
 ### Console output
 
 COLMAP logs through glog, and at INFO level that is a *lot*: every SIFT thread setup,
@@ -637,8 +663,11 @@ every processed image, every pairing step. A 113 frame run printed **2455** such
 around the 4 warnings that actually mattered. The node therefore runs COLMAP at
 **WARNING** level:
 
-* warnings and errors still appear (missing focal priors, "compiled without CUDA
-  support", failures),
+* warnings and errors still appear (missing focal priors, real failures) - the two
+  "Requested to use GPU for bundle adjustment, but COLMAP was compiled without CUDA
+  support" lines are gone, because a CPU-only build is now *told* not to ask for the
+  GPU solvers (they only repeated what `pycolmap.has_cuda` already says - see the
+  speed section below),
 * the progress chatter is gone - the node's own status label and progress bar carry that
   information now,
 * `ENNDEE_COLMAP_VERBOSE=1` restores the full output for debugging.
@@ -646,6 +675,19 @@ around the 4 warnings that actually mattered. The node therefore runs COLMAP at
 The binary tracker passes the same setting to the COLMAP/GLOMAP executables, so
 `glomap mapper` is quiet too (verified: `COLMAP feature_extractor` prints 3 INFO lines
 without it and 0 with it).
+
+The one warning that stays is worth decoding:
+
+    W... global_pipeline.cc:62] Less than 50% of cameras have prior focal lengths.
+    The global mapper depends on reasonably good focal length priors to perform well. ...
+
+It comes from the global mapper (`pycolmap`/COLMAP >= 3.12 - the GLOMAP 1.2.0 binary
+does not even contain that text) and it is a **quality hint, not an error**: frames that
+are generated rather than photographed carry no EXIF focal length, so COLMAP seeds the
+camera with its default guess (`f = 1.2 * max(width, height)`) and does not mark it as a
+*prior*. The mapper then estimates the focal length itself - which is exactly what the
+bundle adjustment is for. Nothing to fix unless you know the real focal length (then a
+calibrated `camera_params` removes the warning and makes the reconstruction better).
 
 The chunked feature extraction imports the frames **once** and pins that camera for every
 chunk: `extract_features` imports what it is handed, and COLMAP's "single camera" mode is

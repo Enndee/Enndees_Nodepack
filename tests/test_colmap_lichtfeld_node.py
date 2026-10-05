@@ -288,6 +288,23 @@ class PyColmapWrapperTests(unittest.TestCase):
         self.fake.models = ()
         self.assertFalse(self.wrapper.mapper(backend="global"))
 
+    def test_mapper_disables_the_gpu_solvers_without_cuda(self):
+        """A CPU-only build must not ask for the GPU solvers (those two warnings)."""
+        self.assertTrue(self.wrapper.mapper(backend="global"))
+        options = self.fake.call("global")[4]["options"]
+        self.assertEqual(options["mapper"]["global_positioning"]["use_gpu"], False)
+        self.assertEqual(options["mapper"]["bundle_adjustment"]["ceres"]["use_gpu"], False)
+
+    def test_mapper_keeps_the_gpu_solvers_with_cuda(self):
+        self.fake.has_cuda = True
+        self.assertTrue(self.wrapper.mapper(backend="global"))
+        self.assertNotIn("mapper", self.fake.call("global")[4]["options"])
+
+    def test_mapper_incremental_is_left_alone(self):
+        """``IncrementalPipelineOptions`` has no ``mapper`` sub-tree - don't send one."""
+        self.assertTrue(self.wrapper.mapper(backend="incremental"))
+        self.assertNotIn("mapper", self.fake.call("incremental")[4]["options"])
+
     def test_missing_pycolmap_is_reported_not_raised(self):
         with mock.patch.object(pycolmap_wrapper, "import_pycolmap", return_value=None):
             self.assertFalse(self.wrapper.feature_extractor())
@@ -299,6 +316,29 @@ class PyColmapWrapperTests(unittest.TestCase):
         info = pycolmap_wrapper.pycolmap_info()
         self.assertEqual(info, {"available": True, "version": "9.9.9-test",
                                 "cuda": False})
+
+
+class CpuNoticeTests(unittest.TestCase):
+    """The "no CUDA build" explanation is a build property - one line, not one per stage."""
+
+    def test_notice_is_printed_once(self):
+        fake = types.SimpleNamespace(has_cuda=False)
+        wrapper = pycolmap_wrapper.PyColmapWrapper()
+        with mock.patch.object(pycolmap_wrapper, "_CPU_NOTICE_SHOWN", False), \
+                mock.patch("builtins.print") as printed:
+            self.assertFalse(wrapper._effective_gpu(fake, True))
+            self.assertFalse(wrapper._effective_gpu(fake, True))
+        self.assertEqual(printed.call_count, 1)
+        self.assertIn("no CUDA support", printed.call_args.args[0])
+        self.assertIn("GPU", printed.call_args.args[0])
+
+    def test_no_notice_with_cuda_or_without_use_gpu(self):
+        wrapper = pycolmap_wrapper.PyColmapWrapper()
+        with mock.patch.object(pycolmap_wrapper, "_CPU_NOTICE_SHOWN", False), \
+                mock.patch("builtins.print") as printed:
+            self.assertTrue(wrapper._effective_gpu(types.SimpleNamespace(has_cuda=True), True))
+            self.assertFalse(wrapper._effective_gpu(types.SimpleNamespace(has_cuda=False), False))
+        printed.assert_not_called()
 
 
 class NativeNodeTests(unittest.TestCase):

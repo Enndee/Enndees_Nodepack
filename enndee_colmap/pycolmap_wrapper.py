@@ -25,6 +25,10 @@ Nothing is downloaded and no executable is needed - only ``pip install pycolmap`
    Linux-only, see the pycolmap docs). Feature extraction/matching and the bundle
    adjustment therefore run on the CPU here; ``use_gpu`` is honoured automatically
    as soon as a CUDA-enabled pycolmap build is installed (``pycolmap.has_cuda``).
+   On a CPU-only build the pipeline is *told* that there is no GPU (see
+   :meth:`PyColmapWrapper.mapper`), so the "Requested to use GPU for bundle
+   adjustment ... falling back to the CPU" warnings disappear - and the run is
+   noticeably slower than the binary node, which does the SIFT work on the GPU.
 """
 
 from pathlib import Path
@@ -54,6 +58,28 @@ INCREMENTAL_BACKEND = "incremental"
 VERBOSE_ENV = "ENNDEE_COLMAP_VERBOSE"
 #: glog level 1 = WARNING: keep the warnings, drop the "I2026... " progress spam.
 GLOG_LEVEL_WARNING = "1"
+
+
+#: the "no CUDA build" situation is a property of the build, not of a stage - one
+#: clear line per session is enough (extraction + matching + mapping would repeat it).
+_CPU_NOTICE_SHOWN = False
+
+
+def _cpu_notice() -> None:
+    """Explain *once* that this pycolmap build cannot use the GPU.
+
+    The official Windows wheels are CPU only, so ``use_gpu`` is a no-op here. Without
+    this line the user sees "running on the CPU" three times per run and wonders why
+    the same settings are faster in the binary node - which runs SIFT on the GPU.
+    """
+    global _CPU_NOTICE_SHOWN
+    if _CPU_NOTICE_SHOWN:
+        return
+    _CPU_NOTICE_SHOWN = True
+    print("[pycolmap] this build has no CUDA support (the official Windows wheels are "
+          "CPU only) - SIFT extraction, matching and the bundle adjustment run on the "
+          "CPU here; the binary tracker (COLMAP CUDA build) does the same work on the "
+          "GPU and is faster")
 
 
 def silence_colmap_logging(module=None) -> None:
@@ -186,8 +212,7 @@ class PyColmapWrapper(GLOMAPWrapper):
         """True when this pycolmap build can really use the GPU."""
         has_cuda = bool(getattr(module, "has_cuda", False))
         if use_gpu and not has_cuda:
-            print("[pycolmap] this build has no CUDA support (the official Windows "
-                  "wheels are CPU only) - running on the CPU")
+            _cpu_notice()
         return bool(use_gpu) and has_cuda
 
     @staticmethod
@@ -375,6 +400,13 @@ class PyColmapWrapper(GLOMAPWrapper):
         ``backend`` accepts the legacy names (``glomap``, ``colmap_global``) and the
         new ones (``global``, ``global_mapper``); ``incremental`` runs COLMAP's
         classic incremental mapper instead.
+
+        Without CUDA in the build the global pipeline is told not to ask for the GPU
+        solvers: ``global_positioning.use_gpu`` and ``bundle_adjustment.ceres.use_gpu``
+        default to *true*, and every run then logs two "Requested to use GPU for bundle
+        adjustment, but COLMAP was compiled without CUDA support - falling back to the
+        CPU" warnings that look like errors but only repeat what ``has_cuda`` already
+        says. Nothing is lost: there is no GPU to fall back *from*.
         """
         module = self._module()
         if module is None:
@@ -383,6 +415,13 @@ class PyColmapWrapper(GLOMAPWrapper):
         options = {"min_num_matches": int(min_num_matches)}
         if num_threads:
             options["num_threads"] = int(num_threads)
+        if backend in GLOBAL_BACKENDS and not getattr(module, "has_cuda", False):
+            # the sub-tree is ``GlobalPipelineOptions.mapper.<stage>`` - see
+            # ``mapper.global_positioning`` / ``mapper.bundle_adjustment.ceres``.
+            options["mapper"] = {
+                "global_positioning": {"use_gpu": False},
+                "bundle_adjustment": {"ceres": {"use_gpu": False}},
+            }
         self._emit(0, 1, f"{backend} mapping")
         try:
             if backend == INCREMENTAL_BACKEND:
