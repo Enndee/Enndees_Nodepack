@@ -216,8 +216,11 @@ ORBIT_DIRECTION_DEFAULT = ORBIT_DIRECTIONS[0]
 #     axis, the frontal view) and climbs to `SPIRAL_END_ARC` (90 deg), which puts the camera IN
 #     the picture's own plane: the clip ends looking at the scene from the side,
 #   * `psi` - the clock angle around that axis (12 = up, 3 = the subject's right, 6 = down,
-#     9 = left, i.e. the dial the front O uses) - winds `SPIRAL_ROUNDS` times and lands on
-#     `SPIRAL_END_CLOCK` (the clock's 9 = the subject's left).
+#     9 = left, i.e. the dial the front O uses) - winds WHOLE rounds and lands on
+#     `SPIRAL_END_CLOCK` (the clock's 9 = the subject's left). Whole rounds are not a style choice:
+#     the clock has to advance `150 + 360k` degrees from the 2 o'clock lead-in to reach 9 o'clock,
+#     so a fractional winding put the last pose somewhere else on the dial entirely (measured in a
+#     user run: 0.70 rounds ended at 0.6 o'clock - straight above the subject - instead of the side).
 # So frame 0 is the framed frontal pose, the lead-in follows the 2 o'clock direction until the
 # arc reaches `SPIRAL_LEAD_ARC`, and the coil then circles the view axis with the arc rising
 # linearly to 90 deg. In the module's own `_place` terms:
@@ -225,14 +228,23 @@ ORBIT_DIRECTION_DEFAULT = ORBIT_DIRECTIONS[0]
 # (see `spiral_pose`/`spiral_arc`/`spiral_clock`). The clock angle advance is what the amplitude
 # ladder scales: when frames x speed cap cannot pay for the whole coil the *rounds* give way
 # (never the cap), and the console/description names the cut - the same rule the front/back
-# modes apply to the back connection.
+# modes apply to the back connection. The frames themselves follow the *measured* subject motion
+# (`_spiral_motion_samples`), which is what makes the full 2 rounds affordable at all: the coil's
+# steep passes over/under the subject turn the picture many times faster than a step at 3/9 o'clock.
 SPIRAL_LEAD_ARC = 10.0            # deg, the lead-in ends when the arc from the view axis is this
 SPIRAL_LEAD_CLOCK = FRONT_ORBIT_START_CLOCK   # 2 o'clock - the lead-in's direction on the dial
 SPIRAL_ROUNDS = 2.0               # revolutions around the view axis at amplitude scale 1
-SPIRAL_MIN_ROUNDS = 0.05          # the ladder's floor: below this the coil is a plain tilt
+SPIRAL_MIN_ROUNDS = 0.05          # deprecated: the coil now flies whole rounds (0 is its floor)
 SPIRAL_END_ARC = 90.0             # deg, where the arc ends - the picture's own plane (side view)
 SPIRAL_END_CLOCK = 9.0            # o'clock the last pose lands on (9 = the subject's left)
 SPIRAL_ELEVATION_CEILING = 88.0   # deg: the coil passes over the top - keep the up vector sane
+# The coil's frames follow the *measured* subject motion instead of a linear clock (see
+# `_spiral_motion_samples`): passing over (or under) the subject turns the picture several times
+# faster than a step at 3/9 o'clock, so a linear clock spends the whole speed budget on a handful of
+# steep frames and the ladder has to cut the rounds to pay for them.
+SPIRAL_MOTION_SAMPLES = 6         # dense coil samples per frame for that motion measurement
+SPIRAL_MOTION_DENSE_MIN = 240     # ... and never fewer than this many
+SPIRAL_MOTION_POOL = 240          # subject points used for it (relative weights only - cheap)
 
 # Scene target: a lateral survey instead of a lap around the scene. Meridian's scene renders are
 # depth reprojections, so what a walk-in VR viewer needs is *side* coverage: rows of viewpoints
@@ -962,7 +974,7 @@ def _path_fits(pool, surface, pivot, distance, scale, size, frames, height, marg
                orbit_end=None, direction=ORBIT_DIRECTION_DEFAULT, options=None):
     """Does the subject stay inside the frame at every pose of this amplitude?"""
     units = subject_samples(frames, pivot, 1.0, scale, size, orbit_end, direction,
-                            **(options or {}))
+                            motion_pool=pool, motion_surface=surface, **(options or {}))
     positions = _path_positions(units, pivot, distance)
     return min(visibility_clearances(pool, positions, pivot, surface, height, margin_px)) >= 0.0
 
@@ -1104,7 +1116,9 @@ def equalize_pivot(surface, pivot, distance, scale, size, frames, orbit_end=None
     content_radius = max(1e-6, float(surface["content_radius"]))
     start = [float(value) for value in pivot]
     centre = torch.as_tensor(surface["pivot"], dtype=torch.float64)
-    base = subject_samples(frames, [0.0, 0.0, 0.0], distance, scale, size, orbit_end, direction)
+    shape_pool = _decimate(surface["content_cloud"], VISIBILITY_POOL)
+    base = subject_samples(frames, [0.0, 0.0, 0.0], distance, scale, size, orbit_end, direction,
+                           motion_pool=shape_pool, motion_surface=surface)
     stride = max(1, len(base) // max(2, int(EQUALIZER_SAMPLES)))
     offsets = torch.tensor(base[::stride], dtype=torch.float64).reshape(-1, 3)
 
@@ -1152,7 +1166,8 @@ def equalize_pivot(surface, pivot, distance, scale, size, frames, orbit_end=None
             # stays where the framing put it (`start`). The clearance therefore has to be measured
             # with the original aim and the candidate's positions (see `visibility_clearances`:
             # positions and look are separate arguments).
-            units = subject_samples(frames, candidate, 1.0, scale, size, orbit_end, direction)
+            units = subject_samples(frames, candidate, 1.0, scale, size, orbit_end, direction,
+                                    motion_pool=pool, motion_surface=surface)
             positions = _path_positions(units, candidate, distance)
             return min(visibility_clearances(pool, positions, start, surface, height, margin_px))
 
@@ -1399,8 +1414,16 @@ def _clock_degrees(clock):
 
 
 def _spiral_rounds(scale=1.0):
-    """The revolutions the coil flies at amplitude scale `scale` (the ladder's floor applies)."""
-    return max(SPIRAL_MIN_ROUNDS, SPIRAL_ROUNDS * max(1e-6, float(scale)))
+    """Whole revolutions the coil flies at amplitude scale `scale`.
+
+    The last pose has to land on `SPIRAL_END_CLOCK` (9 o'clock - the camera in the picture's own
+    plane, level with the pivot). Getting there from the 2 o'clock lead-in means advancing the clock
+    by `150 + 360k` degrees, so only *whole* rounds arrive where the user expects them: a fractional
+    winding left the camera somewhere else on the dial entirely (a measured user run with 0.70
+    rounds ended at 0.6 o'clock - high above the subject - and 0.20 rounds at 6.6 o'clock, below it).
+    """
+    wanted = SPIRAL_ROUNDS * max(0.0, float(scale))
+    return float(min(int(SPIRAL_ROUNDS + 1e-9), int(wanted + 1e-9)))
 
 
 def _spiral_sweep(scale=1.0):
@@ -1414,11 +1437,11 @@ def _spiral_geometry(centre, mirror, scale=1.0):
     """(lead_yaw, end_yaw, sweep, end_arc) of the Spiral coverage at amplitude scale `scale`.
 
     The lead-in follows the dial's 2 o'clock direction (`SPIRAL_LEAD_CLOCK`) until the arc between
-    the camera and the view axis reaches `SPIRAL_LEAD_ARC`; the coil then winds `SPIRAL_ROUNDS *
-    scale` times around that axis and closes on `SPIRAL_END_CLOCK` (the clock's 9, mirrored with the
-    direction), where the arc is `SPIRAL_END_ARC` - the picture's own plane. `sweep` is the total
-    clock-angle advance (the rounds *plus* the closing offset, which is what makes the last pose
-    land on 9 o'clock after whole rounds).
+    the camera and the view axis reaches `SPIRAL_LEAD_ARC`; the coil then winds whole rounds
+    (`_spiral_rounds`) around that axis and closes on `SPIRAL_END_CLOCK` (the clock's 9, mirrored
+    with the direction), where the arc is `SPIRAL_END_ARC` - the picture's own plane. `sweep` is the
+    total clock-angle advance (the rounds *plus* the closing offset, which is what makes the last
+    pose land on 9 o'clock after whole rounds).
     """
     lead_yaw, _lead_elevation = spiral_pose(SPIRAL_LEAD_ARC,
                                             mirror * _clock_degrees(SPIRAL_LEAD_CLOCK))
@@ -1432,10 +1455,12 @@ def _spiral_point(progress, centre, scale=1.0, mirror=1.0):
     Progress 0 is the *middle of the picture* - the camera sits ON the view axis and looks straight
     at the scene - and the first `FRONT_ORBIT_RISE` of the path is the eased lead-in along the dial's
     2 o'clock direction, ending where the arc between the camera and the axis reaches
-    `SPIRAL_LEAD_ARC`. The rest is the coil: the clock angle winds `SPIRAL_ROUNDS * scale` times
-    around the view axis (counter-clockwise with `mirror` = +1, the Auto Orbit Direction default)
-    while the arc climbs linearly to `SPIRAL_END_ARC`, so the last pose lands in the picture's own
-    plane on `SPIRAL_END_CLOCK` (the clock's 9) - the clip ends looking at the scene from the side.
+    `SPIRAL_LEAD_ARC`. The rest is the coil: the clock angle winds `_spiral_rounds(scale)` *whole*
+    rounds around the view axis (counter-clockwise with `mirror` = +1, the Auto Orbit Direction
+    default) while the arc climbs linearly to `SPIRAL_END_ARC`, so the last pose lands in the
+    picture's own plane on `SPIRAL_END_CLOCK` (the clock's 9) - the clip ends looking at the scene
+    from the side. The *frames* are placed by `_spiral_motion_samples` (same path, even subject
+    motion), not by this function's `progress` alone.
     """
     progress = min(1.0, max(0.0, float(progress)))
     lead_clock = mirror * _clock_degrees(SPIRAL_LEAD_CLOCK)
@@ -1467,6 +1492,52 @@ def _spiral_info(view_angle=None, direction=ORBIT_DIRECTION_DEFAULT, scale=1.0):
             "spiral_rounds": _spiral_rounds(scale), "spiral_end_arc": end_arc,
             "orbit_coverage": min(FULL_CIRCLE, sweep),
             "view_angle": None if view_angle is None else float(view_angle)}
+
+
+def _spiral_motion_samples(frames, pivot, radius, scale, size, centre, mirror, pool, surface):
+    """The coil's per-frame positions, spaced by the *subject's own pixel motion*.
+
+    Same coil, same ends (the framed frontal pose, then 9 o'clock in the picture's own plane) - only
+    the frame *timing* along it changes, exactly the way the front/back path splits its phases by
+    travel. A linear clock spends the whole speed budget on the few frames where the coil passes over
+    (or under) the subject: there a small step turns the picture several times faster than a step at
+    3/9 o'clock, and the amplitude ladder then has to cut the rounds to pay for them. Measured on a
+    243 frame run of a 0.55 x 0.72 x 0.55 subject at 0.947 units (cap 37 px/frame): the requested
+    2 rounds + closing arc need 158 px/frame with the linear clock - and 30 px/frame with this split,
+    i.e. the coil the user asked for fits their own speed cap.
+
+    Falls back to the linear clock when there is no surface to measure (or no visible motion).
+    """
+    def linear():
+        return [_place(pivot, radius,
+                       *_spiral_point(index / max(1, frames - 1), centre, scale, mirror))
+                for index in range(frames)]
+
+    rise = FRONT_ORBIT_RISE
+    lead_frames = max(2, int(round(frames * rise)))
+    if frames <= lead_frames:
+        return linear()
+    lead = [_place(pivot, radius,
+                   *_spiral_point(rise * index / (lead_frames - 1), centre, scale, mirror))
+            for index in range(lead_frames)]
+    coil_frames = frames - lead_frames
+    dense = max(SPIRAL_MOTION_DENSE_MIN, frames * SPIRAL_MOTION_SAMPLES)
+    coil = [_place(pivot, radius,
+                   *_spiral_point(rise + (1.0 - rise) * index / dense, centre, scale, mirror))
+            for index in range(dense + 1)]
+    p95, _p50, counts = _pair_motion(_decimate(pool, SPIRAL_MOTION_POOL), coil, pivot, surface, None)
+    if p95 is None:
+        return lead + coil[1:coil_frames + 1]
+    motion = torch.where(counts >= 8, p95, p95.new_full((), 0.0)).to(torch.float64)
+    cumulative = torch.cumsum(motion, dim=0)
+    total = float(cumulative[-1])
+    if total <= 1e-9:
+        return lead + coil[1:coil_frames + 1]
+    targets = torch.linspace(0.0, total, coil_frames + 1, dtype=cumulative.dtype)[1:]
+    # `right=True`: the pose index is the *number of steps* whose cumulative motion the target has
+    # passed - so the last target (== total) lands on the last pose, not one step short of it.
+    indices = torch.searchsorted(cumulative, targets, right=True).clamp(max=dense)
+    return lead + [coil[int(index)] for index in indices]
 
 
 def _legacy_samples(frames, pivot, radius, scale=1.0, size=1.0, orbit_end=None,
@@ -1514,7 +1585,7 @@ def _legacy_samples(frames, pivot, radius, scale=1.0, size=1.0, orbit_end=None,
 
 def subject_samples(frames, pivot, radius, scale=1.0, size=1.0, orbit_end=None,
                     direction=ORBIT_DIRECTION_DEFAULT, share=None, view_angle=None,
-                    coverage=None, back_span=None):
+                    coverage=None, back_span=None, motion_pool=None, motion_surface=None):
     """Per-frame positions of the subject path: the front O, then (optionally) the back O.
 
     **The front O** is a *circle* (`front_amplitudes`: one radius both ways) centred on the azimuth
@@ -1556,8 +1627,13 @@ def subject_samples(frames, pivot, radius, scale=1.0, size=1.0, orbit_end=None,
     if coverage is None and orbit_end is not None:
         mode = coverage_for_end(orbit_end)
     if mode == SPIRAL_COVERAGE:
-        # A rising helix: one continuous phase, so every frame is a step along it - the amplitude
-        # ladder scales the *rounds* instead of splitting the frames between phases.
+        # A rising coil: one continuous phase, so every frame is a step along it - the amplitude
+        # ladder scales the *rounds* instead of splitting the frames between phases. The frames
+        # follow the *measured* subject motion when a surface is at hand (`_spiral_motion_samples`),
+        # because the coil's steep passes over/under the subject would otherwise eat the speed budget.
+        if motion_pool is not None and motion_surface is not None:
+            return _spiral_motion_samples(frames, pivot, radius, scale, size, centre, mirror,
+                                          motion_pool, motion_surface)
         return [_place(pivot, radius,
                        *_spiral_point(index / max(1, frames - 1), centre, scale, mirror))
                 for index in range(frames)]
@@ -1614,23 +1690,26 @@ def subject_samples(frames, pivot, radius, scale=1.0, size=1.0, orbit_end=None,
     return positions
 
 
-def subject_drift(pool, positions, pivot, surface, steps=DRIFT_STEPS):
-    """(worst, typical) pixel motion of the subject per frame along a camera path.
+def _pair_motion(pool, positions, pivot, surface, steps=None):
+    """Per-step pixel motion of the subject along a camera path: (p95, p50, visible counts).
 
-    For every sampled frame step the DRIFT_PERCENTILE-th percentile of the *point* displacement is
-    measured (the subject's near surface moves most, so the percentile keeps a depth spike from
-    dominating) and the worst step wins - that is the number the speed cap has to cover. Only the
-    subject's own pixels enter: the background is never part of the subject-mode budget. All
-    sampled poses go through ONE batched projection (`_batch_project`) - this function runs dozens
-    of times per amplitude fit, and the per-pose calls were the auto camera's hot loop.
+    The DRIFT_PERCENTILE-th percentile of the *point* displacement between consecutive poses (the
+    subject's near surface moves most, so the percentile keeps a depth spike from dominating).
+    `steps` measures only every `frames // steps`-th step (the drift metric does not need every
+    frame); `None` measures *every* step, which is what the spiral's frame split needs. All poses go
+    through ONE batched projection (`_batch_project`) - this runs dozens of times per amplitude fit,
+    and the per-pose calls were the auto camera's hot loop.
     """
     frames = len(positions)
     if frames < 2:
-        return 0.0, 0.0
-    stride = max(1, frames // max(2, int(steps)))
-    pairs = [(index, index + 1) for index in range(0, frames - 1, stride)]
+        return None, None, None
+    if steps is None:
+        pairs = [(index, index + 1) for index in range(frames - 1)]
+    else:
+        stride = max(1, frames // max(2, int(steps)))
+        pairs = [(index, index + 1) for index in range(0, frames - 1, stride)]
     if not pairs:
-        return 0.0, 0.0
+        return None, None, None
     busy = [positions[index] for pair in pairs for index in pair]
     u, v, z = _batch_project(pool, busy, pivot, surface, CANVAS_HEIGHT)
     count = len(pairs)
@@ -1639,8 +1718,6 @@ def subject_drift(pool, positions, pivot, surface, steps=DRIFT_STEPS):
     z = z.reshape(count, 2, -1)
     visible = (z[:, 0] > 1e-4) & (z[:, 1] > 1e-4)
     counts = visible.sum(dim=1)
-    if not bool((counts >= 8).any()):
-        return 0.0, 0.0
     motion = torch.hypot(u[:, 1] - u[:, 0], v[:, 1] - v[:, 0])
     # Per-pair percentiles of the *visible* points, vectorised: one sort per call instead of one
     # `torch.quantile` per pair (this ran ~12k single quantile calls per estimate - the hot loop).
@@ -1659,8 +1736,19 @@ def subject_drift(pool, positions, pivot, surface, steps=DRIFT_STEPS):
         upper = ordered.gather(1, high).to(motion.dtype)
         return (lower + (upper - lower) * fraction).reshape(-1)
 
-    p95 = percentile(DRIFT_PERCENTILE / 100.0)
-    p50 = percentile(0.5)
+    return percentile(DRIFT_PERCENTILE / 100.0), percentile(0.5), counts
+
+
+def subject_drift(pool, positions, pivot, surface, steps=DRIFT_STEPS):
+    """(worst, typical) pixel motion of the subject per frame along a camera path.
+
+    The worst sampled step is what the speed cap has to cover; the typical one describes the rest of
+    the path. Only the subject's own pixels enter: the background is never part of the subject-mode
+    budget. See `_pair_motion` for the measurement itself.
+    """
+    p95, p50, counts = _pair_motion(pool, positions, pivot, surface, steps)
+    if p95 is None or not bool((counts >= 8).any()):
+        return 0.0, 0.0
     p95 = torch.where(counts >= 8, p95, p95.new_full((), -math.inf))
     worst_index = int(torch.argmax(p95))
     worst = max(float(p95[worst_index]), 0.0)
@@ -1758,9 +1846,12 @@ def _orbit_candidate(pool, surface, frames, pivot, radius, scale, size, end, dir
                 "front_share": balanced_front_share(amplitude, max(0.0, end - amplitude))}
         return scale, samples, drift, typical, info
     if str(coverage) == SPIRAL_COVERAGE:
-        # Nothing to cut here: the amplitude ladder *is* the cut for the helix (it scales the
-        # rounds), so one sample run and one drift measurement describe the whole path.
+        # Nothing to cut here: the amplitude ladder *is* the cut for the coil (it scales the rounds),
+        # so one sample run and one drift measurement describe the whole path. The samples are the
+        # motion-even ones (`_spiral_motion_samples`) - they are what the emitted keys come from, so
+        # the fit and the keys must never disagree about where a frame sits.
         samples = subject_samples(frames, pivot, radius, scale, size, None, direction,
+                                  motion_pool=pool, motion_surface=surface,
                                   **path_options(view_angle, coverage))
         drift, typical = subject_drift(pool, samples, pivot, surface)
         return scale, samples, drift, typical, _spiral_info(view_angle, direction, scale)
@@ -2166,9 +2257,12 @@ def automatic_keys(frames, pivot, radius, content_radius, target, max_speed=DEFA
             requested = ORBIT_END_DEFAULT if orbit_end is None else max(ORBIT_END_MIN,
                                                                         float(orbit_end))
             span = max(0.0, meta["orbit_end"] - amplitude)
-        elif str(coverage) == SPIRAL_COVERAGE:  # the helix: the request is SPIRAL_ROUNDS rounds
-            requested = SPIRAL_ROUNDS * 360.0
+        elif str(coverage) == SPIRAL_COVERAGE:  # the coil: whole rounds + the closing arc to 9 o'clock
+            requested = _spiral_sweep(1.0)
             span = 0.0
+            # The coil's "amplitude" is its winding (the arc itself is always `SPIRAL_END_ARC`), so
+            # report the share of the requested coil the speed cap paid for - not the ladder's scale.
+            info["amplitude_scale"] = _spiral_rounds(scale) / max(1e-9, SPIRAL_ROUNDS)
         else:                                  # the front/back path: the request is the full back
             requested = amplitude + max(0.0, ORBIT_COVERAGE_DEGREES - 2.0 * amplitude)
             span = max(0.0, meta.get("back_span", 0.0))
@@ -2601,11 +2695,13 @@ def _estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DE
             rounds = float(info.get("spiral_rounds") or SPIRAL_ROUNDS)
             arc = float(info.get("spiral_end_arc") or SPIRAL_END_ARC)
             beyond = (f", then a rising coil {direction_label(info['orbit_direction'])} around "
-                      f"the view axis: {rounds:.2f} rounds while the arc between the camera and "
-                      f"that axis climbs to {arc:.0f} deg - the clip ends in the picture's own "
+                      f"the view axis: {rounds:.0f} of the {SPIRAL_ROUNDS:.0f} whole rounds plus the "
+                      f"{_spiral_sweep(0.0):.0f} deg closing arc that lands the camera on the clock's "
+                      f"9 ({info['orbit_end']:.0f} deg in total), while the arc between the camera "
+                      f"and that axis climbs to {arc:.0f} deg - the clip ends in the picture's own "
                       f"plane, looking at the scene from the side"
-                      + (f" (cut from {SPIRAL_ROUNDS:.0f} rounds by the speed cap)"
-                         if rounds < SPIRAL_ROUNDS - 1e-6 else ""))
+                      + (f" (the speed cap could only pay for {rounds:.0f} of the "
+                         f"{SPIRAL_ROUNDS:.0f} rounds)" if rounds < SPIRAL_ROUNDS - 1e-6 else ""))
         elif info.get("coverage"):
             beyond = (f", the back visit giving way to the speed cap: the path ends at "
                       f"{info['orbit_end']:.0f} deg of the requested "
@@ -2993,8 +3089,10 @@ def format_summary(summary):
         elif summary.get("coverage") == SPIRAL_COVERAGE:
             rounds = summary.get("spiral_rounds") or SPIRAL_ROUNDS
             arc = summary.get("spiral_end_arc_deg") or SPIRAL_END_ARC
-            beyond = (f"rising coil, {rounds:.2f} rounds to {arc:.0f} deg off the view axis"
-                      + (f" (cut from {SPIRAL_ROUNDS:.0f} by the speed cap)"
+            beyond = (f"rising coil, {rounds:.0f} of the {SPIRAL_ROUNDS:.0f} whole rounds + the "
+                      f"{_spiral_sweep(0.0):.0f} deg closing arc to the clock's 9, "
+                      f"to {arc:.0f} deg off the view axis"
+                      + (f" (the speed cap could only pay for {rounds:.0f})"
                          if rounds < SPIRAL_ROUNDS - 1e-6 else ""))
         elif summary.get("coverage"):
             beyond = "front circle only"

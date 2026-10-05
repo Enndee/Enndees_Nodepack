@@ -243,14 +243,24 @@ image the Geometry node receives. The estimator:
        picture). Frame 0 is the framed front pose with the camera *on* that axis,
        looking straight at the picture (the middle of the frame); the lead-in follows
        the 2 o'clock direction until the arc between the camera and the axis reaches
-       10 degrees; then the coil winds **two rounds** in Auto Orbit Direction
-       (counter-clockwise by default) while that arc climbs to **90 degrees** - the
-       camera ends *in the picture's own plane*, on the clock's 9 o'clock side,
-       looking at the scene from the side, orthogonally to the original view. The
-       front, every side and the top are covered on the way. The rounds are the
-       floor: the fit winds further when the budget allows and the speed cap cuts
-       them when it cannot pay (the console and the path description name it, e.g.
-       "1.35 rounds (cut from 2 by the speed cap)").
+       10 degrees; then the coil winds **two whole rounds** in Auto Orbit Direction
+       (counter-clockwise by default) plus the **closing arc to the clock's 9**
+       (150 degrees), while that arc climbs to **90 degrees** - the camera ends *in the
+       picture's own plane*, level with the pivot, looking at the scene from the side,
+       orthogonally to the original view. The front, every side and the top are
+       covered on the way. Whole rounds are what keeps that end pose: the clock has to
+       advance `150 + 360k` degrees to arrive on 9 o'clock, so a fractional winding
+       ended somewhere else on the dial (0.70 rounds ended at 0.6 o'clock - straight
+       above the subject). The coil's frames follow the *measured* subject motion
+       rather than a linear clock, exactly like the front/back path splits its phases
+       by travel: passing over (or under) the subject turns the picture several times
+       faster than a step at 3/9 o'clock, and a linear clock spent the whole speed
+       budget on those few steep frames - which is what used to cut the coil down to
+       0.2-0.7 rounds. With the motion-even split the full 2 rounds + closing fit the
+       same speed cap (measured: 30 px/frame vs a 37 px cap on a 243 frame run). The
+       rounds are still the thing that gives way when frames x speed cap cannot pay for
+       them (never the cap), and the console and the path description name it, e.g.
+       "1 of the 2 whole rounds + the 150 deg closing arc to the clock's 9".
    - **Manual** - the manual styles below, but aimed at the estimated pivot
      instead of the absolute look-pivot (the `path_pivot_*` widgets are ignored
      and hidden then; every other path widget applies as usual).

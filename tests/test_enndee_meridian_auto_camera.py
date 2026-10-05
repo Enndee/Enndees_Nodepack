@@ -22,6 +22,7 @@ from enndee_meridian_auto_camera import (  # noqa: E402
     CANVAS_HEIGHT,
     COLLISION_MARGIN,
     DEFAULT_MAX_SPEED,
+    DRIFT_POOL,
     FIT_GROW_STEP,
     FRONT_ELEVATION,
     FRONT_ELEVATION_LIMIT,
@@ -77,11 +78,13 @@ from enndee_meridian_auto_camera import (  # noqa: E402
     scene_survey_fill,
     split_subject,
     subject_box,
+    subject_drift,
     subject_framing,
     subject_samples,
     subject_share_curve,
     surface_points,
     visibility_clearances,
+    _decimate,
     _envelope_angles,
     _fit_orbit_world,
     _front_travel_share,
@@ -91,6 +94,7 @@ from enndee_meridian_auto_camera import (  # noqa: E402
     _shrink_amplitude,
     _spiral_geometry,
     _spiral_point,
+    _spiral_rounds,
     _spiral_sweep,
     SPIRAL_COVERAGE,
     SPIRAL_ELEVATION_CEILING,
@@ -1718,6 +1722,45 @@ class AutoCameraSpiralCoverageTests(unittest.TestCase):
         self.assertAlmostEqual(spiral_arc(*angles[0]), 0.0, places=4)      # the front pose
         self.assertAlmostEqual(spiral_arc(*angles[-1]), SPIRAL_END_ARC, places=4)
 
+    def test_the_coil_flies_whole_rounds_and_always_ends_on_9_o_clock(self):
+        """A fractional winding used to land the last pose somewhere else on the dial entirely."""
+        closing = _spiral_sweep(0.0)
+        self.assertEqual(_spiral_rounds(0.0), 0.0)
+        self.assertEqual(_spiral_rounds(1.0), SPIRAL_ROUNDS)
+        for scale in (0.0, 0.25, 0.5, 0.75, 1.0):
+            rounds = _spiral_rounds(scale)
+            self.assertEqual(rounds, float(int(rounds)))              # whole rounds only
+            self.assertLessEqual(rounds, SPIRAL_ROUNDS)
+            self.assertAlmostEqual(_spiral_sweep(scale), rounds * 360.0 + closing, places=6)
+            yaw, elevation = _spiral_point(1.0, 0.0, scale)
+            self.assertAlmostEqual(spiral_arc(yaw, elevation), SPIRAL_END_ARC, places=6)
+            self.assertAlmostEqual(elevation, 0.0, places=6)          # level with the pivot ...
+            self.assertAlmostEqual(spiral_clock(yaw, elevation) % 360.0,
+                                   (30.0 * SPIRAL_END_CLOCK) % 360.0, places=6)   # ... at 9 o'clock
+
+    def test_the_motion_even_split_keeps_the_ends_and_costs_less_motion(self):
+        """Same coil, same first/last pose - the frames just follow the subject's own motion."""
+        surface = probe_surface(_reference(), depth_fn=lambda reference: _depth_with_subject())
+        distance, pivot, _metrics = subject_framing(surface, 40.0)
+        pool = _decimate(surface["content_cloud"], DRIFT_POOL)
+        linear = subject_samples(73, pivot, distance, 1.0, 1.0, None, ORBIT_DIRECTION_DEFAULT,
+                                 coverage=SPIRAL_COVERAGE)
+        even = subject_samples(73, pivot, distance, 1.0, 1.0, None, ORBIT_DIRECTION_DEFAULT,
+                               coverage=SPIRAL_COVERAGE, motion_pool=pool, motion_surface=surface)
+        self.assertEqual(len(even), len(linear))
+        for index in (0, -1):                       # the framed opening pose and the 9 o'clock end
+            for axis in range(3):
+                self.assertAlmostEqual(linear[index][axis], even[index][axis], places=6)
+        for sample in even:                         # every pose keeps the one distance
+            self.assertAlmostEqual(math.dist(sample, pivot), distance, places=6)
+        linear_drift = subject_drift(pool, linear, pivot, surface)[0]
+        even_drift = subject_drift(pool, even, pivot, surface)[0]
+        self.assertLess(even_drift, linear_drift)
+        # ... and without a surface the linear clock stays the fallback (no motion to measure)
+        fallback = subject_samples(73, pivot, distance, 1.0, 1.0, None, ORBIT_DIRECTION_DEFAULT,
+                                   coverage=SPIRAL_COVERAGE)
+        self.assertEqual(len(fallback), 73)
+
     def test_envelope_and_fit_report_the_spiral(self):
         surface = probe_surface(_reference(), depth_fn=lambda reference: _depth_with_subject())
         distance, pivot, metrics = subject_framing(surface, 40.0)
@@ -1726,7 +1769,10 @@ class AutoCameraSpiralCoverageTests(unittest.TestCase):
                                     max_speed=DEFAULT_MAX_SPEED, orbit_size=1.0, surface=surface,
                                     cap_px=cap, coverage=SPIRAL_COVERAGE)
         self.assertEqual(info["coverage"], SPIRAL_COVERAGE)
-        self.assertGreater(info["spiral_rounds"], 0.0)
+        # The coil flies *whole* rounds (plus the closing arc to 9 o'clock) or none at all: this
+        # 73 frame fixture's cap only pays for the closing arc itself.
+        self.assertGreaterEqual(info["spiral_rounds"], 0.0)
+        self.assertIn(info["orbit_end"], [_spiral_sweep(scale) for scale in (0.0, 0.5, 1.0)])
         self.assertFalse(info["back_orbit"])
         self.assertEqual(info["lap_span"], 0.0)
         self.assertEqual(info["spiral_end_arc"], SPIRAL_END_ARC)
