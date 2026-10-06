@@ -232,6 +232,58 @@ class MeridianFastDepthHelperTests(unittest.TestCase):
         self.assertEqual(c2w.shape, (73, 4, 4))
         np.testing.assert_allclose(c2w[0], np.eye(4, dtype=np.float32), atol=1e-5)
         np.testing.assert_allclose(focal, np.ones(73, dtype=np.float32))
+    def _sweep_forward_through_vertical(self, n=121):
+        """Look directions tilting from below horizontal, up over the top (vertical), to above.
+
+        This is exactly the pole crossing - the camera passing directly over the pivot - where the
+        old fixed world-up basis degenerated and flipped.
+        """
+        elev = np.deg2rad(np.linspace(-80.0, 80.0, n))
+        fwd = np.stack([np.zeros(n), -np.sin(elev), -np.cos(elev)], 1).astype(np.float32)
+        return fwd / np.linalg.norm(fwd, axis=1, keepdims=True)
+
+    def test_camera_frame_is_orthonormal_and_never_flips_over_the_pole(self):
+        fwd = self._sweep_forward_through_vertical()
+        right, down = fast_depth.camera_frames(fwd)
+        for i in range(fwd.shape[0]):
+            self.assertAlmostEqual(float(np.dot(right[i], fwd[i])), 0.0, places=4)
+            self.assertAlmostEqual(float(np.dot(right[i], down[i])), 0.0, places=4)
+        # no flip: consecutive right vectors stay positively dotted (the world-up basis flips here)
+        dots = [float(np.dot(right[i], right[i - 1])) for i in range(1, fwd.shape[0])]
+        self.assertGreater(min(dots), 0.5)
+
+    def test_camera_frame_is_pure_parallel_transport_zero_roll(self):
+        fwd = self._sweep_forward_through_vertical()
+        right, _down = fast_depth.camera_frames(fwd)
+        worst = 0.0
+        for i in range(1, fwd.shape[0]):
+            f0, f1 = fwd[i - 1], fwd[i]
+            v = np.cross(f0, f1)
+            s = float(np.linalg.norm(v))
+            if s < 1e-9:
+                continue
+            theta = float(np.arctan2(s, float(np.dot(f0, f1))))
+            transported = fast_depth._rodrigues(right[i - 1], v / s, theta)
+            transported = transported - float(np.dot(transported, f1)) * f1
+            transported = transported / np.linalg.norm(transported)
+            worst = max(worst, float(np.linalg.norm(transported - right[i])))
+        self.assertLess(worst, 1e-4)     # exactly the minimal rotation: zero roll about x
+
+    def test_look_at_keeps_the_opening_frame_then_transports_without_flipping(self):
+        fwd = self._sweep_forward_through_vertical()
+        pos = np.zeros((fwd.shape[0], 3), dtype=np.float32)
+        frame, rights = None, []
+        for i in range(fwd.shape[0]):
+            frame = fast_depth._look_at(pos[i], fwd[i], frame)   # look = a point along fwd
+            rights.append(frame[:, 0].copy())
+        up = np.array([0.0, -1.0, 0.0], dtype=np.float32)
+        r0 = np.cross(fwd[0], up)
+        r0 = r0 / np.linalg.norm(r0)
+        np.testing.assert_allclose(rights[0], r0, atol=1e-5)     # opening unchanged (world-up zero-roll)
+        dots = [float(np.dot(rights[i], rights[i - 1])) for i in range(1, len(rights))]
+        self.assertGreater(min(dots), 0.5)                       # no flip crossing the top
+
+
 
     def test_parametric_orbit_keeps_the_pivot_on_the_optical_axis(self):
         device = torch.device("cpu")

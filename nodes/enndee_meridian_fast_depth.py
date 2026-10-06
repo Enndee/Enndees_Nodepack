@@ -491,22 +491,98 @@ def _catmull_rom(tk: np.ndarray, pk: np.ndarray, t: np.ndarray, ease: List[bool]
     return out
 
 
-def _look_at(pos: np.ndarray, look: np.ndarray, prev: Optional[np.ndarray] = None) -> np.ndarray:
-    """c2w rotation (columns right, down, forward) looking from pos at look with zero roll (recam/path.py)."""
+def _world_up_frame(f: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """(right, down) of a look-at from a unit forward `f`, keeping the horizon with zero roll.
+
+    This is the renderer's zero-roll reference used for the FIRST frame (so a clip opens exactly as
+    it always has). It degenerates when `f` is vertical (parallel to the world up (0,-1,0)), which
+    is why every *later* frame is carried by parallel transport instead of re-deriving from here.
+    """
     up = np.array([0.0, -1.0, 0.0], dtype=np.float32)
+    r = np.cross(f, up)
+    if float(np.linalg.norm(r)) < 1e-6:        # looking straight up/down: keep world x as right
+        r = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    else:
+        r = r / float(np.linalg.norm(r))
+    d = np.cross(f, r)
+    return r.astype(np.float32), d.astype(np.float32)
+
+
+def _rodrigues(v: np.ndarray, axis: np.ndarray, theta: float) -> np.ndarray:
+    """Rotate vector `v` about a unit `axis` by `theta` (Rodrigues' rotation formula)."""
+    cos_t, sin_t = math.cos(theta), math.sin(theta)
+    return (v * cos_t + np.cross(axis, v) * sin_t
+            + axis * float(np.dot(axis, v)) * (1.0 - cos_t))
+
+
+def _transport_step(r_prev: np.ndarray, f_prev: np.ndarray, f_cur: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """(right, down) of the next frame by *parallel transport* - zero roll about the optical axis.
+
+    The whole frame is carried by the single minimal rotation that takes `f_prev` to `f_cur` (about
+    `cross(f_prev, f_cur)`), so `right`/`up` twist as little as possible - exactly zero roll about
+    the view axis. Because the frame is transported rather than re-derived from world up, it stays
+    smooth through the pole (the camera looking straight down over the pivot): no flip. If the look
+    reverses exactly (the minimal rotation is undefined) the previous `right` is already
+    perpendicular to `f_cur` and is kept - still no flip.
+    """
+    v = np.cross(f_prev, f_cur)
+    s = float(np.linalg.norm(v))
+    c = float(np.dot(f_prev, f_cur))
+    if s < 1e-8:                                # parallel (same or exact reversal): keep right
+        r = r_prev.astype(np.float32).copy()
+    else:
+        theta = math.atan2(s, c)
+        r = _rodrigues(r_prev.astype(np.float32), v / s, theta)
+    r = r - float(np.dot(r, f_cur)) * f_cur     # re-orthonormalize against the new forward
+    rn = float(np.linalg.norm(r))
+    if rn < 1e-8:                               # fully degenerate: any perpendicular will do
+        r = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        r = r - float(np.dot(r, f_cur)) * f_cur
+        rn = float(np.linalg.norm(r)) or 1.0
+    r = (r / rn).astype(np.float32)
+    d = np.cross(f_cur, r).astype(np.float32)
+    return r, d
+
+
+def camera_frames(forward) -> Tuple[np.ndarray, np.ndarray]:
+    """(right, down) [N,3] for a sequence of unit forward vectors, rotation-minimizing.
+
+    Frame 0 keeps the horizon (zero roll, `_world_up_frame`); every later frame is parallel
+    transported (`_transport_step`). This is the single source of the camera's roll: both the
+    renderer (`_look_at`) and the auto-camera's measurements use it, so a pixel measured is a pixel
+    rendered and nothing rolls about x or flips over the pivot.
+    """
+    f = np.asarray(forward, dtype=np.float32)
+    if f.ndim == 1:
+        f = f.reshape(1, 3)
+    n = f.shape[0]
+    right = np.empty_like(f)
+    down = np.empty_like(f)
+    right[0], down[0] = _world_up_frame(f[0])
+    for i in range(1, n):
+        right[i], down[i] = _transport_step(right[i - 1], f[i - 1], f[i])
+    return right, down
+
+
+def _look_at(pos: np.ndarray, look: np.ndarray, prev: Optional[np.ndarray] = None) -> np.ndarray:
+    """c2w rotation (columns right, down, forward) looking from pos at look with zero roll.
+
+    With `prev` (the previous frame's 3x3) the new frame is *parallel transported* from it - no roll
+    about x and no flip over the pivot. Without `prev` (the first frame) it falls back to the
+    world-up zero-roll look-at (`_world_up_frame`). `prev` is only a hard fallback when the look
+    vector itself collapses (pos ~== look).
+    """
     f = look - pos
     norm_f = float(np.linalg.norm(f))
     if norm_f < 1e-6:
         return prev if prev is not None else np.eye(3, dtype=np.float32)
-    f = f / norm_f
-    r = np.cross(f, up)
-    norm_r = float(np.linalg.norm(r))
-    if norm_r < 1e-6:              # looking straight up or down: keep x as right
-        r = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    f = (f / norm_f).astype(np.float32)
+    if prev is None:
+        r, d = _world_up_frame(f)
     else:
-        r = r / norm_r
-    d = np.cross(f, r)
+        r, d = _transport_step(prev[:, 0], prev[:, 2], f)
     return np.stack([r, d, f], axis=1)
+
 
 
 def _evaluate_camera_path(path_data: dict, frames: int, zm: float) -> Tuple[np.ndarray, np.ndarray]:

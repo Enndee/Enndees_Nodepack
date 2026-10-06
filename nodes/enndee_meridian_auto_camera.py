@@ -670,36 +670,38 @@ def _decimate(points, limit):
     return points[::stride]
 
 
-def _look_axes(points, camera_position, pivot):
+def _look_axes(points, camera_position, pivot, frame=None):
     """(x, y, z) of `points` in a camera frame - renderer convention (right, down, forward).
 
-    `_look_at` in the fast-depth backend builds the same basis (world up = -y in OpenCV axes, zero
-    roll), so a pixel measured here is a pixel the renderer would produce.
+    `frame` is the (right, down) pair to measure in - pass the parallel-transported pair for a pose
+    inside a sequence (`fast_depth.camera_frames`) so the measurement matches the render exactly. It
+    defaults to the first-frame basis (zero roll from world up) for an isolated pose, which is the
+    same `camera_frames` would pick - a pixel measured here is a pixel the renderer would produce.
     """
     device, dtype = points.device, points.dtype
     position = torch.as_tensor(camera_position, device=device, dtype=dtype)
     forward = torch.as_tensor(pivot, device=device, dtype=dtype) - position
     forward = forward / forward.norm().clamp(min=1e-8)
-    up = torch.tensor([0.0, -1.0, 0.0], device=device, dtype=dtype)
-    right = torch.cross(forward, up, dim=0)
-    if float(right.norm()) < 1e-6:                     # looking straight up or down: keep x
-        right = torch.tensor([1.0, 0.0, 0.0], device=device, dtype=dtype)
+    if frame is None:
+        right_np, down_np = fast_depth.camera_frames(forward.detach().cpu().numpy().reshape(1, 3))
+        right = torch.as_tensor(right_np[0], device=device, dtype=dtype)
+        down = torch.as_tensor(down_np[0], device=device, dtype=dtype)
     else:
-        right = right / right.norm()
-    down = torch.cross(forward, right, dim=0)
+        right, down = (torch.as_tensor(axis, device=device, dtype=dtype) for axis in frame)
     relative = points - position
     return relative @ right, relative @ down, relative @ forward
 
 
-def project_points(points, camera_position, pivot, surface, height=CANVAS_HEIGHT):
+def project_points(points, camera_position, pivot, surface, height=CANVAS_HEIGHT, frame=None):
     """(u, v, z) pixels of world `points` in a camera's frame - the renderer's own pinhole.
 
     `f = 0.5 * height / tan(vfov / 2)`, canvas width from the still's aspect ratio. The canvas
     height is a *canonical* 1000 px: every metric below is a ratio of the frame, so it cancels.
+    `frame` is the (right, down) pair to measure in (see `_look_axes`).
     """
     focal = 0.5 * float(height) / math.tan(math.radians(fast_depth.VFOV_DEGREES) / 2.0)
     aspect = float(surface.get("aspect") or (16.0 / 9.0))
-    x_c, y_c, z_c = _look_axes(points, camera_position, pivot)
+    x_c, y_c, z_c = _look_axes(points, camera_position, pivot, frame)
     width = float(height) * aspect
     safe = z_c.clamp(min=1e-6)
     return 0.5 * width + focal * x_c / safe, 0.5 * float(height) + focal * y_c / safe, z_c

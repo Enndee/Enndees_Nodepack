@@ -1894,6 +1894,27 @@ class AutoCameraSpiralCoverageTests(unittest.TestCase):
         arcs = [spiral_arc(*_orbit_angles(sample, pivot)) for sample in samples]
         self.assertAlmostEqual(arcs[-1], SPIRAL_END_ARC_DEFAULT, places=4)   # the path is flown
 
+    def test_the_spiral_frame_never_rolls_or_flips_over_the_pole(self):
+        """Roll is parallel-transported: no roll about x, no flip crossing the top of the pivot."""
+        surface = probe_surface(_reference(), depth_fn=lambda reference: _depth_with_subject())
+        distance, pivot, _metrics = subject_framing(surface, 40.0)
+        samples = subject_samples(73, pivot, distance, 1.0, 1.0, None, ORBIT_DIRECTION_DEFAULT,
+                                  coverage=SPIRAL_COVERAGE)
+        pos = torch.as_tensor(samples, dtype=torch.float32).reshape(-1, 3)
+        piv = torch.as_tensor(pivot, dtype=torch.float32).reshape(1, 3)
+        forwards = piv - pos
+        forwards = forwards / forwards.norm(dim=1, keepdim=True).clamp(min=1e-8)
+        right, _down = fast_depth.camera_frames(forwards.numpy())
+        right = torch.as_tensor(right)
+        # no flip anywhere along the spiral (the clock winds over the top of the pivot)
+        dots = [float((right[i] * right[i - 1]).sum()) for i in range(1, right.shape[0])]
+        self.assertGreater(min(dots), 0.0)
+        # frame 0 is the plain world-up zero-roll look-at: the opening pose is unchanged
+        up = torch.tensor([0.0, -1.0, 0.0])
+        r0 = torch.cross(forwards[0], up, dim=0)
+        r0 = r0 / r0.norm()
+        self.assertTrue(torch.allclose(right[0], r0, atol=1e-4))
+
     def test_the_keys_follow_the_spiral_s_turning(self):
         """The renderer splines the keys, so they sit where the path bends - not every Nth frame."""
         surface = probe_surface(_reference(), depth_fn=lambda reference: _depth_with_subject())
