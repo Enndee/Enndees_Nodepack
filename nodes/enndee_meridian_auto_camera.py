@@ -2413,6 +2413,11 @@ def probe_surface(reference, target=SUBJECT_TARGET, subject_mask=None, model_siz
     summary. Both automatic paths start here: the automatic one builds its orbit from it, the
     manual one only takes the pivot (plus the user's offset) - and both run the collision guard
     against this cloud. `depth_fn` injects a depth map instead of running a depth model (tests).
+
+    The depth is put in the **renderer's gauge** first (`fast_depth.cloud_gauge`): the Geometry node
+    unprojects the percentile-mapped depth, not the model's raw output, so a rig built in raw units
+    lands at the wrong depth *and* scale (a key's x/y follow its z) and the subject drifts out of
+    the frame along the path.
     """
     target = str(target or SUBJECT_TARGET).strip().lower()
     if target not in AUTO_TARGETS:
@@ -2424,6 +2429,12 @@ def probe_surface(reference, target=SUBJECT_TARGET, subject_mask=None, model_siz
     else:
         depth, depth_model = depth_from_reference(reference, model_size=model_size,
                                                   depth_res=depth_res, device=device)
+    # The renderer unprojects the *mapped* depth (the `DEPTH_NEAR .. DEPTH_FAR` window, see
+    # `fast_depth.cloud_gauge`), so the estimator has to live in that same gauge: the keys it emits
+    # are in units of the mapped median and the render scales them by `zm`. Estimating in the
+    # model's raw units instead put the whole rig at the wrong depth *and* scale (a key's x/y follow
+    # its z), which is what made the orbit circle a point in front of the subject.
+    depth = fast_depth.cloud_gauge(depth)
     cloud = surface_points(depth)
     scene_pivot, scene_extents = geometric_pivot(cloud)
     scene_radius = pivot_radius(cloud, scene_pivot)

@@ -74,7 +74,7 @@ def surface_stub(pivot=(0.1, -0.2, 2.0), radius=0.5, cloud=None):
         "scene_pivot": [0.0, 0.0, 2.0], "scene_extents": [1.0, 1.0, 1.0],
         "points": int(points.shape[0]), "content_points": 64,
         "pivot": list(pivot), "extents": [1.0, 1.0, 1.0],
-        "content_radius": radius,
+        "content_radius": radius, "median_depth": 2.0,
     }
 
 
@@ -378,7 +378,11 @@ class MeridianAutomaticCameraTests(unittest.TestCase):
                       path_start_yaw=0.0, path_target_yaw=90.0,
                       path_spiral_start_elevation=-20.0, path_spiral_end_elevation=20.0)
         surface = surface_stub(pivot=(0.1, -0.2, 2.0), radius=0.5)
-        expected = [0.1, -0.2 + 0.5 * 0.5, 2.0]          # pivot + 0.5 content radii on y
+        # pivot + 0.5 content radii on y, emitted in median-depth units like every other path (the
+        # renderer scales the keys by the cloud's median depth, so absolute keys would sit `zm`
+        # times too far from the subject).
+        expected = [value / surface["median_depth"]
+                    for value in (0.1, -0.2 + 0.5 * 0.5, 2.0)]
 
         def explode(*args, **kwargs):
             raise AssertionError("the estimated path must not run when the manual one is picked")

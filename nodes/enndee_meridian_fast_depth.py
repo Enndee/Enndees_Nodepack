@@ -89,6 +89,16 @@ DA3_RES = 504                         # default `depth_res`: still + Depth-Anyth
 DISPARITY_EPS = 0.001                 # floor before the 1/x inversion, so the far plane stays finite
 KEEP_PARENT_RATIO = 0.999             # recam/geometry.py `upsample`: a hi-res pixel needs every parent kept
 
+# The camera's roll. The frame is the world-up look-at: the horizon stays level, so an orbit - the
+# spiral's O-orbits especially - comes out upright and nothing twists about the optical axis. The
+# one pose without a horizon is the pole, the look straight up/down the world axis, where the
+# world-up frame has to reverse (its right vector flips sign as the look crosses vertical). There
+# the previous frame is carried by parallel transport and walked back to level over the next
+# HORIZON_RELOCK frames, so a coil that grazes the top re-locks smoothly instead of flipping.
+WORLD_UP = np.array([0.0, -1.0, 0.0], dtype=np.float32)   # OpenCV frame: -y is up
+HORIZON_MIN_SIN = 1e-6                # |cross(look, up)| below this = the look is vertical (no horizon)
+HORIZON_RELOCK = 24                   # frames to settle back to level after the look crosses the pole
+
 # Depth-Anything-3 variants the fast backend can load, as Hugging Face repo ids (all
 # Apache-2.0). Small/Base/Large are the any-view series (relative depth + camera poses, the
 # poses unused here); Mono-Large is the monocular series tuned for high-quality single-still
@@ -262,6 +272,31 @@ def _flat_quantile(pool: torch.Tensor, q: float) -> torch.Tensor:
     if flat.numel() > QUANTILE_MAX:
         flat = flat[:: -(-flat.numel() // QUANTILE_MAX)]
     return torch.quantile(flat, q)
+
+
+def cloud_gauge(depth: torch.Tensor) -> torch.Tensor:
+    """A raw model depth map expressed in the *cloud's* gauge - the window `render_depth_aligned`
+    builds its point cloud with.
+
+    `render_depth_aligned` does not unproject the model's raw depth: it clips it to the
+    `DEPTH_PCT_LO`/`DEPTH_PCT_HI` percentiles, maps that onto `DEPTH_NEAR .. DEPTH_FAR` and builds
+    the cloud from *that*. The rendered cloud therefore lives in that window, not in the model's own
+    units, and a camera path must live in the same one: the keys' x/y follow their z (a key is
+    `(px - cx) / f * z`), so a rig placed in the wrong gauge is not just at the wrong distance - it
+    is at the wrong *scale*, and the subject drifts out of the picture along the path.
+
+    The map is affine (`mapped = A + B * raw`), so the estimator cannot get there by rescaling its
+    keys alone: it has to build its surface in this gauge. `probe_surface` calls this before
+    unprojecting, so the emitted keys - in units of the mapped median - are exactly what the
+    renderer's `zm` (`mapped_depth(median)`) expects.
+    """
+    flat = depth.reshape(-1)
+    low = _flat_quantile(flat, DEPTH_PCT_LO)
+    high = _flat_quantile(flat, DEPTH_PCT_HI)
+    # Same span floor as the renderer: a nearly constant depth must not turn float noise into a
+    # fake bumpy surface (which would scramble the `--cull` normals).
+    span = (high - low).clamp(min=1e-3 * float(high.abs() + low.abs()) + 1e-9)
+    return (DEPTH_NEAR + (DEPTH_FAR - DEPTH_NEAR) * (depth - low) / span).clamp(min=0.05)
 
 
 def _predict_da3_depth(model_name: str, first: torch.Tensor, device: torch.device,
@@ -491,21 +526,41 @@ def _catmull_rom(tk: np.ndarray, pk: np.ndarray, t: np.ndarray, ease: List[bool]
     return out
 
 
-def _world_up_frame(f: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """(right, down) of a look-at from a unit forward `f`, keeping the horizon with zero roll.
+def _horizon_right(f: np.ndarray) -> Optional[np.ndarray]:
+    """The level-horizon (zero-roll) right of a unit look direction, or None when `f` is vertical.
 
-    This is the renderer's zero-roll reference used for the FIRST frame (so a clip opens exactly as
-    it always has). It degenerates when `f` is vertical (parallel to the world up (0,-1,0)), which
-    is why every *later* frame is carried by parallel transport instead of re-deriving from here.
+    This is the look's own right in the world, so the horizon stays level and the frame never rolls
+    about the optical axis. It is undefined - and reverses - exactly at the pole (the look straight
+    up/down `WORLD_UP`); `camera_frames`/`_look_at` hold the previous frame there instead of
+    following this vector over the flip.
     """
-    up = np.array([0.0, -1.0, 0.0], dtype=np.float32)
-    r = np.cross(f, up)
-    if float(np.linalg.norm(r)) < 1e-6:        # looking straight up/down: keep world x as right
+    r = np.cross(f, WORLD_UP)
+    norm = float(np.linalg.norm(r))
+    if norm < HORIZON_MIN_SIN:
+        return None
+    return (r / norm).astype(np.float32)
+
+
+def _signed_roll(r_from: np.ndarray, r_to: np.ndarray, f: np.ndarray) -> float:
+    """Signed angle (rad) that turns `r_from` into `r_to` about the unit axis `f` (-pi..pi]."""
+    return math.atan2(float(np.dot(np.cross(r_from, r_to), f)), float(np.dot(r_from, r_to)))
+
+
+def _world_up_frame(f: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """(right, down) of the level-horizon look-at from a unit forward `f` - zero roll about x.
+
+    This is the renderer's reference frame: the horizon stays level, so an orbit never rolls. It
+    only degenerates when `f` is vertical (parallel to the world up), where no horizon exists; there
+    world x is kept as the right so the frame stays orthonormal (`camera_frames` handles that pose
+    with continuity instead of calling this on its own).
+    """
+    r = _horizon_right(f)
+    if r is None:                              # looking straight up/down: keep world x as right
         r = np.array([1.0, 0.0, 0.0], dtype=np.float32)
-    else:
-        r = r / float(np.linalg.norm(r))
-    d = np.cross(f, r)
-    return r.astype(np.float32), d.astype(np.float32)
+        r = r - float(np.dot(r, f)) * f
+        norm = float(np.linalg.norm(r))
+        r = (r / norm).astype(np.float32) if norm > 1e-8 else r.astype(np.float32)
+    return r, np.cross(f, r).astype(np.float32)
 
 
 def _rodrigues(v: np.ndarray, axis: np.ndarray, theta: float) -> np.ndarray:
@@ -519,11 +574,13 @@ def _transport_step(r_prev: np.ndarray, f_prev: np.ndarray, f_cur: np.ndarray) -
     """(right, down) of the next frame by *parallel transport* - zero roll about the optical axis.
 
     The whole frame is carried by the single minimal rotation that takes `f_prev` to `f_cur` (about
-    `cross(f_prev, f_cur)`), so `right`/`up` twist as little as possible - exactly zero roll about
-    the view axis. Because the frame is transported rather than re-derived from world up, it stays
+    `cross(f_prev, f_cur)`), so `right`/`up` twist as little as possible - zero roll about the view
+    axis *per step*. Because the frame is transported rather than re-derived from world up, it stays
     smooth through the pole (the camera looking straight down over the pivot): no flip. If the look
     reverses exactly (the minimal rotation is undefined) the previous `right` is already
-    perpendicular to `f_cur` and is kept - still no flip.
+    perpendicular to `f_cur` and is kept - still no flip. This alone is *not* the render rule:
+    transport accumulates the holonomy of a coil, so `camera_frames` uses it only at the pole
+    (`_horizon_step`).
     """
     v = np.cross(f_prev, f_cur)
     s = float(np.linalg.norm(v))
@@ -544,13 +601,36 @@ def _transport_step(r_prev: np.ndarray, f_prev: np.ndarray, f_cur: np.ndarray) -
     return r, d
 
 
-def camera_frames(forward) -> Tuple[np.ndarray, np.ndarray]:
-    """(right, down) [N,3] for a sequence of unit forward vectors, rotation-minimizing.
+def _horizon_step(r_prev: np.ndarray, f_prev: np.ndarray, f_cur: np.ndarray, weight: float) -> np.ndarray:
+    """Carry `r_prev` to `f_cur` (parallel transport) and roll it `weight` of the way to level.
 
-    Frame 0 keeps the horizon (zero roll, `_world_up_frame`); every later frame is parallel
-    transported (`_transport_step`). This is the single source of the camera's roll: both the
-    renderer (`_look_at`) and the auto-camera's measurements use it, so a pixel measured is a pixel
-    rendered and nothing rolls about x or flips over the pivot.
+    `weight` 1 = the level-horizon frame (`_horizon_right`): zero roll, the clip stays upright.
+    0 = pure transport: the previous frame carried along the look direction, which is what keeps a
+    pole graze continuous. In between the frame walks back to level after such a graze.
+    """
+    r, _ = _transport_step(r_prev, f_prev, f_cur)
+    horizon = _horizon_right(f_cur)
+    if horizon is None or weight <= 0.0:
+        return r
+    turned = _rodrigues(r, f_cur, weight * _signed_roll(r, horizon, f_cur))
+    turned = turned - float(np.dot(turned, f_cur)) * f_cur
+    norm = float(np.linalg.norm(turned))
+    return (turned / norm).astype(np.float32) if norm > 1e-8 else r
+
+
+def camera_frames(forward) -> Tuple[np.ndarray, np.ndarray]:
+    """(right, down) [N,3] for a sequence of unit forwards: horizon level, no roll, no flip.
+
+    The frame is the world-up look-at - the horizon stays level, so an orbit (the spiral's O-orbits
+    especially) comes out upright and nothing twists about the optical axis. The one pose without a
+    horizon is the pole (the look straight up/down the world axis), where the world-up frame would
+    reverse; there the previous frame is carried by parallel transport (`_transport_step`) and
+    walked back to level over the next `HORIZON_RELOCK` frames, so a coil that grazes the top
+    re-locks smoothly instead of flipping 180 degrees.
+
+    Frame 0 is the plain world-up zero-roll look-at, so a clip opens exactly as it always has. This
+    is the single source of the camera's roll: both the renderer (`_evaluate_camera_path`) and the
+    auto-camera's measurements use it, so a pixel measured is a pixel rendered.
     """
     f = np.asarray(forward, dtype=np.float32)
     if f.ndim == 1:
@@ -559,18 +639,35 @@ def camera_frames(forward) -> Tuple[np.ndarray, np.ndarray]:
     right = np.empty_like(f)
     down = np.empty_like(f)
     right[0], down[0] = _world_up_frame(f[0])
+    previous_horizon = _horizon_right(f[0])
+    relock = 0
     for i in range(1, n):
-        right[i], down[i] = _transport_step(right[i - 1], f[i - 1], f[i])
+        horizon = _horizon_right(f[i])
+        if horizon is not None:
+            if previous_horizon is None or float(np.dot(horizon, previous_horizon)) < 0.0:
+                relock = HORIZON_RELOCK         # the horizon just reversed over the pole
+            previous_horizon = horizon
+        if horizon is None:
+            weight = 0.0                        # no horizon to lock to: hold the transported frame
+        elif relock > 0:
+            weight = (HORIZON_RELOCK - relock) / float(HORIZON_RELOCK)
+            relock -= 1
+        else:
+            weight = 1.0
+        right[i] = _horizon_step(right[i - 1], f[i - 1], f[i], weight)
+        down[i] = np.cross(f[i], right[i]).astype(np.float32)
     return right, down
 
 
 def _look_at(pos: np.ndarray, look: np.ndarray, prev: Optional[np.ndarray] = None) -> np.ndarray:
-    """c2w rotation (columns right, down, forward) looking from pos at look with zero roll.
+    """c2w rotation (columns right, down, forward) looking from pos at look with the horizon level.
 
-    With `prev` (the previous frame's 3x3) the new frame is *parallel transported* from it - no roll
-    about x and no flip over the pivot. Without `prev` (the first frame) it falls back to the
-    world-up zero-roll look-at (`_world_up_frame`). `prev` is only a hard fallback when the look
-    vector itself collapses (pos ~== look).
+    The frame is the world-up look-at (`_world_up_frame`) - zero roll about x - so a moving camera
+    keeps the horizon level instead of accumulating roll. `prev` (the previous frame's 3x3) supplies
+    continuity at the pole only: where the look is vertical, or the level frame just reversed, the
+    previous frame is transported instead, so crossing the top never flips. `prev` is also the hard
+    fallback when the look vector itself collapses (pos ~== look). The whole-sequence renderer uses
+    `camera_frames`, which spreads that re-lock over `HORIZON_RELOCK` frames.
     """
     f = look - pos
     norm_f = float(np.linalg.norm(f))
@@ -579,9 +676,13 @@ def _look_at(pos: np.ndarray, look: np.ndarray, prev: Optional[np.ndarray] = Non
     f = (f / norm_f).astype(np.float32)
     if prev is None:
         r, d = _world_up_frame(f)
-    else:
-        r, d = _transport_step(prev[:, 0], prev[:, 2], f)
-    return np.stack([r, d, f], axis=1)
+        return np.stack([r, d, f], axis=1)
+    previous_horizon = _horizon_right(prev[:, 2])
+    horizon = _horizon_right(f)
+    flipped = horizon is not None and (previous_horizon is None
+                                       or float(np.dot(horizon, previous_horizon)) < 0.0)
+    r = _horizon_step(prev[:, 0], prev[:, 2], f, 0.0 if horizon is None or flipped else 1.0)
+    return np.stack([r, np.cross(f, r).astype(np.float32), f], axis=1)
 
 
 
@@ -601,10 +702,16 @@ def _evaluate_camera_path(path_data: dict, frames: int, zm: float) -> Tuple[np.n
     focal = np.interp(t, tk, [float(key.get("focal", 1.0)) for key in keys]).astype(np.float32)
 
     c2w = np.tile(np.eye(4, dtype=np.float32), (frames, 1, 1))
-    r_prev = None
+    forward = look - pos
+    lengths = np.linalg.norm(forward, axis=1)
+    collapsed = lengths < 1e-6            # pos ~== look: no direction, so the frame cannot move
+    forward = forward / np.where(collapsed, 1.0, lengths)[:, None]
+    right, down = camera_frames(forward)
+    rotation = np.eye(3, dtype=np.float32)
     for i in range(frames):
-        r_prev = _look_at(pos[i], look[i], r_prev)
-        c2w[i, :3, :3] = r_prev
+        if not collapsed[i]:
+            rotation = np.stack([right[i], down[i], forward[i]], axis=1)
+        c2w[i, :3, :3] = rotation
         c2w[i, :3, 3] = pos[i]
     return c2w, focal
 

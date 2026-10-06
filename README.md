@@ -278,14 +278,18 @@ image the Geometry node receives. The estimator:
        the per-frame drift against the cap instead, so more Output Frames or a higher
        Auto Max Speed are the levers.
        **Camera roll: none.** The camera keeps one distance and always aims at the pivot,
-       and its orientation is built by *parallel transport* (a rotation-minimizing frame):
-       the up vector is carried along the path with the minimal rotation the aim forces,
-       so there is **no roll about the optical (x) axis** and **no flip** when the path
-       crosses straight over the top of the pivot. The opening frame still uses the plain
-       world-up zero-roll look-at, so a clip starts exactly as it always has; every later
-       frame is transported from it instead of re-deriving from world up (which is what
-       used to snap ~180 deg at the pole). This is the renderer's own basis
-       (`_look_at`/`camera_frames` in the fast-depth backend).
+       and its orientation is the **level-horizon (world-up) look-at**: `right =
+       cross(forward, world-up)`, so the horizon stays level and there is **no roll
+       about the optical (x) axis** at any pose - the frame does not accumulate the
+       holonomy a spiralling path would otherwise twist into it. The opening frame is
+       the plain world-up zero-roll look-at, so a clip starts exactly as it always has.
+       The one pose without a horizon is the **pole** (the look straight up/down the
+       world axis): there the previous frame is held (parallel transport) and walked
+       back to level over the next 24 frames, so a coil that grazes the top re-locks
+       smoothly instead of flipping ~180 deg. This is the renderer's own basis
+       (`camera_frames`/`_evaluate_camera_path` in the fast-depth backend), and the
+       auto-camera's measurements use the same level-horizon basis, so a pixel
+       measured is a pixel rendered.
    - **Manual** - the manual styles below, but aimed at the estimated pivot
      instead of the absolute look-pivot (the `path_pivot_*` widgets are ignored
      and hidden then; every other path widget applies as usual).

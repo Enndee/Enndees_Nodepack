@@ -10,6 +10,7 @@ import math
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import torch
 
@@ -144,6 +145,33 @@ def _estimate(depth, **overrides):
     return estimate_camera_path(_reference(), **options)
 
 
+class _FakeV2Output:
+    def __init__(self, depth):
+        self.predicted_depth = depth
+
+
+class _FakeV2Model:
+    """Depth-Anything-V2 stand-in: a near 'subject' block on a far background (inverse depth).
+
+    `render_depth_aligned` and the estimator both run through `fast_depth._get_depth_model`, so
+    patching it with this gives an estimate *and* a render of the exact same scene - which is what
+    the end-to-end gauge test needs.
+    """
+
+    def __init__(self, size=128, block=32, centre_x=0.30, near=4.0, far=0.4):
+        self.size, self.block, self.centre_x, self.near, self.far = size, block, centre_x, near, far
+
+    def __call__(self, pixel_values=None, **kwargs):
+        height, width = pixel_values.shape[-2], pixel_values.shape[-1]
+        fx = torch.linspace(0.0, 1.0, width).view(1, width)
+        fy = torch.linspace(0.0, 1.0, height).view(height, 1)
+        inside = (((fx - self.centre_x).abs() < 0.5 * self.block / self.size)
+                  & ((fy - 0.5).abs() < 0.5 * self.block / self.size))
+        disparity = torch.where(inside, torch.full_like(fx * fy, self.near),
+                                torch.full_like(fx * fy, self.far))
+        return _FakeV2Output(disparity.unsqueeze(0))
+
+
 def _orbit_angles(position, pivot):
     """(azimuth, elevation) of a camera position around a pivot; yaw 0 = in front of it."""
     delta = [position[axis] - pivot[axis] for axis in range(3)]
@@ -245,7 +273,9 @@ class AutoCameraProbeTests(unittest.TestCase):
         self.assertEqual(surface["target"], SUBJECT_TARGET)
         self.assertIn("near depth layer", surface["source"])
         self.assertAlmostEqual(surface["pivot"][2], 1.0, delta=0.05)        # the subject's plane
-        self.assertAlmostEqual(surface["scene_pivot"][2], 2.5, delta=0.1)   # (near + far) / 2
+        # The scene pivot is the midpoint of the *cloud's* gauge (raw 1.0..4.0 -> mapped 1.0..5.0),
+        # because the estimator runs in the same window the renderer unprojects.
+        self.assertAlmostEqual(surface["scene_pivot"][2], 3.0, delta=0.1)   # (mapped near + far) / 2
         self.assertGreater(surface["scene_radius"], surface["content_radius"])
         self.assertEqual(surface["points"], 64 * 64)
         self.assertEqual(surface["content_points"], 24 * 24)
@@ -891,16 +921,25 @@ class AutoCameraEstimateTests(unittest.TestCase):
         finally:
             fast_depth._predict_da3_depth, fast_depth._get_depth_model = original_da3, original_v2
 
-    def test_estimate_scales_with_the_depth_gauge(self):
+    def test_estimate_is_invariant_to_the_depth_gauge(self):
+        """The estimate runs in the cloud's gauge, so a raw depth's absolute scale must not matter.
+
+        `render_depth_aligned` clips the model's depth to the 1 %/99 % percentiles and maps it onto
+        `DEPTH_NEAR .. DEPTH_FAR` before unprojecting, so the rendered world is scale-free: a depth
+        map and the same map times three render identically. The estimator now shares that gauge
+        (`fast_depth.cloud_gauge`), so its pivot, orbit radius and travel are identical too - before
+        this they scaled with the raw depth, which is exactly what put the rig at the wrong depth in
+        the render.
+        """
         depth = _depth_with_subject()
         _, small = _estimate(depth)
         _, large = _estimate(depth * 3.0)
         self.assertEqual(small["style"], large["style"])
         self.assertEqual(small["keys"], large["keys"])
         self.assertAlmostEqual(small["amplitude_scale"], large["amplitude_scale"], places=6)
-        self.assertAlmostEqual(large["pivot"][2] / small["pivot"][2], 3.0, places=4)
-        self.assertAlmostEqual(large["orbit_radius"] / small["orbit_radius"], 3.0, places=4)
-        self.assertAlmostEqual(large["travel_per_frame"] / small["travel_per_frame"], 3.0, places=4)
+        self.assertAlmostEqual(large["pivot"][2] / small["pivot"][2], 1.0, places=4)
+        self.assertAlmostEqual(large["orbit_radius"] / small["orbit_radius"], 1.0, places=4)
+        self.assertAlmostEqual(large["travel_per_frame"] / small["travel_per_frame"], 1.0, places=4)
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs a CUDA device")
     def test_estimate_handles_a_cuda_depth_map(self):
@@ -1135,7 +1174,10 @@ class AutoCameraVisibilityTests(unittest.TestCase):
         self.assertLessEqual(summary["drift_px"], summary["drift_cap_px"] * 1.01)
         self.assertEqual(summary["orbit_end_deg"], 0.0)
         self.assertEqual(summary["front_share"], 1.0)          # every frame is the O's
-        self.assertGreaterEqual(summary["front_yaw_deg"], 15.0)  # an orbit, not a wobble
+        # An orbit, not a wobble. The estimate now runs in the cloud's gauge (the renderer's
+        # 1 %/99 % -> DEPTH_NEAR..DEPTH_FAR window), which stretches this fixture's narrow raw depth
+        # range (1.0..1.6) into a deeper scene, so the fit lands a slightly tighter O than before.
+        self.assertGreaterEqual(summary["front_yaw_deg"], 10.0)
         keys = json.loads(document)["path"]
         aim = {tuple(key["look"]) for key in keys}
         self.assertEqual(len(aim), 1)                          # one aim for the whole clip ...
@@ -1894,8 +1936,8 @@ class AutoCameraSpiralCoverageTests(unittest.TestCase):
         arcs = [spiral_arc(*_orbit_angles(sample, pivot)) for sample in samples]
         self.assertAlmostEqual(arcs[-1], SPIRAL_END_ARC_DEFAULT, places=4)   # the path is flown
 
-    def test_the_spiral_frame_never_rolls_or_flips_over_the_pole(self):
-        """Roll is parallel-transported: no roll about x, no flip crossing the top of the pivot."""
+    def test_the_spiral_frame_stays_upright_and_never_flips_over_the_pole(self):
+        """The frame is the world-up look-at: a coil comes out upright, with no roll and no flip."""
         surface = probe_surface(_reference(), depth_fn=lambda reference: _depth_with_subject())
         distance, pivot, _metrics = subject_framing(surface, 40.0)
         samples = subject_samples(73, pivot, distance, 1.0, 1.0, None, ORBIT_DIRECTION_DEFAULT,
@@ -1909,11 +1951,53 @@ class AutoCameraSpiralCoverageTests(unittest.TestCase):
         # no flip anywhere along the spiral (the clock winds over the top of the pivot)
         dots = [float((right[i] * right[i - 1]).sum()) for i in range(1, right.shape[0])]
         self.assertGreater(min(dots), 0.0)
+        # upright wherever a horizon exists: `right` is the look's level-horizon right, so the clip
+        # never rolls about the optical axis (the spiral no longer accumulates transport roll)
+        for i in range(forwards.shape[0]):
+            level = fast_depth._horizon_right(forwards[i].numpy())
+            if level is not None:
+                self.assertTrue(torch.allclose(right[i], torch.as_tensor(level), atol=1e-4))
         # frame 0 is the plain world-up zero-roll look-at: the opening pose is unchanged
         up = torch.tensor([0.0, -1.0, 0.0])
         r0 = torch.cross(forwards[0], up, dim=0)
         r0 = r0 / r0.norm()
         self.assertTrue(torch.allclose(right[0], r0, atol=1e-4))
+
+    def test_the_rendered_estimate_keeps_the_subject_in_the_picture_centre(self):
+        """End to end: the emitted keys must land the rig where the renderer's cloud lives.
+
+        The estimator and the renderer have to share one depth gauge (`fast_depth.cloud_gauge` -
+        the 1 %/99 % percentile window mapped onto `DEPTH_NEAR .. DEPTH_FAR`). Estimating in the
+        model's raw units instead put the whole rig at the wrong depth *and* scale (a key's x/y
+        follow its z), so the subject - which the estimate promises to hold in the horizontal
+        picture centre - swung out of the frame along the path. This flies a real spiral over an
+        off-centre subject and measures where it actually lands in the rendered frames.
+        """
+        size, block, centre_x = 128, 32, 0.30
+        image = torch.zeros(1, size, size, 3)
+        image[0, :, :, 2] = 0.15                                    # dim blue background
+        top, left = size // 2 - block // 2, int(centre_x * size) - block // 2
+        image[0, top:top + block, left:left + block, 0] = 1.0       # bright red subject
+        image[0, top:top + block, left:left + block, 2] = 0.0
+        model = _FakeV2Model(size=size, block=block, centre_x=centre_x)
+        device = torch.device("cpu")
+        with mock.patch.object(fast_depth, "_get_depth_model", lambda *a, **k: model):
+            document, _summary = estimate_camera_path(
+                image, 73, target=SUBJECT_TARGET, max_speed=DEFAULT_MAX_SPEED, subject_fill=40.0,
+                coverage=SPIRAL_COVERAGE, device=device, model_size="Depth-Anything-V2-Small-hf")
+            _source, render, width, height, length = fast_depth.render_depth_aligned(
+                image, device, model_size="Depth-Anything-V2-Small-hf", frames=73,
+                canvas_mode="custom", custom_width=size, custom_height=size, cloud_scale=1,
+                point_size=1, edge_cull=True, edge_threshold=0.30, custom_camera=document)
+        self.assertEqual(length, 73)
+        for index in range(length):
+            subject = ((render[index, :, :, 0] > 0.35)
+                       & (render[index, :, :, 0] > render[index, :, :, 2] + 0.2))
+            self.assertGreater(int(subject.sum()), 12, f"the subject left frame {index}")
+            ys, xs = torch.nonzero(subject, as_tuple=True)
+            offset = math.hypot(float(xs.float().mean()) - width / 2.0,
+                                float(ys.float().mean()) - height / 2.0)
+            self.assertLess(offset, 0.12 * height, f"the subject sits off-centre at frame {index}")
 
     def test_the_keys_follow_the_spiral_s_turning(self):
         """The renderer splines the keys, so they sit where the path bends - not every Nth frame."""

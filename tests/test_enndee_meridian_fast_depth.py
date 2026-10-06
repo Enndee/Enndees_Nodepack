@@ -198,6 +198,23 @@ class MeridianFastDepthHelperTests(unittest.TestCase):
             torch.quantile(huge, 0.5)                                        # the crash this helper prevents
         self.assertAlmostEqual(float(fast_depth._flat_quantile(huge, 0.5)),
                                (huge.numel() - 1) / 2, delta=4.0)            # the stride keeps the median
+    def test_cloud_gauge_puts_the_depth_in_the_renderers_window(self):
+        """The auto camera must estimate in the gauge `render_depth_aligned` unprojects.
+
+        The renderer maps the model's raw depth onto `DEPTH_NEAR .. DEPTH_FAR` (1 %/99 % percentile
+        clip) and builds its cloud from *that*, so a camera path has to live in the same window: the
+        keys' x/y follow their z, so a rig in the wrong gauge is at the wrong depth *and* scale.
+        `cloud_gauge` is that map - affine, monotone and free of the raw depth's absolute scale.
+        """
+        raw = torch.linspace(1.0, 4.0, 1001)
+        mapped = fast_depth.cloud_gauge(raw)
+        self.assertTrue(bool((mapped[1:] > mapped[:-1]).all()))              # monotone
+        steps = mapped[1:] - mapped[:-1]
+        self.assertLess(float((steps - steps[0]).abs().max()), 1e-4)         # affine
+        self.assertAlmostEqual(float(mapped[500]), 3.0, delta=0.05)          # raw middle -> window middle
+        self.assertTrue(torch.allclose(fast_depth.cloud_gauge(raw * 3.0), mapped, atol=1e-4))
+
+
 
     def test_edge_keep_culls_only_the_depth_step(self):
         depth = torch.ones(9, 9)
@@ -242,6 +259,20 @@ class MeridianFastDepthHelperTests(unittest.TestCase):
         fwd = np.stack([np.zeros(n), -np.sin(elev), -np.cos(elev)], 1).astype(np.float32)
         return fwd / np.linalg.norm(fwd, axis=1, keepdims=True)
 
+    def _coil_forward(self, n=120, arc=60.0, turns=2.0):
+        """Look directions of a coil around the view axis - the O-orbit family the spiral flies.
+
+        `phi` (the arc from the axis) grows 0 -> `arc`, `psi` (the clock) winds `turns` rounds, so
+        the path never reaches the pole (`arc` < 90) and the horizon is defined at every frame.
+        """
+        progress = np.linspace(0.0, 1.0, n)
+        phi = np.deg2rad(arc * progress)
+        psi = np.deg2rad(turns * 360.0 * progress)
+        offset = np.stack([np.sin(phi) * np.sin(psi),
+                           -np.sin(phi) * np.cos(psi),
+                           -np.cos(phi)], axis=1)
+        return (-offset).astype(np.float32)      # the look at the pivot is minus the camera offset
+
     def test_camera_frame_is_orthonormal_and_never_flips_over_the_pole(self):
         fwd = self._sweep_forward_through_vertical()
         right, down = fast_depth.camera_frames(fwd)
@@ -252,24 +283,47 @@ class MeridianFastDepthHelperTests(unittest.TestCase):
         dots = [float(np.dot(right[i], right[i - 1])) for i in range(1, fwd.shape[0])]
         self.assertGreater(min(dots), 0.5)
 
-    def test_camera_frame_is_pure_parallel_transport_zero_roll(self):
-        fwd = self._sweep_forward_through_vertical()
-        right, _down = fast_depth.camera_frames(fwd)
-        worst = 0.0
-        for i in range(1, fwd.shape[0]):
-            f0, f1 = fwd[i - 1], fwd[i]
-            v = np.cross(f0, f1)
-            s = float(np.linalg.norm(v))
-            if s < 1e-9:
-                continue
-            theta = float(np.arctan2(s, float(np.dot(f0, f1))))
-            transported = fast_depth._rodrigues(right[i - 1], v / s, theta)
-            transported = transported - float(np.dot(transported, f1)) * f1
-            transported = transported / np.linalg.norm(transported)
-            worst = max(worst, float(np.linalg.norm(transported - right[i])))
-        self.assertLess(worst, 1e-4)     # exactly the minimal rotation: zero roll about x
+    def test_camera_frame_stays_level_along_a_coil(self):
+        """The spiral fix: the frame is the world-up look-at, so a coil accumulates no roll.
 
-    def test_look_at_keeps_the_opening_frame_then_transports_without_flipping(self):
+        Parallel transport (the previous rule) twisted the frame as the clock wound round - the
+        render rolled ~130 deg by the end of a two-round coil. The level-horizon frame is upright at
+        every frame instead: `right` is exactly `_horizon_right(forward)`.
+        """
+        fwd = self._coil_forward()
+        right, _down = fast_depth.camera_frames(fwd)
+        for i in range(fwd.shape[0]):
+            np.testing.assert_allclose(right[i], fast_depth._horizon_right(fwd[i]), atol=1e-5)
+
+    def test_camera_frame_relocks_without_flipping_over_the_pole(self):
+        """A look that crosses straight over the pole holds the frame, then settles back to level.
+
+        The world-up frame reverses as the look passes vertical (no horizon exists there), so the
+        frame is carried by parallel transport and walked back to level over `HORIZON_RELOCK` frames
+        - never a 180 deg flip.
+        """
+        angle = np.deg2rad(np.linspace(-60.0, 120.0, 181))     # crosses vertical at 90 deg
+        fwd = np.stack([np.zeros_like(angle), np.sin(angle), np.cos(angle)], axis=1).astype(np.float32)
+        right, _down = fast_depth.camera_frames(fwd)
+        dots = [float(np.dot(right[i], right[i - 1])) for i in range(1, fwd.shape[0])]
+        self.assertGreater(min(dots), 0.5)                    # no flip over the pole
+        # once clear of the pole the frame is level again (the relock has finished)
+        np.testing.assert_allclose(right[-1], fast_depth._horizon_right(fwd[-1]), atol=1e-5)
+
+    def test_custom_path_is_upright_like_the_level_horizon_frame(self):
+        """The renderer's spline path keeps the horizon level (the spiral's no-roll fix)."""
+        n = 73
+        pivot = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        pos = pivot - self._coil_forward(n, arc=50.0, turns=3.0) * 2.0   # on the sphere, aim at pivot
+        path = {"path": [{"t": i, "src": i, "pos": pos[i].tolist(), "look": pivot.tolist()}
+                         for i in range(n)]}
+        c2w, _focal = fast_depth._evaluate_camera_path(path, n, 1.0)
+        for i in range(n):
+            level = fast_depth._horizon_right(c2w[i, :3, 2])
+            if level is not None:
+                np.testing.assert_allclose(c2w[i, :3, 0], level, atol=1e-4)
+
+    def test_look_at_keeps_the_opening_frame_level_and_never_flips(self):
         fwd = self._sweep_forward_through_vertical()
         pos = np.zeros((fwd.shape[0], 3), dtype=np.float32)
         frame, rights = None, []
@@ -282,6 +336,9 @@ class MeridianFastDepthHelperTests(unittest.TestCase):
         np.testing.assert_allclose(rights[0], r0, atol=1e-5)     # opening unchanged (world-up zero-roll)
         dots = [float(np.dot(rights[i], rights[i - 1])) for i in range(1, len(rights))]
         self.assertGreater(min(dots), 0.5)                       # no flip crossing the top
+        # every frame stays level: the horizon is defined all along this sweep
+        for i in range(fwd.shape[0]):
+            np.testing.assert_allclose(rights[i], fast_depth._horizon_right(fwd[i]), atol=1e-5)
 
 
 

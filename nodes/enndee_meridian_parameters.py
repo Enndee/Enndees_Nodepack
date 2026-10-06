@@ -633,6 +633,14 @@ class MeridianParametersAndCamera:
         aimed = dict(kwargs, path_pivot_x=pivot[0], path_pivot_y=pivot[1], path_pivot_z=pivot[2])
         keys = json.loads(cls._build_manual_path(aimed))["path"]
         keys, fixed, worst_before, worst_after = guard_collisions(keys, surface)
+        # The builders work in the surface's own units (the pivot is absolute), but the emitted
+        # document must be in *median-depth units* like every other path - the renderer scales the
+        # keys by the cloud's median depth (`zm`). Emitting the absolute keys put the whole rig `zm`
+        # times too far from the subject.
+        unit = max(1e-6, float(surface["median_depth"]))
+        keys = [{"pos": [round(value / unit, 6) for value in key["pos"]],
+                 "look": [round(value / unit, 6) for value in key["look"]],
+                 "src": key["src"], "t": key["t"]} for key in keys]
         description = (
             f"Manual path '{kwargs['path_camera_mode']}' around the estimated pivot "
             f"[{pivot[0]:.3g}, {pivot[1]:.3g}, {pivot[2]:.3g}] - the geometric midpoint of the "
