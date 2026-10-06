@@ -36,6 +36,7 @@ Lichtfeld Studio dataset in a single step.
 | **Load & Resize Image (Enndee)** | `Enndee_ImageLoaderResize` | Load an image with the classic load-and-resize widgets, core resize types, mask channel, and original-size output |
 | **Meridian Parameters and Camera (Enndee)** | `Enndee_MeridianParametersAndCamera` | Meridian geometry arguments plus the camera path: hand-authored O orbits / alternating-height pendulum / spiral sweeps, or an automatic mode that estimates the subject's (or scene's) geometric pivot from the still's depth profile and flies a speed-capped, collision-guarded path around it (subject: almost a full circle; scene: lateral survey rows for side coverage) |
 | **Meridian Geometry (Enndee)** | `Enndee_MeridianGeometry` | Run VGGT geometry preview; optionally repeat the first frame to a connected custom path's required length |
+| **Meridian Camera Path LLM (Enndee)** | `Enndee_MeridianCameraPathLLM` | Author a custom camera path with a local vision LLM (LM Studio / Ollama): describe the move in plain language, the LLM sees the still + depth map and outputs an orbit trajectory, and the node renders it into a `MERIDIAN_CAMERA_PATH` signal using the real pivot/framing geometry |
 | **Lichtfeld Headless Trainer (Enndee)** | `Enndee_LichtfeldHeadlessTrainer` | Start configurable Lichtfeld Studio Gaussian-splat training from a tracker dataset and export the result as .ply, .sog or .spz |
 | **Standby On Signal (Enndee)** | `Enndee_StandbyOnSignal` | Puts the PC into S3 standby when the workflow reaches the node and the ComfyUI queue is empty (last queued prompt) |
 | **Sharpness Analyzer (Enndee)** | `Enndee_SharpnessAnalyzer` | Laplacian-variance sharpness score for every frame of an IMAGE batch |
@@ -374,6 +375,54 @@ the node decodes its first frame. Repeated stills do not add observed backside
 geometry - the back-facing views are depth reprojections - so inspect the render
 for holes or stretching before feeding it to H3. Restart ComfyUI after updating
 the node pack to register the new node.
+
+## Node: Meridian Camera Path LLM (Enndee)
+
+Author a **custom camera path** with a **local vision LLM** (LM Studio or Ollama). You describe the
+move in plain language ("rotate 180 around the subject, lift up a bit, and rotate back toward the
+starting side"), and a vision LLM - shown the still and its depth map - turns it into an orbit
+trajectory. The node then renders that plan into a valid `MERIDIAN_CAMERA_PATH` signal using the real
+geometry (the subject's pivot + framing orbit radius from the depth profile, in the same median-depth
+units the auto-camera emits), so its `custom_camera` output plugs straight into **Meridian Geometry**.
+
+The LLM does the creative work (reading the scene, translating the instruction); the node does the
+precise 3D placement. The LLM never emits raw xyz - it emits **orbit-space keyframes** (`azimuth` /
+`elevation` / `distance` around the subject), which are robust to scene scale and always keep the
+subject framed and aimed at.
+
+### Inputs (required)
+- **instruction** - the camera move in plain language.
+- **frames** - output frame count (73/90/107/124/141/158/175/243; match the sampler).
+- **provider** - `lmstudio` (OpenAI-compatible, default `http://localhost:1234/v1`) or `ollama`
+  (`http://localhost:11434`).
+- **base_url** / **model** / **api_key** - the local server endpoint and a loaded **vision** model
+  (e.g. `qwen2.5-vl`, `llava`, `gemma3`). `api_key` is optional (Ollama ignores it).
+- **fill_percent** - how large the subject is framed at `distance` 1.0; the plan's `distance`
+  multiplies this framing radius.
+- **temperature** / **max_tokens** - sampling.
+
+### Inputs (optional)
+- **image** - the still (RGB); sent to the LLM and used for geometry.
+- **depth** - the depth map of the still (grayscale); sent to the LLM and used to place the camera.
+- **subject_mask** - optional subject mask (white = subject) for a more accurate pivot.
+- **depth_convention** - how to read the depth image (`brighter = closer` / `brighter = farther`).
+
+### Outputs
+- **custom_camera** - the `MERIDIAN_CAMERA_PATH` signal → Meridian Geometry's `custom_camera`.
+- **plan** - the sanitized JSON keyframe plan the LLM produced (for inspection / editing).
+- **raw** - the raw model reply (debugging).
+- **system_prompt** - the full system prompt used (inspect or copy it).
+
+### The system prompt
+The node embeds a complete, reusable system prompt (also exposed on the `system_prompt` output) that
+teaches the LLM: its role as a virtual cinematographer; the orbit-space camera model (azimuth /
+elevation / distance, aim at the pivot, **no roll / no flip**); hard constraints (elevation ±70° for
+gimbal safety, distance 0.5–3×, exact frame count, key spacing, continuous motion); how to read the
+depth map (prefer orbits that reveal dimensionality, avoid empty rear orbits on flat backgrounds);
+how to translate verbs ("orbit N degrees", "lift up", "push in", "rotate back"); a strict JSON schema;
+and a worked example. The per-run bits (instruction, frame count, depth convention, the two images)
+ride in the user turn.
+
 
 ## Node: Lichtfeld Headless Trainer (Enndee)
 

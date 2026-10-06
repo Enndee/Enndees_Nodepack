@@ -86,6 +86,12 @@ except Exception as _e:
     print(f"\033[31m[Enndee] MeridianPromptComposer unavailable: {_e}\033[0m")
     MeridianPromptComposer = None
 
+try:
+    from enndee_meridian_camera_path_llm import Enndee_MeridianCameraPathLLM
+except Exception as _e:
+    print(f"\033[31m[Enndee] MeridianCameraPathLLM unavailable: {_e}\033[0m")
+    Enndee_MeridianCameraPathLLM = None
+
 # COLMAP for Lichtfeld: the GLOMAP tracker through COLMAP's native Python API
 # (pycolmap) - no COLMAP/GLOMAP binaries are downloaded.
 try:
@@ -156,6 +162,10 @@ if Enndee_SharpFrameSelector is not None:
 if MeridianPromptComposer is not None:
     NODE_CLASS_MAPPINGS["MeridianPromptComposer"] = MeridianPromptComposer
     NODE_DISPLAY_NAME_MAPPINGS["MeridianPromptComposer"] = "Meridian Prompt Composer (conditional pictures)"
+
+if Enndee_MeridianCameraPathLLM is not None:
+    NODE_CLASS_MAPPINGS["Enndee_MeridianCameraPathLLM"] = Enndee_MeridianCameraPathLLM
+    NODE_DISPLAY_NAME_MAPPINGS["Enndee_MeridianCameraPathLLM"] = "Meridian Camera Path LLM (Enndee)"
 
 if ColmapLichtfeldTracker is not None:
     NODE_CLASS_MAPPINGS["Enndee_ColmapLichtfeldTracker"] = ColmapLichtfeldTracker
