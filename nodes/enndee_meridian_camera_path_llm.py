@@ -426,7 +426,7 @@ class Enndee_MeridianCameraPathLLM:
                 }),
             },
         }
-    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING")
+    RETURN_TYPES = (CAMERA_SIGNAL_TYPE, "STRING", "STRING", "STRING")
     RETURN_NAMES = ("custom_camera", "plan", "raw", "system_prompt")
     FUNCTION = "generate"
     CATEGORY = "🧪AILab/🎬 Meridian"

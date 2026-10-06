@@ -110,6 +110,13 @@ class MeridianCameraPathLLMTests(unittest.TestCase):
         parsed = _parse_custom_camera(signal)   # raises if the signal is malformed
         self.assertIsNotNone(parsed)
 
+    def test_custom_camera_socket_type_matches_the_geometry_input(self):
+        """The output must carry the same custom type as the Geometry node's input, or it won't wire."""
+        from enndee_meridian_geometry import EnndeeMeridianGeometry
+        geometry_input = EnndeeMeridianGeometry.INPUT_TYPES()["optional"]["custom_camera"][0]
+        self.assertEqual(Enndee_MeridianCameraPathLLM.RETURN_TYPES[0], geometry_input)
+        self.assertEqual(Enndee_MeridianCameraPathLLM.RETURN_TYPES[0], llm.CAMERA_SIGNAL_TYPE)
+
     def test_base_url_is_normalized_per_provider(self):
         norm = llm._normalize_base_url
         # the exact bug: provider=ollama with the LM Studio URL produced /v1/api/chat on the wrong port
