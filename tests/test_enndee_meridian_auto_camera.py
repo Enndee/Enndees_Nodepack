@@ -99,7 +99,9 @@ from enndee_meridian_auto_camera import (  # noqa: E402
     _spiral_sweep,
     SPIRAL_COVERAGE,
     SPIRAL_ELEVATION_CEILING,
-    SPIRAL_END_ARC,
+    SPIRAL_END_ARC_DEFAULT,
+    SPIRAL_END_ARC_MAX,
+    SPIRAL_END_ARC_MIN,
     SPIRAL_END_DEFAULT,
     SPIRAL_END_MAX,
     SPIRAL_END_MIN,
@@ -110,6 +112,7 @@ from enndee_meridian_auto_camera import (  # noqa: E402
     spiral_clock,
     spiral_pose,
     resolve_spiral_end,
+    resolve_spiral_end_arc,
     resolve_spiral_slope,
 )
 import enndee_meridian_auto_camera as auto_camera  # noqa: E402  (module state: the active winding)
@@ -1684,9 +1687,9 @@ class AutoCameraSpiralCoverageTests(unittest.TestCase):
         """phi = 0 at the FIRST frame, 90 (a side view of the picture) at the END - the spec."""
         self.assertEqual(_spiral_point(0.0, 0.0), (0.0, 0.0))      # the middle of the picture
         self.assertAlmostEqual(spiral_arc(*_spiral_point(0.25, 0.0)),
-                               SPIRAL_END_ARC * 0.25, places=6)     # and it climbs linearly
+                               SPIRAL_END_ARC_DEFAULT * 0.25, places=6)     # and it climbs linearly
         end_yaw, end_elevation = _spiral_point(1.0, 0.0)
-        self.assertAlmostEqual(spiral_arc(end_yaw, end_elevation), SPIRAL_END_ARC, places=6)
+        self.assertAlmostEqual(spiral_arc(end_yaw, end_elevation), SPIRAL_END_ARC_DEFAULT, places=6)
         # phi = 90 is the picture's own plane: the camera looks at the scene from the side, whatever
         # the winding - the end elevation follows from the winding alone.
         self.assertAlmostEqual(abs(end_yaw), 90.0, places=6)
@@ -1702,7 +1705,7 @@ class AutoCameraSpiralCoverageTests(unittest.TestCase):
                 self._with_winding(winding)
                 self.assertAlmostEqual(_spiral_sweep(), winding, places=6)
                 yaw, elevation = _spiral_point(1.0, 0.0)
-                self.assertAlmostEqual(spiral_arc(yaw, elevation), SPIRAL_END_ARC, places=6)
+                self.assertAlmostEqual(spiral_arc(yaw, elevation), SPIRAL_END_ARC_DEFAULT, places=6)
                 self.assertAlmostEqual(abs(yaw), 90.0, places=6)     # always a side view
                 self.assertAlmostEqual(
                     elevation, math.degrees(math.asin(math.cos(math.radians(winding)))), places=6)
@@ -1743,11 +1746,11 @@ class AutoCameraSpiralCoverageTests(unittest.TestCase):
         above = _spiral_point(0.0, 0.0, 1.0, SPIRAL_SLOPE_MAX)
         self.assertEqual(above, (0.0, SPIRAL_ELEVATION_CEILING))
         self.assertAlmostEqual(spiral_arc(*above, slope_degrees=SPIRAL_SLOPE_MAX),
-                               SPIRAL_END_ARC - SPIRAL_ELEVATION_CEILING, places=6)
+                               SPIRAL_END_ARC_DEFAULT - SPIRAL_ELEVATION_CEILING, places=6)
         self.assertAlmostEqual(spiral_arc(*spiral_pose(0.0, 0.0, SPIRAL_SLOPE_MAX),
                                           slope_degrees=SPIRAL_SLOPE_MAX), 0.0, places=6)
         end = _spiral_point(1.0, 0.0, 1.0, SPIRAL_SLOPE_MAX)
-        self.assertAlmostEqual(spiral_arc(*end, slope_degrees=SPIRAL_SLOPE_MAX), SPIRAL_END_ARC,
+        self.assertAlmostEqual(spiral_arc(*end, slope_degrees=SPIRAL_SLOPE_MAX), SPIRAL_END_ARC_DEFAULT,
                                places=4)
         below = _spiral_point(0.0, 0.0, 1.0, SPIRAL_SLOPE_MIN)
         self.assertEqual(below, (0.0, -SPIRAL_ELEVATION_CEILING))
@@ -1773,7 +1776,7 @@ class AutoCameraSpiralCoverageTests(unittest.TestCase):
         self.assertAlmostEqual(samples[0][1], pivot[1] - distance * math.sin(math.radians(60.0)),
                                places=4)                       # the opening frame is high above
         self.assertAlmostEqual(
-            spiral_arc(*_orbit_angles(samples[-1], pivot), slope_degrees=60.0), SPIRAL_END_ARC,
+            spiral_arc(*_orbit_angles(samples[-1], pivot), slope_degrees=60.0), SPIRAL_END_ARC_DEFAULT,
             places=4)
 
     def test_arc_rises_monotonically_and_the_clock_winds(self):
@@ -1781,7 +1784,7 @@ class AutoCameraSpiralCoverageTests(unittest.TestCase):
         points = [_spiral_point(index / steps, 0.0) for index in range(steps + 1)]
         arcs = [spiral_arc(yaw, elevation) for yaw, elevation in points]
         self.assertEqual(arcs, sorted(arcs))                      # the arc never turns back
-        self.assertAlmostEqual(arcs[-1], SPIRAL_END_ARC, places=6)
+        self.assertAlmostEqual(arcs[-1], SPIRAL_END_ARC_DEFAULT, places=6)
         # unwrap the clock angle: the spiral winds the whole sweep, counter-clockwise (falling)
         clocks = [spiral_clock(yaw, elevation) for yaw, elevation in points]
         unwrapped = [clocks[0]]
@@ -1810,7 +1813,7 @@ class AutoCameraSpiralCoverageTests(unittest.TestCase):
             self.assertAlmostEqual(math.dist(sample, pivot), 5.0, places=6)
         angles = [_orbit_angles(sample, pivot) for sample in samples]
         self.assertAlmostEqual(spiral_arc(*angles[0]), 0.0, places=4)      # the front pose
-        self.assertAlmostEqual(spiral_arc(*angles[-1]), SPIRAL_END_ARC, places=4)
+        self.assertAlmostEqual(spiral_arc(*angles[-1]), SPIRAL_END_ARC_DEFAULT, places=4)
 
     def test_the_fit_never_shortens_the_winding(self):
         """The Spiral End parameter is flown as asked - the fit reports the drift, it does not cut."""
@@ -1828,65 +1831,75 @@ class AutoCameraSpiralCoverageTests(unittest.TestCase):
         self.assertEqual(len(samples), 73)
         arcs = [spiral_arc(*_orbit_angles(sample, pivot)) for sample in samples]
         self.assertAlmostEqual(arcs[0], 0.0, places=4)
-        self.assertAlmostEqual(arcs[-1], SPIRAL_END_ARC, places=4)
+        self.assertAlmostEqual(arcs[-1], SPIRAL_END_ARC_DEFAULT, places=4)
         self.assertGreater(drift, 0.0)                 # measured, so the console can name the price
         self.assertGreater(drift, tiny)                # ... and it *is* over the cap: no silent cut
 
-    def test_the_frames_are_spaced_evenly_along_the_spiral(self):
-        """One constant camera speed along the path - that is what keeps the path itself steady."""
+    def test_the_o_orbit_angle_grows_evenly_along_the_path(self):
+        """O-orbits like in the Front-only setting, their angle growing 0 -> the end angle."""
         surface = probe_surface(_reference(), depth_fn=lambda reference: _depth_with_subject())
-        distance, pivot, metrics = subject_framing(surface, 40.0)
-        pool = _decimate(surface["content_cloud"], DRIFT_POOL)
-        cap = 0.5 * metrics["radius_px"]                 # a generous cap: the geometry is the limit
-        steady = subject_samples(73, pivot, distance, 1.0, 1.0, None, ORBIT_DIRECTION_DEFAULT,
-                                 coverage=SPIRAL_COVERAGE, motion_pool=pool, motion_surface=surface,
-                                 motion_cap=cap)
-        self.assertEqual(len(steady), 73)
-        for sample in steady:                            # every pose keeps the one distance
+        distance, pivot, _metrics = subject_framing(surface, 40.0)
+        samples = subject_samples(73, pivot, distance, 1.0, 1.0, None, ORBIT_DIRECTION_DEFAULT,
+                                  coverage=SPIRAL_COVERAGE)
+        self.assertEqual(len(samples), 73)
+        for sample in samples:                            # every pose keeps the one distance
             self.assertAlmostEqual(math.dist(sample, pivot), distance, places=6)
-        travel = [math.dist(steady[index - 1], steady[index]) for index in range(1, 73)]
-        frontal = [math.hypot(steady[index][0] - steady[index - 1][0],
-                              steady[index][1] - steady[index - 1][1]) for index in range(1, 73)]
-        # ... and the steps are even: the drift-even split this replaced swung 17x on the 175 frame
-        # example, which is what read as a jagged polygon (the 1.2 here is the *chord* of a curving
-        # path, not a speed difference)
-        self.assertLess(max(travel) / min(travel), 1.25)
-        self.assertLess(max(frontal) / min(frontal), 1.25)
-        # the *linear* parameter (phi and psi both linear) is the uneven one it has to beat
-        linear = [_place(pivot, distance, *_spiral_point(index / 72, 0.0))
-                  for index in range(73)]
-        linear_travel = [math.dist(linear[index - 1], linear[index]) for index in range(1, 73)]
-        self.assertLess(max(travel) / min(travel), max(linear_travel) / min(linear_travel) / 2.0)
+        arcs = [spiral_arc(*_orbit_angles(sample, pivot)) for sample in samples]
+        self.assertAlmostEqual(arcs[0], 0.0, places=6)    # the family's first O-orbit: the axis
+        self.assertAlmostEqual(arcs[-1], SPIRAL_END_ARC_DEFAULT, places=4)
+        # ... and the angle grows LINEARLY along the path - that is what "growing along the path"
+        # means, and neither the speed cap nor any motion split may reshape it
+        step = SPIRAL_END_ARC_DEFAULT / 72.0
+        for index in range(1, 73):
+            self.assertAlmostEqual(arcs[index] - arcs[index - 1], step, places=3)
 
-    def test_the_speed_cap_slows_the_path_where_the_picture_is_sensitive(self):
-        """The cap is an upper bound, not a target: the path slows down, it never races to hit it."""
+    def test_the_end_angle_is_the_parameter(self):
+        """Spiral End Angle is the O-orbit family's last radius - flown as asked, whatever it is."""
+        pivot = [0.0, 0.0, 3.0]
+        previous_slope = auto_camera._ACTIVE_SPIRAL_SLOPE
+        auto_camera._ACTIVE_SPIRAL_SLOPE = 0.0
+        self.addCleanup(setattr, auto_camera, "_ACTIVE_SPIRAL_SLOPE", previous_slope)
+        for arc in (20.0, 45.0, 75.0, 90.0):
+            with self.subTest(arc=arc):
+                previous = auto_camera._ACTIVE_SPIRAL_END_ARC
+                auto_camera._ACTIVE_SPIRAL_END_ARC = arc
+                self.addCleanup(setattr, auto_camera, "_ACTIVE_SPIRAL_END_ARC", previous)
+                samples = subject_samples(73, pivot, 5.0, 1.0, 1.0, None, ORBIT_DIRECTION_DEFAULT,
+                                          coverage=SPIRAL_COVERAGE, spiral_slope=0.0)
+                arcs = [spiral_arc(*_orbit_angles(sample, pivot)) for sample in samples]
+                # the O-orbit angle grows along the path from the axis out to the end angle: the
+                # first frame is the frontal pose (on the axis) and the last one is the end angle
+                self.assertLess(arcs[0], 1.0)                 # starts on (or within a hair of) the axis
+                self.assertAlmostEqual(arcs[-1], arc, places=4)   # ... and ends on the end angle
+                self.assertEqual(arcs, sorted(arcs))          # the angle never turns back
+
+    def test_resolve_spiral_end_arc_clamps(self):
+        self.assertEqual(resolve_spiral_end_arc(None), SPIRAL_END_ARC_DEFAULT)
+        self.assertEqual(resolve_spiral_end_arc(0), SPIRAL_END_ARC_MIN)      # no spiral at all
+        self.assertEqual(resolve_spiral_end_arc(180), SPIRAL_END_ARC_MAX)    # the picture's plane
+        self.assertEqual(resolve_spiral_end_arc(45), 45.0)
+        self.assertEqual(auto_camera.spiral_end_arc(), SPIRAL_END_ARC_DEFAULT)
+
+    def test_the_drift_is_reported_not_fitted_away(self):
+        """The winding and the end angle stay what the widgets asked for; the drift is *named*."""
         surface = probe_surface(_reference(), depth_fn=lambda reference: _depth_with_subject())
         distance, pivot, metrics = subject_framing(surface, 40.0)
         pool = _decimate(surface["content_cloud"], DRIFT_POOL)
-        # 175 frames is a case the cap can pay for; 73 frames x 840 deg is over budget whatever the
-        # speed, and that path is *reported* (the console names the overshoot), not slowed down.
-        cap = 0.07 * metrics["radius_px"]
-        steady = subject_samples(175, pivot, distance, 1.0, 1.0, None, ORBIT_DIRECTION_DEFAULT,
-                                 coverage=SPIRAL_COVERAGE, motion_pool=pool, motion_surface=surface,
-                                 motion_cap=cap)
-        self.assertLessEqual(subject_drift(pool, steady, pivot, surface)[0], cap + 1e-6)
-        travel = [math.dist(steady[index - 1], steady[index]) for index in range(1, 175)]
-        self.assertGreater(max(travel) / min(travel), 1.05)     # it gives way where the picture is
-        # ... and the ends are the path's own ends either way
-        plain = subject_samples(175, pivot, distance, 1.0, 1.0, None, ORBIT_DIRECTION_DEFAULT,
-                                coverage=SPIRAL_COVERAGE)
-        for index in (0, -1):
-            for axis in range(3):
-                self.assertAlmostEqual(steady[index][axis], plain[index][axis], places=6)
+        # a deliberately tiny cap: the old ladder would have cut the spiral to a fraction of a round
+        tiny = 0.02 * metrics["radius_px"]
+        samples = subject_samples(73, pivot, distance, 1.0, 1.0, None, ORBIT_DIRECTION_DEFAULT,
+                                  coverage=SPIRAL_COVERAGE)
+        drift, _typical = subject_drift(pool, samples, pivot, surface)
+        self.assertGreater(drift, tiny)                   # over the cap - and reported, not cut
+        arcs = [spiral_arc(*_orbit_angles(sample, pivot)) for sample in samples]
+        self.assertAlmostEqual(arcs[-1], SPIRAL_END_ARC_DEFAULT, places=4)   # the path is flown
 
     def test_the_keys_follow_the_spiral_s_turning(self):
         """The renderer splines the keys, so they sit where the path bends - not every Nth frame."""
         surface = probe_surface(_reference(), depth_fn=lambda reference: _depth_with_subject())
         distance, pivot, _metrics = subject_framing(surface, 40.0)
-        pool = _decimate(surface["content_cloud"], DRIFT_POOL)
         samples = subject_samples(175, pivot, distance, 1.0, 1.0, None, ORBIT_DIRECTION_DEFAULT,
-                                  coverage=SPIRAL_COVERAGE, motion_pool=pool, motion_surface=surface,
-                                  motion_cap=0.5 * _metrics["radius_px"])
+                                  coverage=SPIRAL_COVERAGE)
         ticks = _spiral_key_frames(samples, 175)
         self.assertEqual(ticks[0], 0)
         self.assertEqual(ticks[-1], 174)
@@ -1899,24 +1912,21 @@ class AutoCameraSpiralCoverageTests(unittest.TestCase):
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs a CUDA device")
     def test_the_spiral_spacing_survives_a_cuda_surface(self):
-        """A depth model on the GPU hands us CUDA points - the sampler must not mix devices.
+        """A depth model on the GPU hands us CUDA points - the estimate must not mix devices.
 
-        `torch.linspace` always builds on the CPU, while the pool (and with it the measured drift)
-        lives on `cuda:0` when the depth map came from a CUDA model. That combination is a hard
-        RuntimeError in `torch.searchsorted`: "got self is on cpu, different from other tensors on
-        cuda:0" (`self` is ATen's name for the *values* argument).
+        `torch.linspace` always builds on the CPU while the pool lives on `cuda:0` when the depth map
+        came from a CUDA model. That combination is a hard RuntimeError in `torch.searchsorted`:
+        "got self is on cpu, different from other tensors on cuda:0" (`self` is ATen's name for the
+        *values* argument).
         """
         surface = probe_surface(_reference(), depth_fn=lambda reference: _depth_with_subject())
         surface = {key: value.cuda() if torch.is_tensor(value) else value
                    for key, value in surface.items()}
-        distance, pivot, metrics = subject_framing(surface, 40.0)
-        pool = _decimate(surface["content_cloud"], DRIFT_POOL)
-        self.assertTrue(pool.is_cuda)                       # the fixture really is on the GPU
-        steady = subject_samples(73, pivot, distance, 1.0, 1.0, None, ORBIT_DIRECTION_DEFAULT,
-                                 coverage=SPIRAL_COVERAGE, motion_pool=pool, motion_surface=surface,
-                                 motion_cap=0.5 * metrics["radius_px"])
-        self.assertEqual(len(steady), 73)
-        self.assertAlmostEqual(math.dist(steady[-1], pivot), distance, places=6)
+        distance, pivot, _metrics = subject_framing(surface, 40.0)
+        samples = subject_samples(73, pivot, distance, 1.0, 1.0, None, ORBIT_DIRECTION_DEFAULT,
+                                  coverage=SPIRAL_COVERAGE)
+        self.assertEqual(len(samples), 73)
+        self.assertAlmostEqual(math.dist(samples[-1], pivot), distance, places=6)
         # ... and the full entry point the node calls, with a CUDA image *and* a CUDA depth map
         depth = _depth_with_subject().cuda()
         signal, summary = estimate_camera_path(_reference().cuda(), 73, target=SUBJECT_TARGET,
@@ -1943,30 +1953,30 @@ class AutoCameraSpiralCoverageTests(unittest.TestCase):
         self.assertEqual(info["amplitude_scale"], 1.0)
         self.assertFalse(info["back_orbit"])
         self.assertEqual(info["lap_span"], 0.0)
-        self.assertEqual(info["spiral_end_arc"], SPIRAL_END_ARC)
+        self.assertEqual(info["spiral_end_arc"], SPIRAL_END_ARC_DEFAULT)
         self.assertAlmostEqual(info["spiral_end_elevation"], -30.0, places=6)
         self.assertEqual(info["drift_cap_px"], float(cap))
         # the emitted keys really leave the view axis and reach the picture's own plane
         arcs = [spiral_arc(*_orbit_angles(key["pos"], pivot)) for key in keys]
         self.assertGreater(max(arcs), 45.0)
-        self.assertAlmostEqual(max(arcs), SPIRAL_END_ARC, delta=1e-4)
+        self.assertAlmostEqual(max(arcs), SPIRAL_END_ARC_DEFAULT, delta=1e-4)
         # the room/fill envelope sees the spiral's own poses, not the front O's
         envelope = _envelope_angles(1.0, coverage=SPIRAL_COVERAGE)
         self.assertEqual(len(envelope), 5)
         envelope_arcs = [spiral_arc(yaw, elevation) for yaw, elevation in envelope]
         self.assertEqual(envelope_arcs, sorted(envelope_arcs))
-        self.assertAlmostEqual(envelope_arcs[-1], SPIRAL_END_ARC, places=6)
+        self.assertAlmostEqual(envelope_arcs[-1], SPIRAL_END_ARC_DEFAULT, places=6)
 
     def test_estimate_describes_the_spherical_spiral(self):
         document, summary = _estimate(_depth_with_subject(), coverage=SPIRAL_COVERAGE)
         description = json.loads(document)["description"]
         self.assertIn("spherical spiral", description)
-        self.assertIn("from the side", description)
+        self.assertIn("side view of the picture", description)
         self.assertIn(f"{SPIRAL_END_DEFAULT:g} deg", description)
         self.assertNotIn("the front O", description)
         self.assertEqual(summary.get("coverage"), SPIRAL_COVERAGE)
         self.assertAlmostEqual(summary.get("spiral_end_deg"), SPIRAL_END_DEFAULT, places=6)
-        self.assertAlmostEqual(summary.get("spiral_end_arc_deg"), SPIRAL_END_ARC, places=6)
+        self.assertAlmostEqual(summary.get("spiral_end_arc_deg"), SPIRAL_END_ARC_DEFAULT, places=6)
         self.assertAlmostEqual(summary.get("spiral_end_elevation_deg"), -30.0, places=6)
 
     def test_the_spiral_slope_widget_rides_through_the_entry_point(self):

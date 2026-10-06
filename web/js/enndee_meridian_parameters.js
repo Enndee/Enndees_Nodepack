@@ -25,7 +25,7 @@ const SPIRAL_SWEEP_PANEL = ["path_start_yaw", "path_target_yaw", "path_spiral_st
 const PATH_SHARED = ["path_camera_mode", "path_dolly", "path_pivot_x", "path_pivot_y", "path_pivot_z"];
 const PATH_PIVOTS = ["path_pivot_x", "path_pivot_y", "path_pivot_z"];
 const PATH_PANEL = [...O_ORBIT_PANEL, ...HEIGHT_SWEEP_PANEL, ...SPIRAL_SWEEP_PANEL, ...PATH_SHARED];
-const AUTO_PANEL = ["auto_target", "auto_max_speed", "auto_path_mode", "auto_subject_fill", "auto_orbit_view_angle", "auto_orbit_coverage", "auto_orbit_direction", "auto_pivot_x", "auto_pivot_y", "auto_pivot_z", "auto_orbit_angle", "spiral_end"];
+const AUTO_PANEL = ["auto_target", "auto_max_speed", "auto_path_mode", "auto_subject_fill", "auto_orbit_view_angle", "auto_orbit_coverage", "auto_orbit_direction", "auto_pivot_x", "auto_pivot_y", "auto_pivot_z", "auto_orbit_angle", "spiral_end", "spiral_slope"];
 // Deprecated widgets: never visible (the saved value survives in the graph, the backend ignores it).
 // `auto_orbit_distance` was the fixed camera stand-off; the distance follows Auto Subject Fill now.
 // `auto_orbit_end` was where the concluding orbit stopped and `auto_orbit_size` scaled the O - the
@@ -91,33 +91,55 @@ function finishVisibilityUpdate(node) {
   app.graph?.setDirtyCanvas?.(true, true);
 }
 
-// The Auto Orbit Angle slot doubles as the Spiral Center Slope inside the Spiral coverage: the
-// label and the slider range follow the coverage, so the widget always reads as what it does right
-// now (the value itself is kept - the backend clamps each meaning to its own window). The ranges
-// must stay in sync with FRONT_ORBIT_ANGLE_MIN / FRONT_ORBIT_LIMIT and SPIRAL_SLOPE_MIN / _MAX in
-// enndee_meridian_auto_camera.py, the label with the widget's tooltip in
+// The Auto Orbit Angle slot doubles as the Spiral End Angle inside the Spiral coverage: the label
+// and the slider range follow the coverage, so the widget always reads as what it does right now
+// (the value itself is kept - the backend clamps each meaning to its own window; the panel only
+// nudges a value that is still the other mode's *default*). The ranges must stay in sync with
+// FRONT_ORBIT_ANGLE_MIN / FRONT_ORBIT_LIMIT and SPIRAL_END_ARC_MIN / _MAX in
+// enndee_meridian_auto_camera.py, the labels with the widget tooltips in
 // enndee_meridian_parameters.py.
 const SPIRAL_COVERAGE = "Spiral";
 const SHARED_ANGLE_WIDGET = "auto_orbit_angle";
 const ORBIT_ANGLE_LABEL = "O Orbit Angle";
 const ORBIT_ANGLE_RANGE = [5, 60];
+const ORBIT_ANGLE_DEFAULT = 45;
+const SPIRAL_END_ANGLE_LABEL = "Spiral End Angle";
+const SPIRAL_END_ANGLE_RANGE = [5, 90];
+const SPIRAL_END_ANGLE_DEFAULT = 90;
+const SPIRAL_WINDING_LABEL = "Spiral Winding";
 const SPIRAL_SLOPE_LABEL = "Spiral Center Slope";
-const SPIRAL_SLOPE_RANGE = [-90, 90];
 
-function setSharedAngleWidget(node, spiral) {
-  const widget = findWidget(node, SHARED_ANGLE_WIDGET);
-  if (!widget) return false;
-  const label = spiral ? SPIRAL_SLOPE_LABEL : ORBIT_ANGLE_LABEL;
-  const [low, high] = spiral ? SPIRAL_SLOPE_RANGE : ORBIT_ANGLE_RANGE;
+function setSpiralLabels(node, spiral) {
   let changed = false;
-  if (widget.label !== label) {
-    widget.label = label;
-    changed = true;
+  const shared = findWidget(node, SHARED_ANGLE_WIDGET);
+  if (shared) {
+    const label = spiral ? SPIRAL_END_ANGLE_LABEL : ORBIT_ANGLE_LABEL;
+    const [low, high] = spiral ? SPIRAL_END_ANGLE_RANGE : ORBIT_ANGLE_RANGE;
+    if (shared.label !== label) {
+      shared.label = label;
+      changed = true;
+    }
+    if (shared.options && (shared.options.min !== low || shared.options.max !== high)) {
+      shared.options.min = low;
+      shared.options.max = high;
+      changed = true;
+    }
+    // A value still sitting on the *other* mode's default is not a user choice: carry it to this
+    // mode's default so picking Spiral opens on the full 90 deg spiral, and leaving it restores 45.
+    const fallback = spiral ? SPIRAL_END_ANGLE_DEFAULT : ORBIT_ANGLE_DEFAULT;
+    const stranded = spiral ? ORBIT_ANGLE_DEFAULT : SPIRAL_END_ANGLE_DEFAULT;
+    if (Number(shared.value) === stranded && Number(shared.value) !== fallback) {
+      shared.value = fallback;
+      changed = true;
+    }
   }
-  if (widget.options && (widget.options.min !== low || widget.options.max !== high)) {
-    widget.options.min = low;
-    widget.options.max = high;
-    changed = true;
+  for (const [name, label] of [["spiral_end", SPIRAL_WINDING_LABEL],
+                               ["spiral_slope", SPIRAL_SLOPE_LABEL]]) {
+    const widget = findWidget(node, name);
+    if (widget && widget.label !== label) {
+      widget.label = label;
+      changed = true;
+    }
   }
   return changed;
 }
@@ -149,8 +171,9 @@ function applyVisibility(node) {
       changed = true;
     }
   }
-  // The shared angle widget reads as the Spiral Center Slope while the Spiral coverage is picked.
-  if (automatic && setSharedAngleWidget(
+  // The shared angle widget reads as the Spiral End Angle while the Spiral coverage is picked (and
+  // the spiral's own widgets get their labels).
+  if (automatic && setSpiralLabels(
         node, String(findWidget(node, "auto_orbit_coverage")?.value) === SPIRAL_COVERAGE)) {
     changed = true;
   }

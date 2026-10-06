@@ -67,7 +67,9 @@ from enndee_meridian_auto_camera import (
     ORBIT_VIEW_ANGLE_MAX,
     ORBIT_VIEW_ANGLE_MIN,
     SCENE_FILL,
-    SPIRAL_END_ARC,
+    SPIRAL_END_ARC_DEFAULT,
+    SPIRAL_END_ARC_MAX,
+    SPIRAL_END_ARC_MIN,
     SPIRAL_END_DEFAULT,
     SPIRAL_END_MAX,
     SPIRAL_END_MIN,
@@ -140,7 +142,7 @@ AUTO_WIDGET_NAMES = ("auto_target", "auto_max_speed", "auto_path_mode", "auto_su
                      "auto_orbit_distance", "auto_orbit_size", "auto_orbit_end",
                      "auto_orbit_direction", "auto_orbit_view_angle", "auto_orbit_coverage",
                      "auto_pivot_x", "auto_pivot_y", "auto_pivot_z", "auto_orbit_angle",
-                     "spiral_end")
+                     "spiral_end", "spiral_slope")
 
 
 def build_meridian_arguments(output_frames):
@@ -416,25 +418,31 @@ class MeridianParametersAndCamera:
                         f"whole loop CLOCKWISE: 9 -> 12 (over the subject's back head) -> 3 (the far "
                         f"level point) -> 6 (under the back) -> 8, one hour short of its start so no "
                         f"frame is shown twice - the clip shows both sides without a full lap. "
-                        f"'{ORBIT_COVERAGES[2]}' flies a SPHERICAL SPIRAL instead: the camera "
-                        f"travels on a sphere around the pivot (its centre) along a spiral that "
-                        f"unwinds out of the view axis. It starts on the framed front pose - the "
-                        f"camera ON the view axis, looking straight at the picture (the middle of "
-                        f"the frame), phi = 0 - and phi reaches {SPIRAL_END_ARC:g} deg at the END of "
-                        f"the path, i.e. the camera ends up IN the picture's own plane and the clip "
-                        f"finishes with a side view of the picture. While phi climbs, psi - the clock "
-                        f"angle around that axis - winds from 0 to the 'Spiral End' value in the Auto "
-                        f"Orbit Direction (counter-clockwise by default), so {SPIRAL_END_DEFAULT:g} "
-                        f"deg (the default) is two and a third rounds: the front, every side and the "
-                        f"top are covered on the way. The winding alone decides where in the "
-                        f"picture's plane the last frame looks from (with {SPIRAL_END_DEFAULT:g} deg "
-                        f"it is 30 deg BELOW the pivot; 810 deg would end level on the side) - the "
-                        f"console line names the end pose. The spiral's frames follow the measured "
-                        f"subject motion, so the steep passes over/under the subject do not eat the "
-                        f"speed budget. Auto "
-                        f"Max Speed never shortens the spiral (the winding is your parameter, not the "
-                        f"fit's): the console line reports the per-frame drift against the cap "
-                        f"instead, so more Output Frames or a higher Auto Max Speed are the levers."
+                        f"'{ORBIT_COVERAGES[2]}' flies the O-ORBIT FAMILY as a SPHERICAL SPIRAL "
+                        f"instead: the camera travels on a sphere around the pivot (its centre) along "
+                        f"the circles the '{ORBIT_COVERAGES[0]}' coverage flies, their angle growing "
+                        f"evenly along the path. It starts on the framed front pose - the camera ON "
+                        f"the view axis, looking straight at the picture (the middle of the frame), "
+                        f"the O-orbit's angle 0 - and that angle reaches the 'Spiral End Angle' "
+                        f"(the Auto Orbit Angle slot, {SPIRAL_END_ARC_DEFAULT:g} deg by default) at "
+                        f"the END of the path, i.e. at {SPIRAL_END_ARC_DEFAULT:g} deg the camera ends "
+                        f"up IN the picture's own plane and the clip finishes with a side view of the "
+                        f"picture (a smaller end angle stops the spiral earlier, on a fatter "
+                        f"O-orbit). While the angle grows, the clock angle winds from 0 to the "
+                        f"'Spiral Winding' value in the Auto Orbit Direction (counter-clockwise by "
+                        f"default), so {SPIRAL_END_DEFAULT:g} deg (the default) is two and a third "
+                        f"rounds: the front, every side and the top are covered on the way. The "
+                        f"'Spiral Center Slope' leans that whole axis in the vertical plane through "
+                        f"the view axis (0 = as sketched, +90 = 'from straight above', -90 = 'from "
+                        f"straight below'). The winding alone decides where the last frame looks from "
+                        f"(with {SPIRAL_END_DEFAULT:g} deg it is 30 deg BELOW the pivot; 810 deg "
+                        f"would end level on the side) - the console line names the end pose. The "
+                        f"frames follow the parameter (the angle growing evenly along the path) and "
+                        f"the keys the renderer splines follow the path's own turning, so the path "
+                        f"reads smooth in every view. Auto Max Speed never shortens the spiral (the "
+                        f"winding and the end angle are your parameters, not the fit's): the console "
+                        f"line reports the per-frame drift against the cap instead, so more Output "
+                        f"Frames or a higher Auto Max Speed are the levers."
                     ),
                 }),
                 # The front O's angular radius, appended last (same reason as the shape widgets
@@ -442,13 +450,13 @@ class MeridianParametersAndCamera:
                 # keeps the automatic subject orbit flatter / less steep. Hidden with the automatic
                 # group by the JS panel.
                 # One widget, two meanings - the JS panel renames it per coverage: the front O's
-                # angular radius outside the Spiral coverage, the spiral's central axis lean inside
-                # it. The slider range covers both (the backend clamps to the right window per
-                # mode), so switching coverage never strands a value.
+                # angular radius outside the Spiral coverage, the Spiral End Angle (the O-orbit
+                # family's last radius) inside it. The slider range covers both (the backend clamps
+                # to the right window per mode), so switching coverage never strands a value.
                 "auto_orbit_angle": ("FLOAT", {
                     "default": round(FRONT_ORBIT_ANGLE_DEFAULT, 1),
-                    "min": min(FRONT_ORBIT_ANGLE_MIN, SPIRAL_SLOPE_MIN),
-                    "max": max(FRONT_ORBIT_LIMIT, SPIRAL_SLOPE_MAX), "step": 5.0,
+                    "min": min(FRONT_ORBIT_ANGLE_MIN, SPIRAL_END_ARC_MIN),
+                    "max": max(FRONT_ORBIT_LIMIT, SPIRAL_END_ARC_MAX), "step": 5.0,
                     "tooltip": (
                         f"Automatic camera (subject target): the front O-orbit's angular radius in "
                         f"degrees - its swing AND its rise, because the O is one circle "
@@ -460,36 +468,53 @@ class MeridianParametersAndCamera:
                         f"(up to the gimbal-safe ceiling). Clamped to "
                         f"{FRONT_ORBIT_ANGLE_MIN:g}-{FRONT_ORBIT_LIMIT:g} deg. This is the live shape "
                         f"control - Auto Orbit Size / End are deprecated. "
-                        f"IN THE '{ORBIT_COVERAGES[2]}' COVERAGE THIS WIDGET IS THE SPIRAL CENTER "
-                        f"SLOPE instead (the JS panel renames it): the angle of the spiral's central "
-                        f"rotational axis, measured in the vertical plane through the view axis. "
-                        f"{SPIRAL_SLOPE_DEFAULT:g} (the default) leaves that axis horizontal - it is "
-                        f"the view axis itself, so the spiral opens on the framed frontal view; "
-                        f"{SPIRAL_SLOPE_MAX:g} stands the axis upright ('from straight above': the "
-                        f"spiral opens straight above the subject and unwinds down to a level "
-                        f"orbit); {SPIRAL_SLOPE_MIN:g} hangs it straight below. Everything else - "
-                        f"the pivot, the camera distance and the aim - is untouched, and the value "
-                        f"is clamped to {SPIRAL_SLOPE_MIN:g}..{SPIRAL_SLOPE_MAX:g} deg."
+                        f"IN THE '{ORBIT_COVERAGES[2]}' COVERAGE THIS WIDGET IS THE SPIRAL END "
+                        f"ANGLE instead (the JS panel renames it): the spiral is the *family of "
+                        f"O-orbits* this widget measures - the O-orbit's angle grows evenly from "
+                        f"{SPIRAL_END_ARC_MIN:g} deg at the first frame to this value at the last "
+                        f"one. {SPIRAL_END_ARC_DEFAULT:g} (the default) reaches the picture's own "
+                        f"plane, so the clip ends with a side view of the picture; a smaller value "
+                        f"ends the spiral earlier, on a fatter O-orbit. The value is clamped to "
+                        f"{SPIRAL_END_ARC_MIN:g}..{SPIRAL_END_ARC_MAX:g} deg."
                     ),
                 }),
-                # The Spiral coverage's winding, appended after the O Orbit Angle (same reason: the
-                # JS panel hides it with the automatic group). Only the 'Spiral' coverage reads it.
+                # The Spiral coverage's winding and axis slope, appended after the O Orbit Angle
+                # (same reason: the JS panel hides them with the automatic group and labels them).
+                # Only the 'Spiral' coverage reads them.
                 "spiral_end": ("INT", {
                     "default": int(round(SPIRAL_END_DEFAULT)),
                     "min": int(SPIRAL_END_MIN), "max": int(SPIRAL_END_MAX), "step": 10,
                     "tooltip": (
-                        f"Automatic camera, '{ORBIT_COVERAGES[2]}' coverage: the END of the spiral "
-                        f"path - how many degrees the clock angle winds around the view axis from the "
+                        f"Automatic camera, '{ORBIT_COVERAGES[2]}' coverage: the SPIRAL WINDING - "
+                        f"how many degrees the clock angle winds around the spiral's axis from the "
                         f"first frame to the last ({SPIRAL_END_DEFAULT:g} deg by default = two and a "
-                        f"third rounds). Phi - the arc between the camera and the view axis - always "
-                        f"runs 0 -> {SPIRAL_END_ARC:g} deg over the same path, so the first frame is "
-                        f"the framed frontal view and the last one is a side view (the camera in the "
-                        f"picture's own plane). Every 360 deg adds one round; 0 flies the plain "
-                        f"quarter circle (no winding). The winding decides where in that plane the "
-                        f"last frame looks from: with {SPIRAL_END_DEFAULT:g} deg it is 30 deg below "
-                        f"the pivot, with 810 deg it ends level on the side. The fit never shortens "
-                        f"it - the console line reports the per-frame drift against Auto Max Speed "
+                        f"third rounds). The O-orbit's angle meanwhile grows evenly 0 -> the Spiral "
+                        f"End Angle (the Auto Orbit Angle slot), so the first frame is the framed "
+                        f"frontal view and the last one sits on the outermost O-orbit - at "
+                        f"{SPIRAL_END_ARC_DEFAULT:g} deg that is a side view, the camera IN the "
+                        f"picture's own plane. Every 360 deg of winding adds one round; 0 flies the "
+                        f"plain quarter circle (no winding). The winding decides where the last "
+                        f"frame looks from: with {SPIRAL_END_DEFAULT:g} deg it is 30 deg below the "
+                        f"pivot, with 810 deg it ends level on the side. The fit never shortens it - "
+                        f"the console line reports the per-frame drift against Auto Max Speed "
                         f"instead. Clamped to {SPIRAL_END_MIN:g}-{SPIRAL_END_MAX:g} deg."
+                    ),
+                }),
+                "spiral_slope": ("FLOAT", {
+                    "default": round(SPIRAL_SLOPE_DEFAULT, 1),
+                    "min": SPIRAL_SLOPE_MIN, "max": SPIRAL_SLOPE_MAX, "step": 5.0,
+                    "tooltip": (
+                        f"Automatic camera, '{ORBIT_COVERAGES[2]}' coverage: the SPIRAL CENTER "
+                        f"SLOPE - the angle of the spiral's central rotational axis in the vertical "
+                        f"plane through the view axis. {SPIRAL_SLOPE_DEFAULT:g} (the default) leaves "
+                        f"that axis horizontal, i.e. the view axis itself: the spiral is drawn in "
+                        f"the picture's plane and projected onto the sphere, so the O-orbit family "
+                        f"opens on the framed frontal view. {SPIRAL_SLOPE_MAX:g} stands the axis "
+                        f"upright ('from straight above': the spiral opens straight above the "
+                        f"subject and unwinds down to a level orbit); {SPIRAL_SLOPE_MIN:g} hangs it "
+                        f"straight below ('from straight below'). The pivot, the camera distance and "
+                        f"the aim are untouched - only the axis the O-orbit family winds around "
+                        f"moves. Clamped to {SPIRAL_SLOPE_MIN:g}..{SPIRAL_SLOPE_MAX:g} deg."
                     ),
                 }),
             },
@@ -587,15 +612,17 @@ class MeridianParametersAndCamera:
                 view_angle=float(kwargs["auto_orbit_view_angle"]),
                 coverage=kwargs["auto_orbit_coverage"],
                 # O Orbit Angle: the front O's angular radius (swing AND rise). Smaller = flatter.
-                # In the Spiral coverage the same widget slot is the Spiral Center Slope, so its
-                # value also travels as `spiral_slope` - the backend clamps each meaning to its own
-                # window and only the coverage in charge reads it.
+                # In the Spiral coverage the same widget slot is the Spiral End Angle (the O-orbit
+                # family's last radius), so its value also travels as `spiral_end_arc` - the backend
+                # clamps each meaning to its own window and only the coverage in charge reads it.
                 orbit_amplitude=float(kwargs["auto_orbit_angle"]),
-                spiral_slope=float(kwargs["auto_orbit_angle"]),
-                # Spiral End: the 'Spiral' coverage's winding around the view axis (deg). Phi still
-                # runs 0 -> SPIRAL_END_ARC over the same path, so this decides where the last frame
-                # looks from - and the fit never shortens it.
+                spiral_end_arc=float(kwargs["auto_orbit_angle"]),
+                # Spiral Winding: the 'Spiral' coverage's winding around the spiral's axis (deg);
+                # the O-orbit angle meanwhile grows evenly 0 -> the Spiral End Angle, so this decides
+                # where the last frame looks from - and the fit never shortens it.
                 spiral_end=float(kwargs["spiral_end"]),
+                # Spiral Center Slope: the lean of the spiral's central axis (-90..90).
+                spiral_slope=float(kwargs["spiral_slope"]),
             )
             print(f"[Enndee] Meridian {format_summary(summary)}", flush=True)
             return signal
