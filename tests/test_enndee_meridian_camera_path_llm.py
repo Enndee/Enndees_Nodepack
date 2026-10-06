@@ -110,13 +110,37 @@ class MeridianCameraPathLLMTests(unittest.TestCase):
         parsed = _parse_custom_camera(signal)   # raises if the signal is malformed
         self.assertIsNotNone(parsed)
 
-    def test_a_missing_server_reports_clearly(self):
+    def test_base_url_is_normalized_per_provider(self):
+        norm = llm._normalize_base_url
+        # the exact bug: provider=ollama with the LM Studio URL produced /v1/api/chat on the wrong port
+        self.assertEqual(norm("ollama", "http://localhost:1234/v1"), "http://localhost:11434")
+        self.assertEqual(norm("ollama", "http://localhost:11434/v1"), "http://localhost:11434")
+        self.assertEqual(norm("ollama", ""), "http://localhost:11434")
+        self.assertEqual(norm("ollama", "http://localhost:11434/"), "http://localhost:11434")
+        self.assertEqual(norm("lmstudio", "http://localhost:11434"), "http://localhost:1234/v1")
+        self.assertEqual(norm("lmstudio", ""), "http://localhost:1234/v1")
+        # a pasted endpoint suffix is stripped
+        self.assertEqual(norm("lmstudio", "http://localhost:1234/v1/chat/completions"),
+                         "http://localhost:1234/v1")
+        self.assertEqual(norm("ollama", "http://localhost:11434/api/chat"),
+                         "http://localhost:11434")
+
+    def test_a_connection_error_is_diagnosed(self):
+        with mock.patch.object(llm, "_reachable",
+                               side_effect=lambda url, timeout=2.0: "1234" in url):
+            hint = llm._connection_hint("ollama", "http://localhost:11434/api/chat")
+        self.assertIn("Could not reach", hint)
+        self.assertIn("LM Studio IS reachable", hint)          # names the server that IS up
+        self.assertIn("provider=lmstudio", hint)               # and how to fix it
+
+    def test_a_missing_model_reports_clearly(self):
         node = Enndee_MeridianCameraPathLLM()
         signal, plan, raw, _sp = node.generate(
-            instruction="orbit", frames="73", provider="lmstudio", base_url="", model="",
+            instruction="orbit", frames="73", provider="lmstudio",
+            base_url="http://localhost:1234/v1", model="",
             api_key="", fill_percent=40.0, temperature=0.5, max_tokens=256)
         self.assertIn("Meridian Camera Path LLM", signal)
-        self.assertIn("No server URL", signal)
+        self.assertIn("No model name", signal)
         self.assertEqual(plan, "{}")
 
 

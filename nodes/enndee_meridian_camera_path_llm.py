@@ -159,15 +159,73 @@ def _depth_to_array(depth_image, invert: bool):
 # Local LLM calls - LM Studio (OpenAI-compatible) and Ollama
 # ---------------------------------------------------------------------------
 
+LMSTUDIO_DEFAULT = "http://localhost:1234/v1"
+OLLAMA_DEFAULT = "http://localhost:11434"
+_ENDPOINT_SUFFIXES = ("/chat/completions", "/api/chat", "/api/generate", "/api/tags", "/models")
+
+
+def _normalize_base_url(provider, base_url):
+    """Provider-aware server base URL: strips a pasted endpoint and fixes a cross-provider default.
+
+    The two local servers have different shapes - LM Studio is OpenAI-compatible at
+    http://localhost:1234/v1, Ollama's native API is http://localhost:11434 with no /v1 - so a URL
+    left on the *other* provider's default (the common mistake: provider 'ollama' with the LM Studio
+    URL, which produced a bogus /v1/api/chat on the wrong port) is corrected to this provider's own
+    default.
+    """
+    url = (base_url or "").strip().rstrip("/")
+    for suffix in _ENDPOINT_SUFFIXES:
+        if url.endswith(suffix):
+            url = url[: -len(suffix)].rstrip("/")
+    if provider == "ollama":
+        if url.endswith("/v1"):
+            url = url[:-3].rstrip("/")
+        if not url or url in (LMSTUDIO_DEFAULT, "http://localhost:1234"):
+            url = OLLAMA_DEFAULT
+    else:
+        if not url or url == OLLAMA_DEFAULT:
+            url = LMSTUDIO_DEFAULT
+    return url
+
+
+def _reachable(url, timeout=2.0):
+    """True if something answers at `url` (any non-5xx response counts)."""
+    try:
+        return requests.get(url, timeout=timeout).status_code < 500
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _connection_hint(provider, url):
+    """A concrete, actionable message when the local server cannot be reached."""
+    lm_up = _reachable(f"{LMSTUDIO_DEFAULT}/models")
+    ol_up = _reachable(f"{OLLAMA_DEFAULT}/api/tags")
+    lines = [f"Could not reach the local LLM server at {url} (connection refused)."]
+    if lm_up:
+        lines.append("LM Studio IS reachable at http://localhost:1234/v1 - set provider=lmstudio "
+                     "and base_url=http://localhost:1234/v1.")
+    if ol_up:
+        lines.append("Ollama IS reachable at http://localhost:11434 - set provider=ollama "
+                     "and base_url=http://localhost:11434.")
+    if not lm_up and not ol_up:
+        lines.append("Nothing answered on port 1234 (LM Studio) or 11434 (Ollama). Start the server: "
+                     "LM Studio -> Developer/Server tab -> Start Server; Ollama -> run 'ollama serve'.")
+    if provider == "ollama" and "1234" in url:
+        lines.append("The URL uses port 1234 (LM Studio) but the provider is Ollama - did you mean "
+                     "provider=lmstudio?")
+    if provider == "lmstudio" and "11434" in url:
+        lines.append("The URL uses port 11434 (Ollama) but the provider is lmstudio - did you mean "
+                     "provider=ollama?")
+    return " ".join(lines)
+
+
 def _call_llm(provider, base_url, api_key, model, system_prompt, user_message, base64_images,
               temperature, max_tokens):
     """Send a vision chat request to a local server. Returns (content, error)."""
-    base_url = (base_url or "").rstrip("/")
-    if not base_url:
-        return "", ("No server URL set. For LM Studio use http://localhost:1234/v1, "
-                    "for Ollama http://localhost:11434.")
     if not model:
-        return "", "No model name set. Use a loaded vision model (e.g. qwen2.5-vl, llava, gemma3)."
+        return "", ("No model name set. Load a vision model in your server and put its name here "
+                    "(e.g. qwen2.5-vl, llava, gemma3).")
+    base_url = _normalize_base_url(provider, base_url)
 
     if provider == "ollama":
         url = f"{base_url}/api/chat"
@@ -200,19 +258,29 @@ def _call_llm(provider, base_url, api_key, model, system_prompt, user_message, b
 
     try:
         response = requests.post(url, json=payload, headers=headers, timeout=REQUEST_TIMEOUT)
-        if not response.ok:
-            return "", f"HTTP {response.status_code}: {response.text[:200]}"
+    except requests.exceptions.ConnectionError:
+        return "", _connection_hint(provider, url)
+    except requests.exceptions.Timeout:
+        return "", (f"The server at {url} did not answer within {REQUEST_TIMEOUT}s "
+                    "(a large model may still be loading - try again).")
+    except Exception as exc:  # noqa: BLE001
+        return "", f"Request to {url} failed: {exc}"
+
+    if not response.ok:
+        return "", f"{url} returned HTTP {response.status_code}: {response.text[:200]}"
+    try:
         data = response.json()
-        if provider == "ollama":
-            content = data.get("message", {}).get("content", "")
-        else:
-            choices = data.get("choices", [])
-            content = choices[0].get("message", {}).get("content", "") if choices else ""
-        if not content:
-            return "", "Empty response from the model."
-        return content, None
-    except Exception as exc:  # noqa: BLE001 - surface any connection/parse error to the UI
-        return "", str(exc)
+    except ValueError:
+        return "", f"{url} returned a non-JSON response: {response.text[:200]}"
+    if provider == "ollama":
+        content = data.get("message", {}).get("content", "")
+    else:
+        choices = data.get("choices", [])
+        content = choices[0].get("message", {}).get("content", "") if choices else ""
+    if not content:
+        return "", (f"The model returned an empty reply from {url}. Is '{model}' a vision model "
+                    "that is currently loaded?")
+    return content, None
 # ---------------------------------------------------------------------------
 # Plan parsing + rendering to a MERIDIAN_CAMERA_PATH signal
 # ---------------------------------------------------------------------------
@@ -331,7 +399,7 @@ class Enndee_MeridianCameraPathLLM:
                 }),
                 "base_url": ("STRING", {
                     "default": "http://localhost:1234/v1",
-                    "tooltip": "Server base URL. LM Studio: http://localhost:1234/v1  |  Ollama: http://localhost:11434",
+                    "tooltip": "Server base URL. LM Studio: http://localhost:1234/v1 | Ollama: http://localhost:11434. It is auto-corrected to the selected provider's default if left on the other one's.",
                 }),
                 "model": ("STRING", {
                     "default": "",
