@@ -1999,6 +1999,29 @@ class AutoCameraSpiralCoverageTests(unittest.TestCase):
                                 float(ys.float().mean()) - height / 2.0)
             self.assertLess(offset, 0.12 * height, f"the subject sits off-centre at frame {index}")
 
+    def test_the_sloped_spiral_carries_its_own_up(self):
+        """A sloped spiral is levelled to its own (axis-tilted) up; a level one keeps the world up.
+
+        The renderer levels the clip to the document's `up`. A coil levelled to the *world* up swings
+        against its own frame as the clock winds (measured 78.6 deg at 60 deg end angle / 30 deg
+        slope) and crosses the world's pole - the flip - at that slope; the spiral's own up is
+        perpendicular to its tilted axis, so the coil stays upright in it and that pole moves to
+        phi = 90.
+        """
+        document, _summary = _estimate(_depth_with_subject(), coverage=SPIRAL_COVERAGE,
+                                       spiral_slope=30.0)
+        up = json.loads(document).get("up")
+        self.assertIsNotNone(up)
+        slope = math.radians(30.0)
+        self.assertAlmostEqual(up[0], 0.0, places=5)
+        self.assertAlmostEqual(up[1], -math.cos(slope), places=5)     # the world up, tilted
+        self.assertAlmostEqual(up[2], math.sin(slope), places=5)
+        self.assertAlmostEqual(math.dist(up, [0.0, 0.0, 0.0]), 1.0, places=5)
+        # a level spiral - and every other coverage - leaves the field out: the world up it always had
+        for overrides in ({"coverage": SPIRAL_COVERAGE}, {"coverage": ORBIT_COVERAGES[1]}):
+            plain, _summary = _estimate(_depth_with_subject(), **overrides)
+            self.assertNotIn("up", json.loads(plain))
+
     def test_the_keys_follow_the_spiral_s_turning(self):
         """The renderer splines the keys, so they sit where the path bends - not every Nth frame."""
         surface = probe_surface(_reference(), depth_fn=lambda reference: _depth_with_subject())

@@ -323,6 +323,22 @@ def resolve_spiral_slope(degrees=None):
         return SPIRAL_SLOPE_DEFAULT
     return max(SPIRAL_SLOPE_MIN, min(SPIRAL_SLOPE_MAX, _finite(degrees, "Spiral slope")))
 
+
+# The direction the estimated clip is *levelled to*: the camera frame keeps this up, so nothing
+# rolls about the optical axis. A level path keeps the world up; the spiral leans its own up with
+# its central axis (`Spiral Center Slope`), because a coil levelled to the world up swings tens of
+# degrees against its own frame - measured 78.6 deg of swing at 60 deg end angle / 30 deg slope,
+# which is the roll the spiral showed - and the world up is exactly the direction a sloped coil
+# crosses, so levelling to it also made the camera flip there (the world's pole sits at phi = 60 for
+# a 30 deg slope). Levelling to the spiral's own up keeps the coil upright in its own frame and
+# moves that pole to phi = 90, past every end angle the node allows but 90.
+_ACTIVE_ROLL_UP = tuple(fast_depth.WORLD_UP)
+
+
+def roll_up():
+    """The up (3-tuple, frame-0 camera coordinates) the estimate being built is levelled to."""
+    return _ACTIVE_ROLL_UP
+
 # Scene target: a lateral survey instead of a lap around the scene. Meridian's scene renders are
 # depth reprojections, so what a walk-in VR viewer needs is *side* coverage: rows of viewpoints
 # spread across the scene's width at the source viewpoint's distance, each row sweeping the
@@ -673,17 +689,19 @@ def _decimate(points, limit):
 def _look_axes(points, camera_position, pivot, frame=None):
     """(x, y, z) of `points` in a camera frame - renderer convention (right, down, forward).
 
-    `frame` is the (right, down) pair to measure in - pass the parallel-transported pair for a pose
-    inside a sequence (`fast_depth.camera_frames`) so the measurement matches the render exactly. It
-    defaults to the first-frame basis (zero roll from world up) for an isolated pose, which is the
-    same `camera_frames` would pick - a pixel measured here is a pixel the renderer would produce.
+    `frame` is the (right, down) pair to measure in - pass the levelled pair for a pose inside a
+    sequence (`fast_depth.camera_frames`) so the measurement matches the render exactly. It defaults
+    to the isolated pose's own pair (zero roll from the estimate's `roll_up` - the world up, or a
+    sloped spiral's own up), which is the same `camera_frames` would pick: a pixel measured here is
+    a pixel the renderer would produce.
     """
     device, dtype = points.device, points.dtype
     position = torch.as_tensor(camera_position, device=device, dtype=dtype)
     forward = torch.as_tensor(pivot, device=device, dtype=dtype) - position
     forward = forward / forward.norm().clamp(min=1e-8)
     if frame is None:
-        right_np, down_np = fast_depth.camera_frames(forward.detach().cpu().numpy().reshape(1, 3))
+        right_np, down_np = fast_depth.camera_frames(forward.detach().cpu().numpy().reshape(1, 3),
+                                                     roll_up())
         right = torch.as_tensor(right_np[0], device=device, dtype=dtype)
         down = torch.as_tensor(down_np[0], device=device, dtype=dtype)
     else:
@@ -924,7 +942,7 @@ def _batch_project(pool, positions, pivot, surface, height):
     look = torch.as_tensor(pivot, device=device, dtype=dtype).reshape(1, 3)
     forward = look - pos
     forward = forward / forward.norm(dim=1, keepdim=True).clamp(min=1e-8)
-    up = torch.tensor([0.0, -1.0, 0.0], device=device, dtype=dtype).expand_as(forward)
+    up = torch.tensor(roll_up(), device=device, dtype=dtype).expand_as(forward)
     right = torch.cross(forward, up, dim=1)
     norms = right.norm(dim=1, keepdim=True)
     parallel = (norms < 1e-6).squeeze(1)
@@ -2572,15 +2590,21 @@ def estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DEF
     documented on `_estimate_camera_path`, which does the work.
     """
     global _ACTIVE_FRONT_ORBIT_AMPLITUDE, _ACTIVE_SPIRAL_END, _ACTIVE_SPIRAL_END_ARC
-    global _ACTIVE_SPIRAL_SLOPE
+    global _ACTIVE_SPIRAL_SLOPE, _ACTIVE_ROLL_UP
     previous = _ACTIVE_FRONT_ORBIT_AMPLITUDE
     previous_end = _ACTIVE_SPIRAL_END
     previous_arc = _ACTIVE_SPIRAL_END_ARC
     previous_slope = _ACTIVE_SPIRAL_SLOPE
+    previous_up = _ACTIVE_ROLL_UP
     _ACTIVE_FRONT_ORBIT_AMPLITUDE = resolve_front_orbit_amplitude(orbit_amplitude)
     _ACTIVE_SPIRAL_END = resolve_spiral_end(spiral_end)
     _ACTIVE_SPIRAL_END_ARC = resolve_spiral_end_arc(spiral_end_arc)
     _ACTIVE_SPIRAL_SLOPE = resolve_spiral_slope(spiral_slope)
+    # The clip is levelled to the spiral's own up when it flies a sloped coil, the world up
+    # otherwise (see `_ACTIVE_ROLL_UP`); the slope is ignored by every other coverage, so the tilt
+    # only ever reaches the frame where it belongs.
+    _ACTIVE_ROLL_UP = (_spiral_tilt(tuple(fast_depth.WORLD_UP), _ACTIVE_SPIRAL_SLOPE)
+                       if str(coverage) == SPIRAL_COVERAGE else tuple(fast_depth.WORLD_UP))
     try:
         return _estimate_camera_path(
             reference, frames, target=target, max_speed=max_speed, subject_mask=subject_mask,
@@ -2593,6 +2617,7 @@ def estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DEF
         _ACTIVE_SPIRAL_END = previous_end
         _ACTIVE_SPIRAL_END_ARC = previous_arc
         _ACTIVE_SPIRAL_SLOPE = previous_slope
+        _ACTIVE_ROLL_UP = previous_up
 
 
 def _estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DEFAULT_MAX_SPEED,
@@ -2908,9 +2933,17 @@ def _estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DE
         + f". Keys are in median-depth units ({depth_unit:.3g} units = 1.0), like the manual path. "
         + "Non-front views are synthetic depth reprojections, not observed geometry."
     )
+    # A sloped spiral carries its own up so the renderer levels the clip to the same frame the
+    # estimate measured in (`fast_depth.path_up`); a level path leaves the field out and keeps the
+    # world up it always had.
+    up = roll_up()
+    levelled = ([round(float(value), 6) for value in up]
+                if any(abs(float(value) - float(world)) > 1e-6
+                       for value, world in zip(up, fast_depth.WORLD_UP)) else None)
     document = document_from_keys(frames, emitted, f"Auto {info['style']} ({frames} frames)",
                                   description,
-                                  extra={"depth_model": surface.get("depth_model")})
+                                  extra={"depth_model": surface.get("depth_model"),
+                                         "up": levelled})
     hint = ""
     # The lever that frees frames for the front O. With the new modes it is 'Front only' (which
     # drops the whole back visit); with the DEPRECATED `orbit_end` path it is a shorter end.

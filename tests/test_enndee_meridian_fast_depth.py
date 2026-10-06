@@ -16,6 +16,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import math
 import re
 import sys
 import unittest
@@ -74,6 +75,14 @@ def _two_key_path(frames=73, end=(0.5, 0.0, 0.5)):
 
 def _camera(*tokens):
     return fast_depth.parse_camera_settings(list(tokens))
+
+
+def _roll_deg(right, forward, up):
+    """Signed roll (deg) of a frame's `right` about `forward`, measured from the level-horizon one."""
+    level = np.cross(forward, up)
+    level = level / np.linalg.norm(level)
+    return math.degrees(math.atan2(float(np.dot(np.cross(level, right), forward)),
+                                   float(np.dot(level, right))))
 
 
 class MeridianFastDepthHelperTests(unittest.TestCase):
@@ -272,6 +281,64 @@ class MeridianFastDepthHelperTests(unittest.TestCase):
                            -np.sin(phi) * np.cos(psi),
                            -np.cos(phi)], axis=1)
         return (-offset).astype(np.float32)      # the look at the pivot is minus the camera offset
+
+    def _tilted_coil(self, slope_deg, n=120, arc=60.0, turns=2.0):
+        """A coil around the *slope-tilted* view axis, plus that axis' own up.
+
+        This is the auto camera's spiral (`_spiral_tilt`): the world up rotated about the width axis
+        by the slope, which is perpendicular to the tilted axis by construction.
+        """
+        s = math.radians(slope_deg)
+        progress = np.linspace(0.0, 1.0, n)
+        phi = np.deg2rad(arc * progress)
+        psi = np.deg2rad(turns * 360.0 * progress)
+        axis = np.stack([np.sin(phi) * np.sin(psi), -np.sin(phi) * np.cos(psi), -np.cos(phi)], axis=1)
+        offset = np.stack([axis[:, 0],
+                           axis[:, 1] * math.cos(s) + axis[:, 2] * math.sin(s),
+                           -axis[:, 1] * math.sin(s) + axis[:, 2] * math.cos(s)], axis=1)
+        return (-offset).astype(np.float32), np.array([0.0, -math.cos(s), math.sin(s)],
+                                                      dtype=np.float32)
+
+    def test_camera_frames_levels_a_tilted_coil_to_its_own_up(self):
+        """A sloped spiral must be levelled to its *own* up - the world up swings against it.
+
+        Measured on the real spiral (60 deg end angle / 30 deg slope): the world-up frame swings
+        78.6 deg against the coil's own frame over the clip, which is the roll the user saw, and it
+        crosses the world's pole (a flip) at that slope. Levelled to the tilted up it stays at
+        exactly zero.
+        """
+        fwd, up = self._tilted_coil(30.0)
+        right, _down = fast_depth.camera_frames(fwd, up)
+        for i in range(fwd.shape[0]):
+            np.testing.assert_allclose(right[i], fast_depth._horizon_right(fwd[i], up), atol=1e-5)
+        # ... whereas the world up would swing tens of degrees against that same coil
+        world, _down = fast_depth.camera_frames(fwd)
+        swings = [abs(_roll_deg(world[i], fwd[i], up)) for i in range(fwd.shape[0])]
+        self.assertGreater(max(swings), 30.0)
+
+    def test_path_up_reads_the_documents_up(self):
+        """The clip is levelled to the document's `up`; absent or unusable keeps the world up."""
+        np.testing.assert_allclose(fast_depth.path_up({}), fast_depth.WORLD_UP)
+        np.testing.assert_allclose(fast_depth.path_up({"up": [0.0, 0.0, 0.0]}), fast_depth.WORLD_UP)
+        np.testing.assert_allclose(fast_depth.path_up({"up": ["x", 0.0, 0.0]}), fast_depth.WORLD_UP)
+        np.testing.assert_allclose(fast_depth.path_up({"up": [0.0, -3.0, 0.0]}), fast_depth.WORLD_UP)
+        root_half = math.sqrt(0.5)
+        np.testing.assert_allclose(fast_depth.path_up({"up": [0.0, -1.0, 1.0]}),
+                                   [0.0, -root_half, root_half], atol=1e-6)
+
+    def test_custom_path_is_levelled_to_the_documents_up(self):
+        """The renderer levels the spline path to the document's up, not to the world up."""
+        n = 73
+        fwd, up = self._tilted_coil(30.0, n=n, arc=50.0, turns=3.0)
+        pivot = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        pos = pivot - fwd * 2.0                       # on the sphere, aim at the pivot
+        path = {"path": [{"t": i, "src": i, "pos": pos[i].tolist(), "look": pivot.tolist()}
+                         for i in range(n)], "up": up.tolist()}
+        c2w, _focal = fast_depth._evaluate_camera_path(path, n, 1.0)
+        for i in range(n):
+            level = fast_depth._horizon_right(c2w[i, :3, 2], up)
+            if level is not None:
+                np.testing.assert_allclose(c2w[i, :3, 0], level, atol=1e-4)
 
     def test_camera_frame_is_orthonormal_and_never_flips_over_the_pole(self):
         fwd = self._sweep_forward_through_vertical()

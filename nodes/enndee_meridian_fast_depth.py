@@ -526,15 +526,17 @@ def _catmull_rom(tk: np.ndarray, pk: np.ndarray, t: np.ndarray, ease: List[bool]
     return out
 
 
-def _horizon_right(f: np.ndarray) -> Optional[np.ndarray]:
+def _horizon_right(f: np.ndarray, up: np.ndarray = WORLD_UP) -> Optional[np.ndarray]:
     """The level-horizon (zero-roll) right of a unit look direction, or None when `f` is vertical.
 
     This is the look's own right in the world, so the horizon stays level and the frame never rolls
-    about the optical axis. It is undefined - and reverses - exactly at the pole (the look straight
-    up/down `WORLD_UP`); `camera_frames`/`_look_at` hold the previous frame there instead of
-    following this vector over the flip.
+    about the optical axis. `up` is the direction the clip is levelled to: the world up for a level
+    path, and the spiral's own (slope-tilted) up for a sloped one - a coil levelled to the world up
+    swings tens of degrees relative to its own axis, which is the roll the spiral used to show. It is
+    undefined - and reverses - exactly at the pole (the look straight up/down `up`); `camera_frames`
+    / `_look_at` hold the previous frame there instead of following this vector over the flip.
     """
-    r = np.cross(f, WORLD_UP)
+    r = np.cross(f, up)
     norm = float(np.linalg.norm(r))
     if norm < HORIZON_MIN_SIN:
         return None
@@ -546,15 +548,15 @@ def _signed_roll(r_from: np.ndarray, r_to: np.ndarray, f: np.ndarray) -> float:
     return math.atan2(float(np.dot(np.cross(r_from, r_to), f)), float(np.dot(r_from, r_to)))
 
 
-def _world_up_frame(f: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+def _world_up_frame(f: np.ndarray, up: np.ndarray = WORLD_UP) -> Tuple[np.ndarray, np.ndarray]:
     """(right, down) of the level-horizon look-at from a unit forward `f` - zero roll about x.
 
     This is the renderer's reference frame: the horizon stays level, so an orbit never rolls. It
-    only degenerates when `f` is vertical (parallel to the world up), where no horizon exists; there
-    world x is kept as the right so the frame stays orthonormal (`camera_frames` handles that pose
-    with continuity instead of calling this on its own).
+    only degenerates when `f` is vertical (parallel to `up`), where no horizon exists; there world x
+    is kept as the right so the frame stays orthonormal (`camera_frames` handles that pose with
+    continuity instead of calling this on its own).
     """
-    r = _horizon_right(f)
+    r = _horizon_right(f, up)
     if r is None:                              # looking straight up/down: keep world x as right
         r = np.array([1.0, 0.0, 0.0], dtype=np.float32)
         r = r - float(np.dot(r, f)) * f
@@ -601,15 +603,16 @@ def _transport_step(r_prev: np.ndarray, f_prev: np.ndarray, f_cur: np.ndarray) -
     return r, d
 
 
-def _horizon_step(r_prev: np.ndarray, f_prev: np.ndarray, f_cur: np.ndarray, weight: float) -> np.ndarray:
+def _horizon_step(r_prev: np.ndarray, f_prev: np.ndarray, f_cur: np.ndarray, weight: float,
+                  up: np.ndarray = WORLD_UP) -> np.ndarray:
     """Carry `r_prev` to `f_cur` (parallel transport) and roll it `weight` of the way to level.
 
-    `weight` 1 = the level-horizon frame (`_horizon_right`): zero roll, the clip stays upright.
-    0 = pure transport: the previous frame carried along the look direction, which is what keeps a
-    pole graze continuous. In between the frame walks back to level after such a graze.
+    `weight` 1 = the level-horizon frame (`_horizon_right`, levelled to `up`): zero roll, the clip
+    stays upright. 0 = pure transport: the previous frame carried along the look direction, which is
+    what keeps a pole graze continuous. In between the frame walks back to level after such a graze.
     """
     r, _ = _transport_step(r_prev, f_prev, f_cur)
-    horizon = _horizon_right(f_cur)
+    horizon = _horizon_right(f_cur, up)
     if horizon is None or weight <= 0.0:
         return r
     turned = _rodrigues(r, f_cur, weight * _signed_roll(r, horizon, f_cur))
@@ -618,18 +621,19 @@ def _horizon_step(r_prev: np.ndarray, f_prev: np.ndarray, f_cur: np.ndarray, wei
     return (turned / norm).astype(np.float32) if norm > 1e-8 else r
 
 
-def camera_frames(forward) -> Tuple[np.ndarray, np.ndarray]:
+def camera_frames(forward, up: np.ndarray = WORLD_UP) -> Tuple[np.ndarray, np.ndarray]:
     """(right, down) [N,3] for a sequence of unit forwards: horizon level, no roll, no flip.
 
-    The frame is the world-up look-at - the horizon stays level, so an orbit (the spiral's O-orbits
-    especially) comes out upright and nothing twists about the optical axis. The one pose without a
-    horizon is the pole (the look straight up/down the world axis), where the world-up frame would
-    reverse; there the previous frame is carried by parallel transport (`_transport_step`) and
-    walked back to level over the next `HORIZON_RELOCK` frames, so a coil that grazes the top
-    re-locks smoothly instead of flipping 180 degrees.
+    The frame is the level-horizon look-at levelled to `up` - the world up for a level path, the
+    spiral's own (slope-tilted) up for a sloped one, so a tilted coil stays upright in *its* frame
+    instead of swinging tens of degrees against it. Nothing twists about the optical axis. The one
+    pose without a horizon is the pole (the look straight along `up`), where the frame would reverse;
+    there the previous frame is carried by parallel transport (`_transport_step`) and walked back to
+    level over the next `HORIZON_RELOCK` frames, so a coil that grazes the top re-locks smoothly
+    instead of flipping 180 degrees.
 
-    Frame 0 is the plain world-up zero-roll look-at, so a clip opens exactly as it always has. This
-    is the single source of the camera's roll: both the renderer (`_evaluate_camera_path`) and the
+    Frame 0 is the plain zero-roll look-at, so a clip opens exactly as it always has. This is the
+    single source of the camera's roll: both the renderer (`_evaluate_camera_path`) and the
     auto-camera's measurements use it, so a pixel measured is a pixel rendered.
     """
     f = np.asarray(forward, dtype=np.float32)
@@ -638,11 +642,11 @@ def camera_frames(forward) -> Tuple[np.ndarray, np.ndarray]:
     n = f.shape[0]
     right = np.empty_like(f)
     down = np.empty_like(f)
-    right[0], down[0] = _world_up_frame(f[0])
-    previous_horizon = _horizon_right(f[0])
+    right[0], down[0] = _world_up_frame(f[0], up)
+    previous_horizon = _horizon_right(f[0], up)
     relock = 0
     for i in range(1, n):
-        horizon = _horizon_right(f[i])
+        horizon = _horizon_right(f[i], up)
         if horizon is not None:
             if previous_horizon is None or float(np.dot(horizon, previous_horizon)) < 0.0:
                 relock = HORIZON_RELOCK         # the horizon just reversed over the pole
@@ -654,17 +658,19 @@ def camera_frames(forward) -> Tuple[np.ndarray, np.ndarray]:
             relock -= 1
         else:
             weight = 1.0
-        right[i] = _horizon_step(right[i - 1], f[i - 1], f[i], weight)
+        right[i] = _horizon_step(right[i - 1], f[i - 1], f[i], weight, up)
         down[i] = np.cross(f[i], right[i]).astype(np.float32)
     return right, down
 
 
-def _look_at(pos: np.ndarray, look: np.ndarray, prev: Optional[np.ndarray] = None) -> np.ndarray:
+def _look_at(pos: np.ndarray, look: np.ndarray, prev: Optional[np.ndarray] = None,
+             up: np.ndarray = WORLD_UP) -> np.ndarray:
     """c2w rotation (columns right, down, forward) looking from pos at look with the horizon level.
 
-    The frame is the world-up look-at (`_world_up_frame`) - zero roll about x - so a moving camera
-    keeps the horizon level instead of accumulating roll. `prev` (the previous frame's 3x3) supplies
-    continuity at the pole only: where the look is vertical, or the level frame just reversed, the
+    The frame is the level-horizon look-at (`_world_up_frame`) - zero roll about x - so a moving
+    camera keeps the horizon level instead of accumulating roll. `up` is the direction the clip is
+    levelled to (the world up, or a tilted path's own up). `prev` (the previous frame's 3x3) supplies
+    continuity at the pole only: where the look is along `up`, or the level frame just reversed, the
     previous frame is transported instead, so crossing the top never flips. `prev` is also the hard
     fallback when the look vector itself collapses (pos ~== look). The whole-sequence renderer uses
     `camera_frames`, which spreads that re-lock over `HORIZON_RELOCK` frames.
@@ -675,21 +681,43 @@ def _look_at(pos: np.ndarray, look: np.ndarray, prev: Optional[np.ndarray] = Non
         return prev if prev is not None else np.eye(3, dtype=np.float32)
     f = (f / norm_f).astype(np.float32)
     if prev is None:
-        r, d = _world_up_frame(f)
+        r, d = _world_up_frame(f, up)
         return np.stack([r, d, f], axis=1)
-    previous_horizon = _horizon_right(prev[:, 2])
-    horizon = _horizon_right(f)
+    previous_horizon = _horizon_right(prev[:, 2], up)
+    horizon = _horizon_right(f, up)
     flipped = horizon is not None and (previous_horizon is None
                                        or float(np.dot(horizon, previous_horizon)) < 0.0)
-    r = _horizon_step(prev[:, 0], prev[:, 2], f, 0.0 if horizon is None or flipped else 1.0)
+    r = _horizon_step(prev[:, 0], prev[:, 2], f, 0.0 if horizon is None or flipped else 1.0, up)
     return np.stack([r, np.cross(f, r).astype(np.float32), f], axis=1)
+
+
+def path_up(path_data: Optional[dict]) -> np.ndarray:
+    """The direction a camera-path document is levelled to - `up` in the document, else the world up.
+
+    A sloped spiral carries its own up (the world up rotated by the Spiral Center Slope), because a
+    coil levelled to the world up swings against its own axis. Everything else - the manual paths,
+    the LLM's plans, older documents - has no `up` and keeps the world up it always had.
+    """
+    values = (path_data or {}).get("up")
+    if not isinstance(values, (list, tuple)) or len(values) != 3:
+        return WORLD_UP
+    try:
+        vector = np.array([float(value) for value in values], dtype=np.float32)
+    except (TypeError, ValueError):
+        return WORLD_UP
+    norm = float(np.linalg.norm(vector))
+    if not math.isfinite(norm) or norm < 1e-6:
+        return WORLD_UP
+    return (vector / norm).astype(np.float32)
 
 
 
 def _evaluate_camera_path(path_data: dict, frames: int, zm: float) -> Tuple[np.ndarray, np.ndarray]:
     """Custom path keys -> per-frame c2w (F,4,4, float32) and focal multipliers (F,).
 
-    Keys are in frame-0 camera coordinates / pivot depth, exactly like recam/path.py's plan_path."""
+    Keys are in frame-0 camera coordinates / pivot depth, exactly like recam/path.py's plan_path.
+    The clip is levelled to the document's `up` (the world up when it carries none, a sloped
+    spiral's own up when it does - see `path_up`)."""
     keys = path_data["path"]
     tk = np.array([int(key["t"]) for key in keys], dtype=np.float32)
     ease = [bool(key.get("ease", False)) for key in keys]
@@ -706,7 +734,7 @@ def _evaluate_camera_path(path_data: dict, frames: int, zm: float) -> Tuple[np.n
     lengths = np.linalg.norm(forward, axis=1)
     collapsed = lengths < 1e-6            # pos ~== look: no direction, so the frame cannot move
     forward = forward / np.where(collapsed, 1.0, lengths)[:, None]
-    right, down = camera_frames(forward)
+    right, down = camera_frames(forward, path_up(path_data))
     rotation = np.eye(3, dtype=np.float32)
     for i in range(frames):
         if not collapsed[i]:
