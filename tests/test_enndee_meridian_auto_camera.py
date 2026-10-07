@@ -824,6 +824,32 @@ class AutoCameraEstimateTests(unittest.TestCase):
         self.assertIn("subject mask selects only 4", message)
         self.assertIn("white = subject", message)
 
+    def test_the_subject_floor_accepts_a_small_detail(self):
+        """The orbit floor is ~200 px of the real depth canvas, not the old 1 % of the cloud.
+
+        A SAM3 mask that isolates a small detail used to fail ("selects only 1689 of 169344
+        pixels, at least 1693 are needed") because 1 % of the canvas was required.
+        """
+        import enndee_meridian_auto_camera as meridian
+        self.assertEqual(meridian.MIN_SUBJECT_PIXELS, 200)
+        self.assertLessEqual(meridian._minimum_subject_pixels(169344), 210)
+
+    def test_the_spiral_frames_keep_a_constant_camera_speed(self):
+        """Equal arc length per frame - the coil used to crawl at the pole and race at its end."""
+        import enndee_meridian_auto_camera as meridian
+        frames = 121
+        samples = meridian._spiral_samples(frames, [0.0, 0.0, 0.0], 4.0, 0.0, 1.0)
+        steps = [math.dist(samples[index - 1], samples[index]) for index in range(1, frames)]
+        self.assertGreater(min(steps), 0.0)
+        self.assertLess(max(steps) / min(steps), 1.15)      # ~9x before the arc-length remap
+        # the endpoints stay exactly what the widgets asked for
+        self.assertAlmostEqual(meridian._spiral_point(0.0, 0.0, 1.0)[0], 0.0, places=6)
+        end = meridian._spiral_point(1.0, 0.0, 1.0)
+        expected = meridian.spiral_pose(meridian.spiral_end_arc(),
+                                        -meridian._spiral_sweep(), meridian.spiral_slope())
+        self.assertAlmostEqual(end[0], expected[0], places=6)
+        self.assertAlmostEqual(end[1], expected[1], places=6)
+
     def test_the_pivot_reports_the_exact_points_it_was_built_from(self):
         """The console line must say which points fed the pivot - the orbit can hide a bad one."""
         depth = _depth_with_subject()
@@ -1728,8 +1754,12 @@ class AutoCameraSpiralCoverageTests(unittest.TestCase):
     def test_phi_runs_from_the_view_axis_to_the_picture_plane(self):
         """phi = 0 at the FIRST frame, 90 (a side view of the picture) at the END - the spec."""
         self.assertEqual(_spiral_point(0.0, 0.0), (0.0, 0.0))      # the middle of the picture
-        self.assertAlmostEqual(spiral_arc(*_spiral_point(0.25, 0.0)),
-                               SPIRAL_END_ARC_DEFAULT * 0.25, places=6)     # and it climbs linearly
+        # phi does NOT climb linearly: the frames are spread over the coil's ARC LENGTH (constant
+        # camera speed), so the angle per frame is small where the coil opens and large where it
+        # winds. A quarter of the way along the path is therefore well past a quarter of the angle.
+        quarter = spiral_arc(*_spiral_point(0.25, 0.0))
+        self.assertGreater(quarter, SPIRAL_END_ARC_DEFAULT * 0.25)
+        self.assertLess(quarter, SPIRAL_END_ARC_DEFAULT * 0.5)
         end_yaw, end_elevation = _spiral_point(1.0, 0.0)
         self.assertAlmostEqual(spiral_arc(end_yaw, end_elevation), SPIRAL_END_ARC_DEFAULT, places=6)
         # phi = 90 is the picture's own plane: the camera looks at the scene from the side, whatever
@@ -1878,7 +1908,12 @@ class AutoCameraSpiralCoverageTests(unittest.TestCase):
         self.assertGreater(drift, tiny)                # ... and it *is* over the cap: no silent cut
 
     def test_the_o_orbit_angle_grows_evenly_along_the_path(self):
-        """O-orbits like in the Front-only setting, their angle growing 0 -> the end angle."""
+        """O-orbits like in the Front-only setting, their angle growing 0 -> the end angle.
+
+        The frames are spread over the coil's **arc length** (constant camera speed), so the
+        O-orbit angle per frame is deliberately NOT constant: it is small where the coil opens at
+        the pole and large out at the winding ring - that is what equalises the camera speed.
+        """
         surface = probe_surface(_reference(), depth_fn=lambda reference: _depth_with_subject())
         distance, pivot, _metrics = subject_framing(surface, 40.0)
         samples = subject_samples(73, pivot, distance, 1.0, 1.0, None, ORBIT_DIRECTION_DEFAULT,
@@ -1889,11 +1924,15 @@ class AutoCameraSpiralCoverageTests(unittest.TestCase):
         arcs = [spiral_arc(*_orbit_angles(sample, pivot)) for sample in samples]
         self.assertAlmostEqual(arcs[0], 0.0, places=6)    # the family's first O-orbit: the axis
         self.assertAlmostEqual(arcs[-1], SPIRAL_END_ARC_DEFAULT, places=4)
-        # ... and the angle grows LINEARLY along the path - that is what "growing along the path"
-        # means, and neither the speed cap nor any motion split may reshape it
-        step = SPIRAL_END_ARC_DEFAULT / 72.0
-        for index in range(1, 73):
-            self.assertAlmostEqual(arcs[index] - arcs[index - 1], step, places=3)
+        # the angle still grows monotonically, and the O-orbit angle per frame *falls* along the
+        # path: right at the pole the arc is pure `phi`, while at the winding ring it is almost
+        # all `psi` - that is exactly what keeps the camera's speed constant
+        self.assertTrue(all(arcs[index] > arcs[index - 1] for index in range(1, 73)))
+        self.assertGreater(arcs[1] - arcs[0], arcs[-1] - arcs[-2])
+        # ... because what grows evenly now is the ARC on the orbit sphere: constant speed. The
+        # residual spread comes from the elevation ceiling that flattens the coil's top.
+        steps = [math.dist(samples[index - 1], samples[index]) for index in range(1, 73)]
+        self.assertLess(max(steps) / min(steps), 1.25)     # ~9x before the arc-length remap
 
     def test_the_end_angle_is_the_parameter(self):
         """Spiral End Angle is the O-orbit family's last radius - flown as asked, whatever it is."""
