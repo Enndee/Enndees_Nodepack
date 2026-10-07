@@ -469,6 +469,8 @@ retain their output connections. You may also enter a dataset path manually.
 - **Grow Until Iter / Stop Refine:** optional explicit refinement cutoffs. Zero
   leaves Lichtfeld's selected strategy/config defaults untouched. These are
   applied through Studio's supported `--python-script` iteration-start callback.
+  **Headless builds cannot take them** (see "Older and free Studio builds" below) -
+  the node then reports that Studio's own defaults applied instead.
 - **Save Steps / Eval Steps:** optional comma-separated iteration lists (e.g.
   `5000,10000,20000`). Empty Save Steps preserves Studio/config defaults. Eval
   Steps automatically enable evaluation; if evaluation is enabled but Eval Steps
@@ -534,6 +536,17 @@ capability probing is the only reliable trigger. Read-only and cached per execut
   build does not know falls back to `info` with a note.
 - A build without `--python-script` logs that Grow Until / Stop Refine / Save Steps /
   Eval Steps are ignored for this run.
+- **A headless build cannot apply those four settings at all** - verified against
+  LichtFeld Studio v0.5.3: `lichtfeld.optimization_params()` returns a live object and
+  `set()` / `add_save_step()` accept writes, but `has_params()` is **false** because the
+  GUI-side `ParameterManager` (which pushes edits into the trainer) does not exist in
+  headless mode, and the trainer keeps its own defaults. Measured: `save_steps=[2, 3]`
+  written by the hook produced no checkpoints at all. The node therefore treats this as a
+  compatibility note instead of an error: the hook logs **one** warning
+  (`this Lichtfeld build does not expose optimization parameters to a headless
+  --python-script run ... Studio defaults apply.`), writes a JSON status that the node
+  repeats in the run summary, and never raises - a raised exception made Studio log a
+  Python traceback for **every single iteration**.
 
 ### Tracker features vs. trained splats
 

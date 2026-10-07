@@ -19,10 +19,12 @@ from lichtfeld_training_node import (  # noqa: E402
     build_lfs_settings_script,
     build_training_command,
     check_studio_choice,
+    describe_lfs_settings_status,
     filter_supported_flags,
     parse_iteration_steps,
     parse_studio_capabilities,
     probe_studio_support,
+    read_lfs_settings_status,
     resolve_export_support,
     run_streaming_command,
     resolve_studio_executable,
@@ -358,6 +360,121 @@ class LichtfeldCommandTests(unittest.TestCase):
             enable_eval=True,
         )
         self.assertIn('"eval_steps": [5000, 15000]', source)
+
+    def _run_settings_hook(self, source, params, *, calls=1):
+        """Run the generated hook against a mock lichtfeld; fire every callback `calls` times."""
+        registered = []
+        mock_lf = types.ModuleType("lichtfeld")
+        mock_lf.optimization_params = lambda: params
+        mock_lf.on_training_start = registered.append
+        mock_lf.on_iteration_start = registered.append
+        printed = []
+        with mock.patch.dict(sys.modules, {"lichtfeld": mock_lf}), mock.patch(
+            "builtins.print", lambda *args, **kwargs: printed.append(" ".join(map(str, args)))
+        ):
+            exec(compile(source, "<generated Lichtfeld settings>", "exec"), {})
+            for callback in registered:
+                for _ in range(calls):
+                    callback(object())
+        return registered, printed
+
+    def test_settings_hook_never_raises_when_parameters_are_unavailable(self):
+        # Headless Studio hands out a parameter object whose has_params() is False
+        # (the GUI ParameterManager does not exist); Studio logs a traceback for every
+        # single iteration if the hook raises, which floods the console.
+        source = build_lfs_settings_script(grow_until_iter=12000, save_steps=[5000])
+
+        class HeadlessParams:
+            def __init__(self):
+                self.calls = []
+
+            def has_params(self):
+                return False
+
+            def set(self, name, value):
+                self.calls.append((name, value))
+
+            def clear_save_steps(self):
+                self.calls.append("clear_save_steps")
+
+            def add_save_step(self, step):
+                self.calls.append(("add_save_step", step))
+
+        params = HeadlessParams()
+        registered, printed = self._run_settings_hook(source, params, calls=2)
+        self.assertEqual(len(registered), 2)
+        warnings = [line for line in printed if "does not expose optimization parameters" in line]
+        self.assertEqual(len(warnings), 1)
+        # best effort: the writes are still attempted once, they just do not reach the trainer
+        self.assertEqual(params.calls.count("clear_save_steps"), 1)
+
+    def test_settings_hook_writes_one_status_report_for_the_node_summary(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            status_path = Path(temp_dir) / "status.json"
+            source = build_lfs_settings_script(
+                grow_until_iter=12000, save_steps=[5000], status_path=str(status_path)
+            )
+
+            class HeadlessParams:
+                def __init__(self):
+                    self.values = {}
+
+                def has_params(self):
+                    return False
+
+                def set(self, name, value):
+                    self.values[name] = value
+
+                def clear_save_steps(self):
+                    self.values["save_steps"] = []
+
+                def add_save_step(self, step):
+                    self.values["save_steps"].append(step)
+
+            params = HeadlessParams()
+            self._run_settings_hook(source, params, calls=1)
+
+            self.assertEqual(params.values["grow_until_iter"], 12000)
+            self.assertEqual(params.values["save_steps"], [5000])
+            payload = read_lfs_settings_status(status_path)
+            self.assertEqual(
+                payload, {"applied": True, "has_params": False, "reason": ""}
+            )
+            self.assertIn(
+                "does not expose optimization parameters",
+                describe_lfs_settings_status(payload),
+            )
+
+    def test_settings_hook_reports_a_failing_hook_to_the_summary(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            status_path = Path(temp_dir) / "status.json"
+            source = build_lfs_settings_script(save_steps=[5000], status_path=str(status_path))
+
+            class ExplodingParams:
+                def has_params(self):
+                    return True
+
+                def clear_save_steps(self):
+                    raise RuntimeError("studio says no")
+
+            registered, printed = self._run_settings_hook(source, ExplodingParams(), calls=1)
+
+            payload = read_lfs_settings_status(status_path)
+            self.assertFalse(payload["applied"])
+            self.assertIn("studio says no", payload["reason"])
+            self.assertIn("hook could not be applied", describe_lfs_settings_status(payload))
+            self.assertTrue(
+                any("applying the Lichtfeld training settings failed" in line for line in printed)
+            )
+
+    def test_describe_lfs_settings_status_is_silent_when_the_hook_worked(self):
+        self.assertEqual(describe_lfs_settings_status(None), "")
+        self.assertEqual(read_lfs_settings_status(""), None)
+        self.assertEqual(
+            describe_lfs_settings_status({"applied": True, "has_params": True, "reason": ""}),
+            "",
+        )
+
 
     def test_builds_lfs_settings_script_with_defaults_only_when_overridden(self):
         self.assertEqual(build_lfs_settings_script(), "")

@@ -411,8 +411,21 @@ def build_lfs_settings_script(
     save_steps=None,
     eval_steps=None,
     enable_eval=False,
+    status_path="",
 ):
-    """Build a Lichtfeld --python-script hook for parameters without CLI flags."""
+    """Build a Lichtfeld --python-script hook for parameters without CLI flags.
+
+    Studio only exposes Grow Until / Stop Refine / Save Steps / Eval Steps through
+    ``lichtfeld.optimization_params()``.  A *headless* build (v0.5.3 among them) hands
+    out a parameter object whose ``has_params()`` is False, because the GUI-side
+    ``ParameterManager`` that pushes edits into the trainer does not exist in headless
+    mode - the trainer keeps its own defaults no matter what the hook writes.
+
+    The hook therefore never raises: Studio logs an exception for *every* iteration,
+    which floods the console with tracebacks.  It applies what it can, reports the
+    outcome once (to Studio's log and, when ``status_path`` is set, to that JSON file)
+    and stops.
+    """
     settings = {}
     if int(grow_until_iter) > 0:
         settings["grow_until_iter"] = int(grow_until_iter)
@@ -431,34 +444,86 @@ def build_lfs_settings_script(
         return ""
 
     encoded_settings = repr(json.dumps(settings, sort_keys=True))
+    encoded_status = repr(str(status_path or ""))
     return (
         "import json\n"
         "import lichtfeld as lf\n\n"
-        f"_ENNDEE_SETTINGS = json.loads({encoded_settings})\n\n"
-        "_ENNDEE_SETTINGS_APPLIED = False\n\n"
-        "def _enndee_apply_training_settings(*_args, **_kwargs):\n"
-        "    global _ENNDEE_SETTINGS_APPLIED\n"
-        "    if _ENNDEE_SETTINGS_APPLIED:\n"
+        f"_ENNDEE_SETTINGS = json.loads({encoded_settings})\n"
+        f"_ENNDEE_STATUS_PATH = {encoded_status}\n"
+        "_ENNDEE_DONE = False\n"
+        "_ENNDEE_NO_PARAMS = (\n"
+        "    'Enndee: this Lichtfeld build does not expose optimization parameters to a'\n"
+        "    ' headless --python-script run (has_params() is false), so Grow Until / Stop'\n"
+        "    ' Refine / Save Steps / Eval Steps cannot be applied - Studio defaults apply.'\n"
+        ")\n\n\n"
+        "def _enndee_report(payload):\n"
+        "    if not _ENNDEE_STATUS_PATH:\n"
         "        return\n"
-        "    params = lf.optimization_params()\n"
-        "    if params is None or not params.has_params():\n"
-        "        raise RuntimeError('Lichtfeld optimization parameters are unavailable.')\n"
-        "    for name in ('grow_until_iter', 'stop_refine'):\n"
-        "        if name in _ENNDEE_SETTINGS:\n"
-        "            params.set(name, _ENNDEE_SETTINGS[name])\n"
-        "    if 'enable_eval' in _ENNDEE_SETTINGS:\n"
-        "        params.enable_eval = True\n"
-        "    if 'save_steps' in _ENNDEE_SETTINGS:\n"
-        "        params.clear_save_steps()\n"
-        "        for step in _ENNDEE_SETTINGS['save_steps']:\n"
-        "            params.add_save_step(step)\n"
-        "    if 'eval_steps' in _ENNDEE_SETTINGS:\n"
-        "        params.clear_eval_steps()\n"
-        "        for step in _ENNDEE_SETTINGS['eval_steps']:\n"
-        "            params.add_eval_step(step)\n"
-        "    _ENNDEE_SETTINGS_APPLIED = True\n\n"
-        "lf.on_iteration_start(_enndee_apply_training_settings)\n"
+        "    try:\n"
+        "        with open(_ENNDEE_STATUS_PATH, 'w', encoding='utf-8') as handle:\n"
+        "            json.dump(payload, handle, sort_keys=True)\n"
+        "    except Exception:\n"
+        "        pass\n\n\n"
+        "def _enndee_warn(message):\n"
+        "    logger = getattr(lf, 'log', None)\n"
+        "    if logger is not None and hasattr(logger, 'warn'):\n"
+        "        try:\n"
+        "            logger.warn(message)\n"
+        "            return\n"
+        "        except Exception:\n"
+        "            pass\n"
+        "    print(message, flush=True)\n\n\n"
+        "def _enndee_apply_training_settings(*_args, **_kwargs):\n"
+        "    global _ENNDEE_DONE\n"
+        "    if _ENNDEE_DONE:\n"
+        "        return\n"
+        "    _ENNDEE_DONE = True\n"
+        "    try:\n"
+        "        params = lf.optimization_params()\n"
+        "    except Exception as exc:\n"
+        "        _enndee_warn('Enndee: lf.optimization_params() failed: ' + repr(exc))\n"
+        "        _enndee_report({'applied': False, 'has_params': False, 'reason': repr(exc)})\n"
+        "        return\n"
+        "    if params is None:\n"
+        "        _enndee_warn('Enndee: Lichtfeld has no optimization parameter object for this run.')\n"
+        "        _enndee_report({'applied': False, 'has_params': False,\n"
+        "                        'reason': 'no parameter object'})\n"
+        "        return\n"
+        "    try:\n"
+        "        has_params = bool(params.has_params())\n"
+        "    except Exception:\n"
+        "        has_params = False\n"
+        "    try:\n"
+        "        for name in ('grow_until_iter', 'stop_refine'):\n"
+        "            if name in _ENNDEE_SETTINGS:\n"
+        "                params.set(name, _ENNDEE_SETTINGS[name])\n"
+        "        if 'enable_eval' in _ENNDEE_SETTINGS:\n"
+        "            params.enable_eval = True\n"
+        "        if 'save_steps' in _ENNDEE_SETTINGS:\n"
+        "            params.clear_save_steps()\n"
+        "            for step in _ENNDEE_SETTINGS['save_steps']:\n"
+        "                params.add_save_step(step)\n"
+        "        if 'eval_steps' in _ENNDEE_SETTINGS:\n"
+        "            params.clear_eval_steps()\n"
+        "            for step in _ENNDEE_SETTINGS['eval_steps']:\n"
+        "                params.add_eval_step(step)\n"
+        "    except Exception as exc:\n"
+        "        _enndee_warn('Enndee: applying the Lichtfeld training settings failed: '\n"
+        "                     + repr(exc))\n"
+        "        _enndee_report({'applied': False, 'has_params': has_params,\n"
+        "                        'reason': repr(exc)})\n"
+        "        return\n"
+        "    if not has_params:\n"
+        "        _enndee_warn(_ENNDEE_NO_PARAMS)\n"
+        "    _enndee_report({'applied': True, 'has_params': has_params, 'reason': ''})\n\n\n"
+        "# Studio fires training_start before the first iteration; both are registered so\n"
+        "# older builds that lack one of them still get the settings applied exactly once.\n"
+        "for _enndee_name in ('on_training_start', 'on_iteration_start'):\n"
+        "    _enndee_register = getattr(lf, _enndee_name, None)\n"
+        "    if callable(_enndee_register):\n"
+        "        _enndee_register(_enndee_apply_training_settings)\n"
     )
+
 
 
 def write_lfs_settings_script(contents):
@@ -480,6 +545,34 @@ def write_lfs_settings_script(contents):
         path.unlink(missing_ok=True)
         raise
     return path
+
+
+def read_lfs_settings_status(path):
+    """Read the settings hook's JSON status report (missing/empty file -> None)."""
+    if not path:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def describe_lfs_settings_status(payload):
+    """Compatibility note for a hook that could not apply its settings (else "")."""
+    if not isinstance(payload, dict):
+        return ""
+    if payload.get("applied") and payload.get("has_params"):
+        return ""
+    if payload.get("applied"):
+        return ("this Studio build does not expose optimization parameters to a headless "
+                "--python-script run (has_params() is false), so the Grow Until / Stop "
+                "Refine / Save Steps / Eval Steps settings were ignored and Studio's own "
+                "defaults applied.")
+    reason = str(payload.get("reason") or "")
+    return ("the Lichtfeld settings hook could not be applied"
+            + (f" ({reason})" if reason else "") + ".")
 
 
 def build_training_command(
@@ -1033,13 +1126,22 @@ class LichtfeldHeadlessTrainer:
                 output / f"lichtfeld_training_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
             )
 
+        settings_status_path = ""
+        handle, settings_status_path = tempfile.mkstemp(
+            prefix="enndee_lfs_status_", suffix=".json"
+        )
+        os.close(handle)
         settings_script = build_lfs_settings_script(
             grow_until_iter=grow_until_iter,
             stop_refine=stop_refine,
             save_steps=parsed_save_steps,
             eval_steps=parsed_eval_steps,
             enable_eval=effective_enable_eval,
+            status_path=settings_status_path,
         )
+        if not settings_script:
+            Path(settings_status_path).unlink(missing_ok=True)
+            settings_status_path = ""
         command = build_training_command(
             executable=executable,
             dataset=dataset,
@@ -1080,6 +1182,9 @@ class LichtfeldHeadlessTrainer:
             compatibility_notes.append(note)
             print(f"[Enndee Lichtfeld] Note: {note}", flush=True)
             settings_script = ""
+            if settings_status_path:
+                Path(settings_status_path).unlink(missing_ok=True)
+                settings_status_path = ""
         preview_command = subprocess.list2cmdline(command)
         print(f"[Enndee Lichtfeld] Dataset: {dataset}", flush=True)
         print(f"[Enndee Lichtfeld] Output: {output}", flush=True)
@@ -1092,6 +1197,9 @@ class LichtfeldHeadlessTrainer:
             )
 
         if preview_only:
+            if settings_status_path:
+                Path(settings_status_path).unlink(missing_ok=True)
+                settings_status_path = ""
             summary = "Preview only: dataset validated; training was not started."
             if compatibility_notes:
                 summary += " " + " ".join(compatibility_notes)
@@ -1130,18 +1238,27 @@ class LichtfeldHeadlessTrainer:
                 settings_script_path.unlink(missing_ok=True)
             raise
 
+        settings_status = None
         try:
             return_code, tail = run_streaming_command(
                 command, cwd=executable.parent
             )
+            settings_status = read_lfs_settings_status(settings_status_path)
         finally:
             if settings_script_path is not None:
                 settings_script_path.unlink(missing_ok=True)
+            if settings_status_path:
+                Path(settings_status_path).unlink(missing_ok=True)
         if return_code:
             raise RuntimeError(
                 f"Lichtfeld Studio training exited with code {return_code}. "
                 f"Full log: {log_file}\nLast output:\n{tail or '(no console output)'}"
             )
+
+        settings_note = describe_lfs_settings_status(settings_status)
+        if settings_note:
+            compatibility_notes.append(settings_note)
+            print(f"[Enndee Lichtfeld] Note: {settings_note}", flush=True)
 
         export_path = None
         export_tail = ""
