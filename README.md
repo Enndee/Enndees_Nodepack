@@ -536,17 +536,17 @@ capability probing is the only reliable trigger. Read-only and cached per execut
   build does not know falls back to `info` with a note.
 - A build without `--python-script` logs that Grow Until / Stop Refine / Save Steps /
   Eval Steps are ignored for this run.
-- **A headless build cannot apply those four settings at all** - verified against
-  LichtFeld Studio v0.5.3: `lichtfeld.optimization_params()` returns a live object and
-  `set()` / `add_save_step()` accept writes, but `has_params()` is **false** because the
-  GUI-side `ParameterManager` (which pushes edits into the trainer) does not exist in
-  headless mode, and the trainer keeps its own defaults. Measured: `save_steps=[2, 3]`
-  written by the hook produced no checkpoints at all. The node therefore treats this as a
-  compatibility note instead of an error: the hook logs **one** warning
-  (`this Lichtfeld build does not expose optimization parameters to a headless
-  --python-script run ... Studio defaults apply.`), writes a JSON status that the node
-  repeats in the run summary, and never raises - a raised exception made Studio log a
-  Python traceback for **every single iteration**.
+- **A headless build takes those four settings through a generated config file.** Studio's
+  `--config <file>` is parsed *before* the trainer exists, so unlike the `--python-script`
+  hook it reaches a headless run. The node merges Grow Until / Stop Refine / Save Steps /
+  Eval Steps into a complete `optimization` section (`lfs_optimization_defaults.json`,
+  dumped from Studio's own `optimization_params().properties()`) and passes it with
+  `--config`. Verified against v0.5.3: `save_steps=[2, 3]` produced a checkpoint per step,
+  and the run summary reports the route used.
+- Studio's config parser requires **every** key of the `optimization` section, stores the
+  enums `mask_mode` / `bg_mode` as **strings**, and keeps integers and floats distinct -
+  hence the bundled template. If the template is missing (or a future Studio rejects it)
+  the node silently falls back to the `--python-script` hook below.
 
 ### Tracker features vs. trained splats
 

@@ -559,6 +559,97 @@ def read_lfs_settings_status(path):
     return payload if isinstance(payload, dict) else None
 
 
+LFS_OPTIMIZATION_DEFAULTS = (Path(__file__).resolve().parent.parent
+                             / "lfs_optimization_defaults.json")
+_LFS_OPTIMIZATION_TEMPLATE = {}
+
+
+def load_lfs_optimization_template():
+    """Studio's complete ``optimization`` config section (it rejects partial configs).
+
+    ``LichtFeld-Studio.exe --config <file>`` reads the parameters *before* the trainer
+    exists, so - unlike the ``--python-script`` hook - it also works headless.  Studio's
+    parser requires every key of the section, so the template below (dumped from Studio's
+    own ``optimization_params().properties()``) is merged with the requested settings.
+    """
+    if _LFS_OPTIMIZATION_TEMPLATE:
+        return dict(_LFS_OPTIMIZATION_TEMPLATE)
+    try:
+        with open(LFS_OPTIMIZATION_DEFAULTS, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except Exception:
+        return {}
+    section = data.get("optimization") if isinstance(data, dict) else None
+    if not isinstance(section, dict):
+        return {}
+    _LFS_OPTIMIZATION_TEMPLATE.update(section)
+    return dict(_LFS_OPTIMIZATION_TEMPLATE)
+
+
+def build_lfs_optimization_section(grow_until_iter=0, stop_refine=0, save_steps=None,
+                                   eval_steps=None, enable_eval=False, mask_mode="",
+                                   bg_mode=""):
+    """Complete ``optimization`` section with the requested settings applied.
+
+    Returns ``{}`` when nothing was requested (or the template is unavailable), so the
+    caller can fall back to the ``--python-script`` hook.
+    """
+    overrides = {}
+    if int(grow_until_iter) > 0:
+        overrides["grow_until_iter"] = int(grow_until_iter)
+    if int(stop_refine) > 0:
+        overrides["stop_refine"] = int(stop_refine)
+    if save_steps is not None:
+        overrides["save_steps"] = sorted({int(step) for step in save_steps})
+    if eval_steps is not None:
+        overrides["eval_steps"] = sorted({int(step) for step in eval_steps})
+    if enable_eval or eval_steps is not None:
+        overrides["enable_eval"] = True
+        if eval_steps is None and save_steps:
+            # Studio's GUI mirrors save steps as evaluation steps when eval is on.
+            overrides["eval_steps"] = sorted({int(step) for step in save_steps})
+    # Studio stores these two as strings in the config file, not as numbers.
+    if mask_mode:
+        overrides["mask_mode"] = str(mask_mode)
+    if bg_mode:
+        overrides["bg_mode"] = str(bg_mode)
+    if not overrides:
+        return {}
+    section = load_lfs_optimization_template()
+    if not section:
+        return {}
+    section.update(overrides)
+    return section
+
+
+def write_lfs_config_file(section, base_config_path=""):
+    """Write a Studio config file: the user's config (optional) plus our section."""
+    payload = {}
+    if base_config_path:
+        try:
+            with open(base_config_path, "r", encoding="utf-8") as handle:
+                loaded = json.load(handle)
+            if isinstance(loaded, dict):
+                payload.update(loaded)
+        except Exception:
+            payload = {}
+    payload["optimization"] = section
+    handle = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", suffix=".json", prefix="enndee_lfs_config_", delete=False
+    )
+    path = Path(handle.name)
+    try:
+        with handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
+    return path
+
+
 def describe_lfs_settings_status(payload):
     """Compatibility note for a hook that could not apply its settings (else "")."""
     if not isinstance(payload, dict):
@@ -1126,22 +1217,38 @@ class LichtfeldHeadlessTrainer:
                 output / f"lichtfeld_training_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
             )
 
-        settings_status_path = ""
-        handle, settings_status_path = tempfile.mkstemp(
-            prefix="enndee_lfs_status_", suffix=".json"
-        )
-        os.close(handle)
-        settings_script = build_lfs_settings_script(
+        settings_section = build_lfs_optimization_section(
             grow_until_iter=grow_until_iter,
             stop_refine=stop_refine,
             save_steps=parsed_save_steps,
             eval_steps=parsed_eval_steps,
             enable_eval=effective_enable_eval,
-            status_path=settings_status_path,
+            mask_mode=mask_mode,
+            bg_mode=background_mode,
         )
-        if not settings_script:
-            Path(settings_status_path).unlink(missing_ok=True)
-            settings_status_path = ""
+        config_override_path = None
+        settings_status_path = ""
+        if settings_section:
+            # Studio reads --config before the trainer exists, so - unlike the
+            # --python-script hook - this also reaches a headless trainer.
+            config_override_path = write_lfs_config_file(settings_section, config_path)
+            settings_script = ""
+        else:
+            handle, settings_status_path = tempfile.mkstemp(
+                prefix="enndee_lfs_status_", suffix=".json"
+            )
+            os.close(handle)
+            settings_script = build_lfs_settings_script(
+                grow_until_iter=grow_until_iter,
+                stop_refine=stop_refine,
+                save_steps=parsed_save_steps,
+                eval_steps=parsed_eval_steps,
+                enable_eval=effective_enable_eval,
+                status_path=settings_status_path,
+            )
+            if not settings_script:
+                Path(settings_status_path).unlink(missing_ok=True)
+                settings_status_path = ""
         command = build_training_command(
             executable=executable,
             dataset=dataset,
@@ -1162,7 +1269,7 @@ class LichtfeldHeadlessTrainer:
             enable_sparsity=enable_sparsity,
             log_level=log_level,
             output_name=output_name,
-            config_file=config_path,
+            config_file=str(config_override_path) if config_override_path else config_path,
             centralize_dataset=centralize_dataset,
             resize_factor=image_resize_factor,
             max_image_width=max_image_width,
@@ -1200,6 +1307,8 @@ class LichtfeldHeadlessTrainer:
             if settings_status_path:
                 Path(settings_status_path).unlink(missing_ok=True)
                 settings_status_path = ""
+            if config_override_path is not None:
+                config_override_path.unlink(missing_ok=True)
             summary = "Preview only: dataset validated; training was not started."
             if compatibility_notes:
                 summary += " " + " ".join(compatibility_notes)
@@ -1249,6 +1358,8 @@ class LichtfeldHeadlessTrainer:
                 settings_script_path.unlink(missing_ok=True)
             if settings_status_path:
                 Path(settings_status_path).unlink(missing_ok=True)
+            if config_override_path is not None:
+                config_override_path.unlink(missing_ok=True)
         if return_code:
             raise RuntimeError(
                 f"Lichtfeld Studio training exited with code {return_code}. "
@@ -1259,6 +1370,11 @@ class LichtfeldHeadlessTrainer:
         if settings_note:
             compatibility_notes.append(settings_note)
             print(f"[Enndee Lichtfeld] Note: {settings_note}", flush=True)
+        if config_override_path is not None:
+            note = ("Grow Until / Stop Refine / Save Steps / Eval Steps were applied through "
+                    "a generated Lichtfeld config file (--config).")
+            compatibility_notes.append(note)
+            print(f"[Enndee Lichtfeld] Note: {note}", flush=True)
 
         export_path = None
         export_tail = ""

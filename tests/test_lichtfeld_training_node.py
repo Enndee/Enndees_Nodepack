@@ -1,6 +1,7 @@
 """Unit tests for the Lichtfeld headless trainer; no Studio training is run."""
 
 import importlib.util
+import json
 import sys
 import tempfile
 import types
@@ -16,16 +17,19 @@ sys.path.insert(0, str(PACK_DIR / "nodes"))
 from lichtfeld_training_node import (  # noqa: E402
     LichtfeldHeadlessTrainer,
     build_conversion_command,
+    build_lfs_optimization_section,
     build_lfs_settings_script,
     build_training_command,
     check_studio_choice,
     describe_lfs_settings_status,
     filter_supported_flags,
+    load_lfs_optimization_template,
     parse_iteration_steps,
     parse_studio_capabilities,
     probe_studio_support,
     read_lfs_settings_status,
     resolve_export_support,
+    write_lfs_config_file,
     run_streaming_command,
     resolve_studio_executable,
     resolve_trained_splat,
@@ -475,6 +479,54 @@ class LichtfeldCommandTests(unittest.TestCase):
             "",
         )
 
+    def test_optimization_template_carries_every_studio_key(self):
+        # Studio's config parser requires the complete section (verified against 0.5.3).
+        section = load_lfs_optimization_template()
+        self.assertTrue(section)
+        for key in ("iterations", "strategy", "stop_refine", "grow_until_iter", "save_steps",
+                    "eval_steps", "enable_eval", "mask_mode", "bg_mode"):
+            self.assertIn(key, section)
+        self.assertIsInstance(section["iterations"], int)
+        self.assertIsInstance(section["means_lr"], float)
+        # Studio stores these two enums as strings in the config file, not as numbers
+        self.assertIsInstance(section["mask_mode"], str)
+        self.assertIsInstance(section["bg_mode"], str)
+
+    def test_build_lfs_optimization_section_merges_the_requested_settings(self):
+        self.assertEqual(build_lfs_optimization_section(), {})
+        section = build_lfs_optimization_section(
+            grow_until_iter=12000, stop_refine=20000, save_steps=[5000, 10000],
+            enable_eval=True, mask_mode="segment", bg_mode="solidcolor",
+        )
+        self.assertEqual(section["grow_until_iter"], 12000)
+        self.assertEqual(section["stop_refine"], 20000)
+        self.assertEqual(section["save_steps"], [5000, 10000])
+        self.assertEqual(section["eval_steps"], [5000, 10000])     # mirrors the save steps
+        self.assertTrue(section["enable_eval"])
+        self.assertEqual(section["mask_mode"], "segment")
+        self.assertEqual(section["bg_mode"], "solidcolor")
+        self.assertIn("iterations", section)                       # template keys survive
+
+    def test_write_lfs_config_file_merges_a_user_config(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir) / "user.json"
+            base.write_text(
+                json.dumps({"dataset": {"images": "images"},
+                            "optimization": {"iterations": 1234}}),
+                encoding="utf-8",
+            )
+            section = build_lfs_optimization_section(stop_refine=99, mask_mode="none")
+            path = write_lfs_config_file(section, str(base))
+            try:
+                payload = json.loads(Path(path).read_text(encoding="utf-8"))
+            finally:
+                Path(path).unlink(missing_ok=True)
+            self.assertEqual(payload["optimization"]["stop_refine"], 99)
+            self.assertEqual(payload["optimization"]["mask_mode"], "none")
+            self.assertIn("iterations", payload["optimization"])
+            self.assertEqual(payload["dataset"]["images"], "images")
+
+
 
     def test_builds_lfs_settings_script_with_defaults_only_when_overridden(self):
         self.assertEqual(build_lfs_settings_script(), "")
@@ -534,8 +586,8 @@ class LichtfeldCommandTests(unittest.TestCase):
             self.assertIn("--centralize=by_pointcloud", result["result"][1])
             self.assertIn("--resize_factor=1", result["result"][1])
             self.assertIn("--max-width=0", result["result"][1])
-            self.assertIn("--python-script", result["result"][1])
-            self.assertIn("<temporary Lichtfeld settings script>", result["result"][1])
+            self.assertIn("--config", result["result"][1])
+            self.assertNotIn("--python-script", result["result"][1])
             self.assertIn("Preview only", result["result"][3])
             self.assertFalse(output.exists())
 
