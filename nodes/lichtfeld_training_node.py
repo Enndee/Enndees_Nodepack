@@ -31,6 +31,10 @@ _LFS_VALUE_FLAGS = frozenset({
     "--output-name", "--config", "--python-script", "--test-every",
     # one --add-splat per anchor file, so the path has to go with the flag when it is dropped
     "--add-splat",
+    # 0.5.4 supervision + freeze flags: all take a value, so it must go with them
+    "--depth-loss-mode", "--depth-loss-weight", "--normal-loss-weight",
+    "--normal-consistency-weight", "--normal-flatten-weight", "--normal-loss-space",
+    "--normal-start-fraction", "--normal-end-fraction", "--freeze-lr-scale",
 })
 _STUDIO_PROBE_CACHE = {}
 _TAIL_LINES = 80
@@ -179,6 +183,24 @@ def parse_studio_capabilities(help_text, convert_text=""):
         items = {item.strip().lower() for item in match.group(1).split(",") if item.strip()}
         return frozenset(items) or None
 
+    def depth_loss_modes(text):
+        """Accepted ``--depth-loss-mode`` values, or None when the help does not say.
+
+        0.5.4 prints `Depth prior convention: ssi (auto-detect), ssi-disparity, or
+        ssi-depth (default: ssi)`; 0.5.3 named them differently and prints nothing usable,
+        in which case this returns None and the node sends the user's value unchanged.
+        """
+        match = re.search(r"Depth prior convention:\s*([^\n]+)", text)
+        if not match:
+            return None
+        listing = re.split(r"\(default", match.group(1))[0]
+        items = set()
+        for item in re.split(r",| or ", listing):
+            item = re.sub(r"\(.*?\)", "", item).strip().lower()
+            if item and " " not in item:
+                items.add(item)
+        return frozenset(items) or None
+
     value_flags = option_flags(help_text, with_value=True)
     flags = value_flags | option_flags(help_text, with_value=False)
 
@@ -211,6 +233,8 @@ def parse_studio_capabilities(help_text, convert_text=""):
         "strategies": choices(r"Optimization strategy:\s*([^\n(]+)", help_text),
         "mask_modes": choices(r"Mask mode:\s*([^\n(]+)", help_text),
         "log_levels": choices(r"Log level:\s*([^\n(]+)", help_text),
+        # 0.5.3 used adaptive-warped-l1 / pearson; 0.5.4 renamed them to ssi*.
+        "depth_loss_modes": depth_loss_modes(help_text),
     }
 
 
@@ -839,6 +863,29 @@ def dataset_needs_undistort(dataset):
     return bool(models) and not models <= PINHOLE_CAMERA_MODELS
 
 
+#: Lichtfeld 0.5.3 -> 0.5.4 depth-prior naming. 0.5.4 replaced the two 0.5.3 losses with
+#: one auto-detecting `ssi` family, so a saved workflow's old value must be translated
+#: instead of sent verbatim (0.5.4 would reject it).
+LEGACY_DEPTH_LOSS_MODES = {"adaptive-warped-l1": "ssi", "pearson": "ssi"}
+
+
+def resolve_depth_loss_mode(mode, supported):
+    """Map a `depth_loss_mode` widget value onto one the installed build accepts.
+
+    ``supported`` is the set parsed from `--help` (``studio["depth_loss_modes"]``). When it
+    is None the build said nothing usable, so the value is passed through unchanged.
+    """
+    mode = str(mode or "").strip().lower()
+    if not mode or not supported or mode in supported:
+        return mode
+    translated = LEGACY_DEPTH_LOSS_MODES.get(mode)
+    if translated and translated in supported:
+        return translated
+    if "ssi" in supported:
+        return "ssi"
+    return mode
+
+
 def resolve_anchor_mesh(dataset, explicit=""):
     """The mesh to turn into surface anchors, or ``None`` when there is none.
 
@@ -947,6 +994,16 @@ def build_training_command(
     anchor_splats=(),
     anchor_freeze=False,
     undistort=False,
+    use_normal_loss=False,
+    normal_loss_weight=0.005,
+    normal_consistency_weight=0.001,
+    normal_flatten_weight=0.0,
+    normal_loss_space="auto",
+    normal_start_fraction=0.08,
+    normal_end_fraction=1.0,
+    freeze_lr_scale=None,
+    depth_loss_mode="",
+    depth_loss_weight=0.0,
 ):
     """Build an argument vector for the documented LichtFeld Studio CLI."""
     if int(iterations) < 1:
@@ -1037,6 +1094,26 @@ def build_training_command(
         # Studio REFUSES a distorted dataset without this ("Distorted images detected.
         # Use --gut or --undistort"), and it adjusts the intrinsics itself.
         command.append("--undistort")
+    # Depth / normal supervision as CLI flags. 0.5.4 exposes both on the command line and
+    # renamed the depth-prior convention (`adaptive-warped-l1`/`pearson` -> `ssi*`), so the
+    # caller passes an already-translated depth_loss_mode (see resolve_depth_loss_mode).
+    if depth_loss_mode:
+        command.extend(["--depth-loss-mode", str(depth_loss_mode)])
+    if float(depth_loss_weight) > 0.0:
+        command.extend(["--depth-loss-weight", str(float(depth_loss_weight))])
+    if use_normal_loss:
+        command.append("--use-normal-loss")
+        command.extend(["--normal-loss-weight", str(float(normal_loss_weight))])
+        command.extend(["--normal-consistency-weight",
+                        str(float(normal_consistency_weight))])
+        if float(normal_flatten_weight) > 0.0:
+            command.extend(["--normal-flatten-weight", str(float(normal_flatten_weight))])
+        if str(normal_loss_space) not in ("", "auto"):
+            command.extend(["--normal-loss-space", str(normal_loss_space)])
+        if float(normal_start_fraction) != 0.08:
+            command.extend(["--normal-start-fraction", str(float(normal_start_fraction))])
+        if float(normal_end_fraction) != 1.0:
+            command.extend(["--normal-end-fraction", str(float(normal_end_fraction))])
     if log_file:
         command.extend(["--log-file", str(log_file)])
     # Surface anchors. Studio's `--add-splat` appends trained Gaussians *before* the
@@ -1046,6 +1123,10 @@ def build_training_command(
         command.extend(["--add-splat", str(anchor)])
     if anchor_splats and anchor_freeze:
         command.append("--freeze")
+        # 0.5.4: a frozen splat can still absorb a little appearance mismatch instead of
+        # being a hard 0-gradient wall (0 = fully frozen, the default).
+        if freeze_lr_scale is not None and float(freeze_lr_scale) > 0.0:
+            command.extend(["--freeze-lr-scale", str(float(freeze_lr_scale))])
     return command
 
 
@@ -1731,6 +1812,77 @@ class LichtfeldHeadlessTrainer:
                         "undistorts on the fly and adjusts the intrinsics itself."
                     ),
                 }),
+                # ---- Lichtfeld 0.5.4: normal supervision -------------------
+                "use_normal_loss": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": (
+                        "Lichtfeld 0.5.4+. Supervise the surface with per-pixel NORMAL "
+                        "maps, which is the strongest soft geometry constraint the "
+                        "trainer has: normals pin the SURFACE ORIENTATION, which a depth "
+                        "map alone cannot (depth says where, normals say which way it "
+                        "faces - and that is what floaters and 'double surfaces' get "
+                        "wrong). Needs a 'normals/' folder in the dataset; run Studio's "
+                        "'preprocess' (MoGe-2, depth + normals in one forward pass, so "
+                        "they agree with each other) or leave Studio's own auto-generate "
+                        "on. Needs a 0.5.4 build - older builds drop the flags."
+                    ),
+                }),
+                "normal_loss_weight": ("FLOAT", {
+                    "default": 0.005, "min": 0.0, "max": 0.5, "step": 0.001,
+                    "tooltip": (
+                        "Studio's own default (0.005) and a sensible start. Normals are a "
+                        "much more direct constraint than depth, so this stays two orders "
+                        "of magnitude below 'Depth Loss Weight' - pushing it up is how "
+                        "you trade photometric sharpness for surface correctness. Raise "
+                        "it if the surface stays blobby; lower it if textures go flat."
+                    ),
+                }),
+                "normal_consistency_weight": ("FLOAT", {
+                    "default": 0.001, "min": 0.0, "max": 0.2, "step": 0.001,
+                    "tooltip": (
+                        "Studio's own default (0.001). Ties the DEPTH and NORMAL priors "
+                        "together so they cannot contradict each other - the two are "
+                        "generated in one MoGe-2 pass, so disagreement between them is a "
+                        "sign that one of the two is being over-weighted. This is the "
+                        "cheapest way to keep the pair honest."
+                    ),
+                }),
+                "normal_flatten_weight": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": (
+                        "Studio's default is 0 (off). While normal supervision is active "
+                        "it flattens the smallest Gaussian axis, i.e. it attacks "
+                        "NEEDLE-SHAPED splats - the ones that exist to explain one "
+                        "disagreeing view and that read as spikes and floaters. Worth "
+                        "trying when a scene looks correct but 'hairy'. It only applies "
+                        "during the normal-supervision window, so it cannot damage the "
+                        "final iterations."
+                    ),
+                }),
+                "normal_loss_space": (["auto", "camera-opencv", "camera-opengl", "world"], {
+                    "default": "auto",
+                    "tooltip": (
+                        "Coordinate space the normal prior is compared in. 'auto' lets "
+                        "Studio decide and is right unless you know your maps are in a "
+                        "specific frame. 'world' is the interesting one for multi-view "
+                        "consistency (the normals are then anchored to the "
+                        "reconstruction, not to each camera), but a monocular estimator "
+                        "like MoGe-2 predicts CAMERA-space normals, so 'auto' / "
+                        "'camera-opencv' is what those maps actually mean."
+                    ),
+                }),
+                "freeze_lr_scale": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": (
+                        "Lichtfeld 0.5.4+. Only used when Surface Anchors are frozen. "
+                        "0 (default) is the hard freeze: the anchor Gaussians get no "
+                        "gradients at all. 0.01-0.1 lets them absorb a small APPEARANCE "
+                        "mismatch (exposure, white balance, a slightly wrong colour) "
+                        "without moving the geometry much - the middle ground between "
+                        "'anchors fight the images' and 'anchors are gone'. Geometry-wise "
+                        "the hard freeze is still the stronger constraint."
+                    ),
+                }),
             }
         }
 
@@ -1806,6 +1958,12 @@ class LichtfeldHeadlessTrainer:
         anchor_resolution=256,
         anchor_freeze=True,
         undistort_cameras="auto",
+        use_normal_loss=False,
+        normal_loss_weight=0.005,
+        normal_consistency_weight=0.001,
+        normal_flatten_weight=0.0,
+        normal_loss_space="auto",
+        freeze_lr_scale=0.0,
     ):
         iterations = int(iterations)
         if iterations < 1:
@@ -1949,6 +2107,19 @@ class LichtfeldHeadlessTrainer:
                 output / f"lichtfeld_training_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
             )
 
+        # 0.5.3 named the depth-prior conventions `adaptive-warped-l1` / `pearson`, 0.5.4
+        # replaced them with the `ssi` family. Translate once, here, so BOTH the config file
+        # and the command line carry a value the installed build accepts.
+        supported_depth_modes = studio.get("depth_loss_modes") if studio else None
+        depth_loss_mode = resolve_depth_loss_mode(depth_loss_mode, supported_depth_modes)
+        if supported_depth_modes and depth_loss_mode not in supported_depth_modes:
+            note = (f"this Studio build does not accept depth loss mode '{depth_loss_mode}' "
+                    f"(it offers {', '.join(sorted(supported_depth_modes))}) - "
+                    "the build's own default is used.")
+            compatibility_notes.append(note)
+            print(f"[Enndee Lichtfeld] Note: {note}", flush=True)
+            depth_loss_mode = ""
+
         settings_section = build_lfs_optimization_section(
             grow_until_iter=grow_until_iter,
             stop_refine=stop_refine,
@@ -2062,6 +2233,14 @@ class LichtfeldHeadlessTrainer:
             anchor_splats=anchor_splats,
             anchor_freeze=bool(anchor_freeze),
             undistort=bool(undistort),
+            use_normal_loss=bool(use_normal_loss),
+            normal_loss_weight=float(normal_loss_weight),
+            normal_consistency_weight=float(normal_consistency_weight),
+            normal_flatten_weight=float(normal_flatten_weight),
+            normal_loss_space=str(normal_loss_space),
+            freeze_lr_scale=float(freeze_lr_scale),
+            depth_loss_mode=str(depth_loss_mode or ""),
+            depth_loss_weight=float(depth_loss_weight) if use_depth_loss else 0.0,
         )
         command, dropped_flags = filter_supported_flags(command, studio["flags"])
         if dropped_flags:

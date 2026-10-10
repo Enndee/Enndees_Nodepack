@@ -25,6 +25,7 @@ from lichtfeld_training_node import (  # noqa: E402
     UNDISTORT_MODES,
     dataset_camera_models,
     dataset_needs_undistort,
+    resolve_depth_loss_mode,
     LichtfeldHeadlessTrainer,
     build_conversion_command,
     build_lfs_optimization_section,
@@ -725,11 +726,12 @@ class LichtfeldCommandTests(unittest.TestCase):
         # workflows. Any new control must therefore go last.
         spec = LichtfeldHeadlessTrainer.INPUT_TYPES()["required"]
         names = list(spec)
-        # the anchor block is the newest addition, so it owns the tail; subject_mode is the
-        # newest control BEFORE it and must still precede it.
-        self.assertEqual(names[-5:], ["use_surface_anchors", "surface_anchor_mesh",
-                                      "anchor_resolution", "anchor_freeze",
-                                      "undistort_cameras"])
+        # the 0.5.4 supervision block is the newest addition, so it owns the tail;
+        # subject_mode is the newest control before the anchor block and must precede it.
+        self.assertEqual(names[-7:], ["undistort_cameras", "use_normal_loss",
+                                      "normal_loss_weight", "normal_consistency_weight",
+                                      "normal_flatten_weight", "normal_loss_space",
+                                      "freeze_lr_scale"])
         self.assertEqual(names[names.index("subject_mode") + 1], "use_surface_anchors")
 
     # ---------------------------------------------------------------- surface anchors
@@ -906,6 +908,104 @@ class LichtfeldCommandTests(unittest.TestCase):
                 f"{header}1 SIMPLE_RADIAL 3456 2304 2786.2 1728 1152 0.01\n",
                 encoding="utf-8")
             self.assertTrue(dataset_needs_undistort(dataset))
+
+    # ------------------------------------------------- Lichtfeld 0.5.4 supervision
+    def test_normal_loss_widgets_are_declared_and_in_the_signature(self):
+        spec = LichtfeldHeadlessTrainer.INPUT_TYPES()["required"]
+        names = ("use_normal_loss", "normal_loss_weight", "normal_consistency_weight",
+                 "normal_flatten_weight", "normal_loss_space", "freeze_lr_scale")
+        for name in names:
+            self.assertIn(name, spec, name)
+
+        import inspect
+
+        parameters = set(inspect.signature(LichtfeldHeadlessTrainer.train).parameters)
+        for name in names:
+            self.assertIn(name, parameters, name)
+
+        # OFF by default, and the weights keep Studio's own 0.5.4 defaults: normals are a
+        # much more direct constraint than depth, so the weight is two orders smaller.
+        self.assertEqual(spec["use_normal_loss"][1]["default"], False)
+        self.assertAlmostEqual(spec["normal_loss_weight"][1]["default"], 0.005)
+        self.assertAlmostEqual(spec["normal_consistency_weight"][1]["default"], 0.001)
+        self.assertAlmostEqual(spec["normal_flatten_weight"][1]["default"], 0.0)
+        self.assertEqual(spec["normal_loss_space"][1]["default"], "auto")
+        self.assertEqual(list(spec["normal_loss_space"][0]),
+                         ["auto", "camera-opencv", "camera-opengl", "world"])
+        self.assertAlmostEqual(spec["freeze_lr_scale"][1]["default"], 0.0)
+
+    def test_build_training_command_emits_the_normal_flags(self):
+        plain = build_training_command(**default_command_options())
+        for flag in ("--use-normal-loss", "--normal-loss-weight",
+                     "--normal-consistency-weight", "--normal-flatten-weight",
+                     "--normal-loss-space"):
+            self.assertNotIn(flag, plain, flag)
+
+        command = build_training_command(**default_command_options(), use_normal_loss=True)
+        self.assertIn("--use-normal-loss", command)
+        self.assertEqual(command[command.index("--normal-loss-weight") + 1], "0.005")
+        self.assertEqual(command[command.index("--normal-consistency-weight") + 1], "0.001")
+        # flatten 0 / space auto are the build's own defaults, so they are not sent
+        self.assertNotIn("--normal-flatten-weight", command)
+        self.assertNotIn("--normal-loss-space", command)
+
+        tuned = build_training_command(**default_command_options(), use_normal_loss=True,
+                                       normal_flatten_weight=0.05,
+                                       normal_loss_space="camera-opencv")
+        self.assertEqual(tuned[tuned.index("--normal-flatten-weight") + 1], "0.05")
+        self.assertEqual(tuned[tuned.index("--normal-loss-space") + 1], "camera-opencv")
+
+    def test_normal_and_freeze_flags_are_value_flags(self):
+        # a dropped flag must take its value with it, or Studio gets a stray argument
+        for flag in ("--normal-loss-weight", "--normal-consistency-weight",
+                     "--normal-flatten-weight", "--normal-loss-space",
+                     "--depth-loss-mode", "--depth-loss-weight", "--freeze-lr-scale"):
+            self.assertIn(flag, _LFS_VALUE_FLAGS, flag)
+
+    def test_freeze_lr_scale_needs_frozen_anchors(self):
+        # 0.0 is the hard freeze Studio already defaults to, so nothing is sent
+        command = build_training_command(**default_command_options(),
+                                         anchor_splats=[Path("a.ply")],
+                                         anchor_freeze=True, freeze_lr_scale=0.05)
+        self.assertIn("--freeze", command)
+        self.assertEqual(command[command.index("--freeze-lr-scale") + 1], "0.05")
+
+        hard = build_training_command(**default_command_options(),
+                                      anchor_splats=[Path("a.ply")],
+                                      anchor_freeze=True, freeze_lr_scale=0.0)
+        self.assertNotIn("--freeze-lr-scale", hard)
+
+        # without anchors there is nothing to freeze, so the scale is meaningless
+        warm = build_training_command(**default_command_options(),
+                                      anchor_splats=[Path("a.ply")],
+                                      anchor_freeze=False, freeze_lr_scale=0.05)
+        self.assertNotIn("--freeze-lr-scale", warm)
+
+    def test_depth_loss_mode_is_translated_for_a_0_5_4_build(self):
+        # 0.5.3 named them adaptive-warped-l1 / pearson; 0.5.4 replaced both with the ssi
+        # family, so a saved workflow's value has to be translated instead of rejected.
+        new = frozenset({"ssi", "ssi-disparity", "ssi-depth"})
+        self.assertEqual(resolve_depth_loss_mode("adaptive-warped-l1", new), "ssi")
+        self.assertEqual(resolve_depth_loss_mode("pearson", new), "ssi")
+        self.assertEqual(resolve_depth_loss_mode("ssi-depth", new), "ssi-depth")
+        # an unknown build says nothing usable -> pass the value through untouched
+        self.assertEqual(resolve_depth_loss_mode("pearson", None), "pearson")
+        # a value the build does not know and we cannot map -> the build's own default
+        self.assertEqual(resolve_depth_loss_mode("something-else", new), "ssi")
+        self.assertEqual(resolve_depth_loss_mode("", new), "")
+
+    def test_parse_studio_capabilities_reads_the_0_5_4_depth_modes(self):
+        help_text = (
+            "        --depth-loss-mode=[depth_loss_mode]\n"
+            "                                          Depth prior convention: ssi "
+            "(auto-detect), ssi-disparity, or ssi-depth (default: ssi)\n"
+        )
+        capabilities = parse_studio_capabilities(help_text)
+        self.assertEqual(capabilities["depth_loss_modes"],
+                         frozenset({"ssi", "ssi-disparity", "ssi-depth"}))
+        # a 0.5.3-style help without that sentence leaves it unknown
+        self.assertIsNone(
+            parse_studio_capabilities("--depth-loss-mode=[m]\n")["depth_loss_modes"])
 
     def test_write_lfs_config_file_merges_a_user_config(self):
         with tempfile.TemporaryDirectory() as temp_dir:

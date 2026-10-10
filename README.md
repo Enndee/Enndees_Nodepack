@@ -711,6 +711,62 @@ the COLMAP node's default, and what the VGGT node always writes - need nothing. 
 forces the flag, `off` never sends it. Studio undistorts on the fly and adjusts the
 intrinsics itself (measured: 3456x2304 -> 3422x2281 with fx/fy unchanged).
 
+### Normal supervision (Lichtfeld 0.5.4+)
+
+0.5.4 can supervise the surface **orientation**, not just its depth. A depth map says *where*
+a surface is; a normal map says *which way it faces* - and floaters, spikes and "double
+surfaces" are exactly the cases where depth is satisfied but orientation is not. For
+drifting AI video that makes normals the most direct constraint the trainer has.
+
+| Widget | Default | Studio flag |
+| --- | --- | --- |
+| `use_normal_loss` | off | `--use-normal-loss` |
+| `normal_loss_weight` | 0.005 | `--normal-loss-weight` |
+| `normal_consistency_weight` | 0.001 | `--normal-consistency-weight` |
+| `normal_flatten_weight` | 0 | `--normal-flatten-weight` |
+| `normal_loss_space` | auto | `--normal-loss-space` |
+
+The weights keep Studio's own defaults: normals are a much more direct constraint than
+depth, so `normal_loss_weight` sits two orders of magnitude below `depth_loss_weight`.
+`normal_consistency_weight` ties the depth and normal priors together so they cannot
+contradict each other. `normal_flatten_weight` flattens the smallest Gaussian axis while
+normal supervision is active, i.e. it attacks needle-shaped splats - try it when a scene
+looks correct but "hairy".
+
+**Where the normal maps come from.** The dataset needs a `normals/` folder. Studio can
+generate it itself (MoGe-2, `--no-normal-auto-generate` is off by default), or you can
+pre-generate it once so it becomes a fixed artefact:
+
+    LichtFeld-Studio.exe preprocess <dataset> --mode both --max-side 1024 --bit-depth 16 -y
+      depth/<image>.png     16-bit
+      normals/<image>.png   RGB, [-1,1] encoded to [0,255]
+
+Both maps come out of **one MoGe-2 forward pass**, so they agree with each other by
+construction - the same gauge rule that pairs COLMAP depth with COLMAP poses. Note that
+MoGe-2 predicts *camera*-space normals, which is what `normal_loss_space='auto'` expects;
+only switch to `world` if you know your maps are world-space.
+
+If the dataset carries no `normals/` folder, Studio logs a warning and trains without the
+normal term - the run does not fail.
+
+### `freeze_lr_scale`: the soft freeze
+
+`freeze_lr_scale` (0.5.4+) only applies when `anchor_freeze` is on. `0` (default) is the
+hard freeze: the anchor Gaussians get no gradients at all. `0.01-0.1` lets them absorb a
+small **appearance** mismatch - exposure, white balance, a slightly wrong colour - without
+moving the geometry much. That is the middle ground between "the anchors fight the images"
+and "the anchors are gone"; geometry-wise the hard freeze is still the stronger constraint.
+
+### `--depth-loss-mode` values changed in 0.5.4
+
+0.5.3 used `adaptive-warped-l1` / `pearson`; 0.5.4 replaced both with an auto-detecting
+`ssi` family (`ssi`, `ssi-disparity`, `ssi-depth`). A saved workflow sending the old value
+would be rejected by 0.5.4, so the node reads the accepted values out of the build's own
+`--help` and translates the 0.5.3 names to `ssi` automatically. If a build reports values
+the node cannot map, it says so in the summary and falls back to the build's own default.
+`ssi` means scale-and-shift invariant, so the depth loss re-gauges each map to the current
+render - which is why a monocular depth prior can be used with any pose set.
+
 ### Tracker features vs. trained splats
 
 The GLOMAP tracker's `max_features` controls the maximum number of SIFT keypoints
