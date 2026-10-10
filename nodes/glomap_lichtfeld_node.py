@@ -712,7 +712,16 @@ class GLOMAPLichtfeldTracker:
 
     @staticmethod
     def _as_image_batch(images):
-        """Normalise an IMAGE input to a float32 tensor [N,H,W,C] on the CPU."""
+        """Normalise an IMAGE input to a float32 tensor [N,H,W,C] in [0, 1].
+
+        ComfyUI hands ``IMAGE`` over as float32 in ``[0, 1]``, but a caller that
+        drives :meth:`track` from a script (or another custom node) may hand over
+        8-bit ``0..255`` data instead.  Without the rescale below the pipeline
+        still runs and writes *silently* wrong files: the dataset export clamps
+        to ``[0, 1]``, so every non-zero pixel becomes 1 and the dataset images
+        come out as binary masks - and the depth model is fed that same mask.
+        This is the same guard :meth:`_as_mask_tensor` already applies.
+        """
         if isinstance(images, torch.Tensor):
             batch = images.detach()
         else:
@@ -722,7 +731,14 @@ class GLOMAPLichtfeldTracker:
             batch = batch.unsqueeze(0)
         if batch.dim() != 4:
             return None
-        return batch.to("cpu", dtype=torch.float32).contiguous()
+        batch = batch.to("cpu", dtype=torch.float32).contiguous()
+
+        if batch.numel() and float(batch.max()) > 1.0:
+            log_warn("images arrived outside the ComfyUI [0, 1] float range "
+                     "(8-bit 0..255?) - rescaling by 1/255; without this the "
+                     "dataset export would clamp them into a binary mask")
+            batch = batch / 255.0
+        return batch.clamp(0.0, 1.0).contiguous()
 
     @staticmethod
     def _as_mask_tensor(masks):

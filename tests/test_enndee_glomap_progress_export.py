@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+import torch
 from PIL import Image
 
 
@@ -112,6 +113,68 @@ class DatasetImageExportTests(unittest.TestCase):
         wrapper.progress_callback = messages.append
         wrapper._log_progress("Feature extraction started")
         self.assertEqual(messages, ["[SfM] Feature extraction started"])
+
+
+class ImageBatchNormalisationTests(unittest.TestCase):
+    """A 0..255 batch must be rescaled, not clamped into a binary mask.
+
+    Regression: driving ``track()`` with an 8-bit array used to make the dataset
+    export write ``clamp(x, 0, 1) * 255`` - every non-zero pixel became 255, so
+    the frames came out as white/magenta masks and the depth model was fed the
+    same mask.  Nothing warned; the run reported success.
+    """
+
+    @staticmethod
+    def batch(images):
+        return GLOMAPLichtfeldTracker._as_image_batch(images)
+
+    def test_uint8_batch_is_rescaled_to_unit_range(self):
+        photo = (np.arange(2 * 3 * 3 * 3).reshape(2, 3, 3, 3) % 256).astype(np.uint8)
+        batch = self.batch(photo)
+        self.assertEqual(batch.dtype, torch.float32)
+        expected = torch.from_numpy(photo.astype(np.float32) / 255.0)
+        self.assertTrue(torch.allclose(batch, expected, atol=1e-6))
+
+    def test_torch_uint8_batch_is_rescaled_too(self):
+        photo = (np.arange(2 * 3 * 3 * 3).reshape(2, 3, 3, 3) % 256).astype(np.uint8)
+        batch = self.batch(torch.from_numpy(photo.copy()))
+        expected = torch.from_numpy(photo.astype(np.float32) / 255.0)
+        self.assertTrue(torch.allclose(batch, expected, atol=1e-6))
+
+    def test_unit_float_batch_is_untouched(self):
+        unit = np.linspace(0.0, 1.0, 2 * 3 * 3 * 3, dtype=np.float32).reshape(2, 3, 3, 3)
+        self.assertTrue(np.array_equal(self.batch(unit).numpy(), unit))
+
+    def test_uint8_input_does_not_export_a_binary_image(self):
+        photo = np.zeros((1, 8, 6, 3), dtype=np.uint8)
+        photo[0, :, :, 0] = 17   # dark but non-zero
+        photo[0, :, :, 1] = 0    # exactly zero -> the old magenta channel
+        photo[0, :, :, 2] = 34
+        batch = self.batch(photo)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            GLOMAPLichtfeldTracker._export_dataset_images(
+                None, Path(temp_dir), batch, None
+            )
+            output = Path(temp_dir) / "images" / "0001.png"
+            written = np.asarray(Image.open(output).convert("RGB"))
+        self.assertEqual(int(written[0, 0, 0]), 17)
+        self.assertEqual(int(written[0, 0, 1]), 0)
+        self.assertEqual(int(written[0, 0, 2]), 34)
+        self.assertEqual(len(np.unique(written)), 3)
+
+    def test_empty_saturated_and_boolean_batches_survive(self):
+        empty = self.batch(np.zeros((0, 4, 4, 3), dtype=np.float32))
+        self.assertEqual(tuple(empty.shape), (0, 4, 4, 3))
+        self.assertEqual(float(self.batch(np.zeros((1, 4, 4, 3), np.float32)).max()), 0.0)
+        self.assertEqual(float(self.batch(np.ones((1, 4, 4, 3), np.float32)).min()), 1.0)
+        self.assertEqual(float(self.batch(np.ones((1, 4, 4, 3), bool)).min()), 1.0)
+
+    def test_single_image_gets_a_batch_axis(self):
+        self.assertEqual(tuple(self.batch(np.zeros((4, 4, 3), np.uint8)).shape),
+                         (1, 4, 4, 3))
+
+    def test_non_four_dimensional_input_is_rejected(self):
+        self.assertIsNone(self.batch(np.zeros((4, 4), np.float32)))
 
 
 if __name__ == "__main__":
