@@ -27,13 +27,15 @@ binaries (``ENNDEE_AUTO_DOWNLOAD=0`` disables it) plus the node's
 import os
 import subprocess
 import sys
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Optional, Tuple
 
 #: pip requirement per torch CUDA major version.
 ONNX_GPU_SPECS = {13: "onnxruntime-gpu>=1.30", 12: "onnxruntime-gpu>=1.19,<1.30"}
 ONNX_GPU_FALLBACK = "onnxruntime-gpu"
 PYCOLMAP_SPEC = "pycolmap"
-#: packages that ship a CUDA enabled pycolmap (platform dependent, see docs)
+#: historical name(s) of a CUDA enabled pycolmap distribution - there is no CUDA pycolmap
+#: wheel for Windows/cp313 on PyPI, so ``pycolmap_cuda_specs`` prepends the torch-CUDA-major
+#: aware name and this stays as the fallback.
 PYCOLMAP_CUDA_SPECS = ("pycolmap-cuda12",)
 #: point at a self built / downloaded CUDA pycolmap wheel (path or URL)
 PYCOLMAP_CUDA_WHEEL_ENV = "ENNDEE_PYCOLMAP_CUDA_WHEEL"
@@ -177,26 +179,72 @@ def _pip_can_install(spec: str, dry: bool = False) -> bool:
     return code == 0
 
 
-def _install_pycolmap_cuda(say, dry: bool = False) -> str:
-    """Try every known CUDA pycolmap source; returns the reason when none worked."""
+def pycolmap_cuda_specs(cuda_major: Optional[int] = None) -> Tuple[str, ...]:
+    """CUDA pycolmap distribution names to try, torch-CUDA-major aware first.
+
+    There is no CUDA pycolmap wheel on PyPI for Windows/cp313, so these names are a
+    best effort: ``pycolmap-cuda13`` on a CUDA 13 machine, then the historical
+    ``pycolmap-cuda12`` name as the fallback. A self-built wheel always wins - point
+    ``ENNDEE_PYCOLMAP_CUDA_WHEEL`` at it (path or URL, e.g.
+    ``D:\\dev\\wheels_repaired4\\pycolmap-4.2.1-cp313-cp313-win_amd64.whl``) and it is
+    installed directly, see ``_install_pycolmap_cuda``.
+    """
+    major = cuda_major if cuda_major is not None else torch_cuda_major()
+    specs = [f"pycolmap-cuda{major}"] if major else []
+    specs.extend(PYCOLMAP_CUDA_SPECS)
+    return tuple(dict.fromkeys(specs))
+
+
+def _verify_pycolmap_cuda() -> Tuple[bool, str]:
+    """Re-import pycolmap after an install and say whether it really is a CUDA build.
+
+    Returns ``(has_cuda, "pycolmap <version>")`` so the caller can report the installed
+    version and never claim a GPU build that is not there.
+    """
+    state = pycolmap_state()
+    return bool(state.get("cuda")), f"pycolmap {state.get('version') or '?'}"
+
+
+def _cuda_major_from_state(cuda: Dict[str, object]) -> Optional[int]:
+    """CUDA major version from a ``cuda_state()`` dict (its ``version`` may be a driver)."""
+    try:
+        return int(str(cuda.get("version") or "").split(".")[0])
+    except (TypeError, ValueError):
+        return None
+
+
+def _install_pycolmap_cuda(say, dry: bool = False,
+                           cuda_major: Optional[int] = None) -> str:
+    """Try every known CUDA pycolmap source; returns the reason when none worked.
+
+    ``ENNDEE_PYCOLMAP_CUDA_WHEEL`` (a path or URL to a self-built wheel) is the first
+    choice, then the torch-CUDA-major aware distribution names. Every attempt is
+    verified with ``pycolmap_info()`` - a wheel that installs but leaves ``cuda`` False
+    is reported as a failure *with its version*, so a CPU wheel never masquerades as a
+    GPU build.
+    """
     reasons = []
     wheel = (os.environ.get(PYCOLMAP_CUDA_WHEEL_ENV) or "").strip()
     if wheel:
         say(f"{PYCOLMAP_CUDA_WHEEL_ENV} is set - installing the CUDA build from {wheel}")
         code, _ = pip(["install", "--force-reinstall", "--no-deps", wheel], dry=dry)
-        if code == 0:
-            return f"installed from {PYCOLMAP_CUDA_WHEEL_ENV}"
-        reasons.append(f"{PYCOLMAP_CUDA_WHEEL_ENV} could not be installed")
+        ok, detail = _verify_pycolmap_cuda()
+        if code == 0 and ok:
+            return f"installed from {PYCOLMAP_CUDA_WHEEL_ENV} ({detail}, CUDA)"
+        reasons.append(f"{PYCOLMAP_CUDA_WHEEL_ENV} installed {detail} without CUDA support"
+                       if code == 0 else f"{PYCOLMAP_CUDA_WHEEL_ENV} could not be installed")
 
-    for spec in PYCOLMAP_CUDA_SPECS:
+    for spec in pycolmap_cuda_specs(cuda_major):
         if not _pip_can_install(spec, dry=dry):
             reasons.append(f"no '{spec}' wheel exists for this platform")
             continue
         say(f"installing the CUDA build: {spec}")
         code, _ = pip(["install", "--force-reinstall", "--no-deps", spec], dry=dry)
-        if code == 0:
-            return f"installed {spec}"
-        reasons.append(f"{spec} could not be installed")
+        ok, detail = _verify_pycolmap_cuda()
+        if code == 0 and ok:
+            return f"installed {spec} ({detail}, CUDA)"
+        reasons.append(f"{spec} installed {detail} without CUDA support"
+                       if code == 0 else f"{spec} could not be installed")
 
     reasons.append(f"build pycolmap from source with CUDA, or set "
                    f"{PYCOLMAP_CUDA_WHEEL_ENV}=<wheel|url>")
@@ -220,6 +268,9 @@ def ensure_pycolmap(auto_install: bool = True, prefer_cuda: bool = True, dry: bo
     cuda = cuda_state()
     state = pycolmap_state()
     allowed = bool(auto_install) and auto_install_enabled()
+    # torch knows its CUDA major; a cuda_state() "version" may be a *driver* version, so
+    # it is only the fallback for choosing the wheel name.
+    cuda_major = torch_cuda_major() or _cuda_major_from_state(cuda)
 
     # ---- 1. installed at all? -------------------------------------------
     if not state.get("available"):
@@ -250,18 +301,21 @@ def ensure_pycolmap(auto_install: bool = True, prefer_cuda: bool = True, dry: bo
         return _pycolmap_result(
             state, cuda, "cpu-fallback",
             "CUDA is available but auto install is off - install "
-            f"{PYCOLMAP_CUDA_SPECS[0]} or set {PYCOLMAP_CUDA_WHEEL_ENV}=<wheel|url>")
+            f"{pycolmap_cuda_specs(cuda_major)[0]} or set "
+            f"{PYCOLMAP_CUDA_WHEEL_ENV}=<wheel|url>")
 
     # ---- 4. try to get a CUDA build (once per session) ------------------
     cache_key = f"{state.get('version')}|{cuda.get('version')}"
     if cache_key not in _CUDA_ATTEMPT:
         say(f"CUDA {cuda.get('version') or '?'} ({cuda.get('device') or 'GPU'}) is available, "
             f"but pycolmap has no CUDA support - looking for a CUDA build")
-        _CUDA_ATTEMPT[cache_key] = _install_pycolmap_cuda(say, dry=dry)
+        _CUDA_ATTEMPT[cache_key] = _install_pycolmap_cuda(say, dry=dry,
+                                                          cuda_major=cuda_major)
         state = pycolmap_state()
 
     if state.get("cuda"):
-        return _pycolmap_result(state, cuda, "cuda", "CUDA build installed")
+        # the reason carries the installed version + source (verified with pycolmap_info)
+        return _pycolmap_result(state, cuda, "cuda", str(_CUDA_ATTEMPT[cache_key]))
 
     reason = str(_CUDA_ATTEMPT[cache_key])
     say(f"staying on the CPU: {reason}")

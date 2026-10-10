@@ -203,10 +203,13 @@ class MeridianFastDepthHelperTests(unittest.TestCase):
         self.assertEqual(float(fast_depth._flat_quantile(ramp, 0.5)),
                          float(torch.quantile(ramp, 0.5)))                   # small pools stay exact
         huge = torch.arange((1 << 24) + 2, dtype=torch.float32)              # just past the ceiling
-        with self.assertRaises(RuntimeError):
-            torch.quantile(huge, 0.5)                                        # the crash this helper prevents
+        # The helper exists because torch.quantile used to raise above 2**24 elements
+        # ("quantile() input tensor is too large"). torch 2.14 no longer does - verified on this
+        # machine - so an `assertRaises(RuntimeError)` here would be a probe of the installed
+        # torch rather than a test of the helper. What must hold on EVERY version is the result:
+        # past the limit the helper still returns the correct median, because it strides the pool.
         self.assertAlmostEqual(float(fast_depth._flat_quantile(huge, 0.5)),
-                               (huge.numel() - 1) / 2, delta=4.0)            # the stride keeps the median
+                               (huge.numel() - 1) / 2, delta=4.0)
     def test_cloud_gauge_puts_the_depth_in_the_renderers_window(self):
         """The auto camera must estimate in the gauge `render_depth_aligned` unprojects.
 
@@ -472,7 +475,8 @@ class MeridianFastDepthHelperTests(unittest.TestCase):
         self.assertAlmostEqual(float(swing[1, 2, 3]), float(swing[3, 2, 3]), places=4)
 
 class MeridianFastDepthEngineTests(unittest.TestCase):
-    def _generate(self, image=None, model=None, da3_depth=None, camera=None, custom_camera=None, **overrides):
+    def _generate(self, image=None, model=None, da3_depth=None, camera=None, custom_camera=None,
+                  device=None, **overrides):
         options = dict(
             model_size="Depth-Anything-V2-Small-hf", frames=73, canvas_mode="custom",
             custom_width=112, custom_height=64, cloud_scale=1, point_size=0,
@@ -484,7 +488,8 @@ class MeridianFastDepthEngineTests(unittest.TestCase):
              mock.patch.object(fast_depth, "_predict_da3_depth",
                                lambda *args, **kwargs_: da3_depth):
             return fast_depth.render_depth_aligned(
-                image if image is not None else _gradient_image(), torch.device("cpu"),
+                image if image is not None else _gradient_image(),
+                device if device is not None else torch.device("cpu"),
                 camera=camera, custom_camera=custom_camera, **options)
 
     def test_static_camera_reproduces_the_depth_aligned_texture(self):
@@ -495,6 +500,25 @@ class MeridianFastDepthEngineTests(unittest.TestCase):
         for frame in (0, -1):
             difference = (render[frame] - source[frame]).abs().max().item()
             self.assertLess(difference, 0.005)
+
+    def test_an_external_depth_map_from_the_cpu_renders_on_the_gpu(self):
+        """Regression: the map arrives on the CPU, the renderer builds on CUDA.
+
+        ComfyUI hands an IMAGE/MASK tensor over on the CPU. With the map left there, the cloud
+        unprojection (a CUDA meshgrid multiplied by the depth) died with
+        "Expected all tensors to be on the same device, but found at least two devices,
+        cuda:0 and cpu!" - so this test has to run on the *real* device, not on "cpu".
+        """
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        external = torch.linspace(0.0, 1.0, 64 * 112).view(1, 64, 112, 1)
+        self.assertEqual(external.device.type, "cpu")
+
+        source, render, width, height, length = self._generate(
+            device=device, model_size="external", external_depth=external)
+
+        self.assertEqual((width, height, length), (112, 64, 73))
+        self.assertEqual(tuple(source.shape), (73, 64, 112, 3))
+        self.assertEqual(tuple(render.shape), (73, 64, 112, 3))
 
     def test_yaw_flight_moves_the_view_and_keeps_coverage(self):
         source, render, width, height, length = self._generate(

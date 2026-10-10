@@ -7,10 +7,13 @@ and the accelerator logic.
 
 import os
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
 from unittest import mock
+
+import numpy as np
 
 PACK_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACK_DIR / "nodes"))
@@ -34,7 +37,12 @@ class FakePycolmap:
         self.pair_error = pair_error
         self.camera_id = camera_id
         self.import_error = False
+        #: True = the matcher raises TypeError when any option keyword is passed (a
+        #: binding that does not know ``device`` / ``pairing_options``).
+        self.reject_kwargs = False
         self.calls = []
+        #: calls that were made without the optional keywords (the retry form).
+        self.bare_calls = []
         self.closed_databases = []
         self.pair_options = []
         self.pair_databases = []
@@ -107,14 +115,23 @@ class FakePycolmap:
     def extract_features(self, database, images, **kwargs):
         self.calls.append(("extract", str(database), str(images), kwargs))
 
+    def _record_match(self, name, database, kwargs):
+        """Record one matcher call - and reject the keyword form when asked to."""
+        if self.reject_kwargs and kwargs:
+            raise TypeError(f"{name}() got an unexpected keyword argument 'device'")
+        if kwargs:
+            self.calls.append((name, str(database), kwargs))
+        else:
+            self.bare_calls.append((name, str(database)))
+
     def match_sequential(self, database, **kwargs):
-        self.calls.append(("sequential", str(database), kwargs))
+        self._record_match("sequential", database, kwargs)
 
     def match_exhaustive(self, database, **kwargs):
-        self.calls.append(("exhaustive", str(database), kwargs))
+        self._record_match("exhaustive", database, kwargs)
 
     def match_image_pairs(self, database, **kwargs):
-        self.calls.append(("match_image_pairs", str(database), kwargs))
+        self._record_match("match_image_pairs", database, kwargs)
 
     def _models(self):
         class Model:
@@ -266,6 +283,34 @@ class PyColmapWrapperTests(unittest.TestCase):
         self.assertEqual(kwargs["matching_options"]["use_gpu"], False)
         self.assertEqual(self.progress[-1], (1, 1, "sequential matching"))
 
+    def test_builtin_matching_retries_without_rejected_option_keywords(self):
+        """A binding that rejects ``device``/``pairing_options`` must not kill the run."""
+        self.fake.pair_error = True                 # force the built-in matcher path
+        self.fake.reject_kwargs = True
+        self.assertTrue(self.wrapper.sequential_matcher(use_gpu=False, overlap=5))
+        self.assertEqual(self.fake.calls, [])       # the keyword form was refused
+        self.assertEqual(self.fake.bare_calls,
+                         [("sequential", str(self.wrapper.database_path))])
+        self.assertEqual(self.progress[-1], (1, 1, "sequential matching"))
+
+    def test_chunked_matching_retries_without_rejected_option_keywords(self):
+        self.fake.reject_kwargs = True
+        self.assertTrue(self.wrapper.exhaustive_matcher(use_gpu=False))
+        self.assertEqual([entry[0] for entry in self.fake.bare_calls],
+                         ["match_image_pairs"] * (len(self.IMAGES) - 1))
+        self.assertEqual(self.progress[-1],
+                         (4, 4, "exhaustive matching 4/4 pairs"))
+
+    def test_matching_still_fails_when_even_the_bare_form_fails(self):
+        self.fake.pair_error = True
+        self.fake.reject_kwargs = True
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("no matcher at all")
+
+        self.fake.match_sequential = boom
+        self.assertFalse(self.wrapper.sequential_matcher(use_gpu=False))
+
     def test_mapper_reports_progress(self):
         self.assertTrue(self.wrapper.mapper(backend="global"))
         self.assertEqual(self.progress[0], (0, 1, "global mapping"))
@@ -295,10 +340,42 @@ class PyColmapWrapperTests(unittest.TestCase):
         self.assertEqual(options["mapper"]["global_positioning"]["use_gpu"], False)
         self.assertEqual(options["mapper"]["bundle_adjustment"]["ceres"]["use_gpu"], False)
 
-    def test_mapper_keeps_the_gpu_solvers_with_cuda(self):
+    def test_mapper_also_disables_the_gpu_solvers_with_cuda(self):
+        """A CUDA build maps on the CPU too - the GPU solver needs cuDSS, not CUDA."""
         self.fake.has_cuda = True
         self.assertTrue(self.wrapper.mapper(backend="global"))
-        self.assertNotIn("mapper", self.fake.call("global")[4]["options"])
+        options = self.fake.call("global")[4]["options"]
+        self.assertEqual(options["mapper"]["global_positioning"]["use_gpu"], False)
+        self.assertEqual(options["mapper"]["bundle_adjustment"]["ceres"]["use_gpu"], False)
+
+    def test_mapper_never_touches_auto_select_solver_type(self):
+        """It changes the solver and does not help the default global-SfM BA."""
+        self.assertTrue(self.wrapper.mapper(backend="global"))
+        ceres = self.fake.call("global")[4]["options"]["mapper"]["bundle_adjustment"]["ceres"]
+        self.assertNotIn("auto_select_solver_type", ceres)
+
+    def test_mapper_reports_the_cpu_solver_once(self):
+        """One clear line instead of the two misleading COLMAP warnings."""
+        with mock.patch("builtins.print") as printed:
+            self.assertTrue(self.wrapper.mapper(backend="global"))
+        lines = [call.args[0] for call in printed.call_args_list if call.args]
+        solver = [line for line in lines if "mapping solver" in line]
+        self.assertEqual(len(solver), 1)
+        self.assertIn("CPU (SPARSE_SCHUR)", solver[0])
+        self.assertIn("cuDSS", solver[0])
+
+    def test_mapper_gpu_ba_switch_restores_the_gpu_solvers(self):
+        """``ENNDEE_PYCOLMAP_GPU_BA=1`` is the escape hatch for a cuDSS/Caspar build."""
+        with mock.patch.dict("os.environ", {pycolmap_wrapper.GPU_BA_ENV: "1"}), \
+                mock.patch("builtins.print") as printed:
+            self.assertTrue(self.wrapper.mapper(backend="global"))
+        options = self.fake.call("global")[4]["options"]
+        self.assertEqual(options["mapper"]["global_positioning"]["use_gpu"], True)
+        self.assertEqual(options["mapper"]["bundle_adjustment"]["ceres"]["use_gpu"], True)
+        lines = [call.args[0] for call in printed.call_args_list if call.args]
+        solver = [line for line in lines if "mapping solver" in line]
+        self.assertEqual(len(solver), 1)
+        self.assertIn("GPU requested", solver[0])
 
     def test_mapper_incremental_is_left_alone(self):
         """``IncrementalPipelineOptions`` has no ``mapper`` sub-tree - don't send one."""
@@ -315,7 +392,31 @@ class PyColmapWrapperTests(unittest.TestCase):
     def test_pycolmap_info_shape(self):
         info = pycolmap_wrapper.pycolmap_info()
         self.assertEqual(info, {"available": True, "version": "9.9.9-test",
-                                "cuda": False})
+                                "cuda": False, "device_name": "",
+                                "sift_on_gpu": False, "mapping_on_gpu": False})
+
+    def test_pycolmap_info_reports_a_cuda_build(self):
+        self.fake.has_cuda = True
+        with mock.patch.object(pycolmap_wrapper, "_cuda_device_name",
+                               return_value="RTX 5090"):
+            info = pycolmap_wrapper.pycolmap_info()
+        self.assertTrue(info["cuda"])
+        self.assertEqual(info["device_name"], "RTX 5090")
+        self.assertTrue(info["sift_on_gpu"])
+        self.assertFalse(info["mapping_on_gpu"])       # the GPU solver needs cuDSS
+
+    def test_pycolmap_info_reports_the_gpu_ba_switch(self):
+        self.fake.has_cuda = True
+        with mock.patch.dict("os.environ", {pycolmap_wrapper.GPU_BA_ENV: "1"}):
+            info = pycolmap_wrapper.pycolmap_info()
+        self.assertTrue(info["mapping_on_gpu"])
+
+    def test_pycolmap_info_without_pycolmap(self):
+        with mock.patch.object(pycolmap_wrapper, "import_pycolmap", return_value=None):
+            info = pycolmap_wrapper.pycolmap_info()
+        self.assertFalse(info["available"])
+        self.assertIn("sift_on_gpu", info)
+        self.assertIn("mapping_on_gpu", info)
 
 
 class GpuBridgeTests(unittest.TestCase):
@@ -476,13 +577,42 @@ class CpuNoticeTests(unittest.TestCase):
         self.assertIn("no CUDA support", printed.call_args.args[0])
         self.assertIn("GPU", printed.call_args.args[0])
 
-    def test_no_notice_with_cuda_or_without_use_gpu(self):
+    def test_no_notice_without_use_gpu(self):
         wrapper = pycolmap_wrapper.PyColmapWrapper()
         with mock.patch.object(pycolmap_wrapper, "_CPU_NOTICE_SHOWN", False), \
+                mock.patch.object(pycolmap_wrapper, "_MAPPING_NOTICE_SHOWN", False), \
                 mock.patch("builtins.print") as printed:
-            self.assertTrue(wrapper._effective_gpu(types.SimpleNamespace(has_cuda=True), True))
-            self.assertFalse(wrapper._effective_gpu(types.SimpleNamespace(has_cuda=False), False))
+            self.assertFalse(wrapper._effective_gpu(types.SimpleNamespace(has_cuda=False),
+                                                    False))
+            self.assertFalse(wrapper._effective_gpu(types.SimpleNamespace(has_cuda=True),
+                                                    False))
         printed.assert_not_called()
+
+
+class MappingNoticeTests(unittest.TestCase):
+    """A CUDA build explains *once* that its mapping still runs on the CPU."""
+
+    def test_mapping_notice_is_printed_once(self):
+        fake = types.SimpleNamespace(has_cuda=True)
+        wrapper = pycolmap_wrapper.PyColmapWrapper()
+        with mock.patch.object(pycolmap_wrapper, "_MAPPING_NOTICE_SHOWN", False), \
+                mock.patch("builtins.print") as printed:
+            self.assertTrue(wrapper._effective_gpu(fake, True))
+            self.assertTrue(wrapper._effective_gpu(fake, True))
+        self.assertEqual(printed.call_count, 1)
+        self.assertIn("stays on the CPU", printed.call_args.args[0])
+        self.assertIn("cuDSS", printed.call_args.args[0])
+
+    def test_the_two_notices_are_independent(self):
+        wrapper = pycolmap_wrapper.PyColmapWrapper()
+        with mock.patch.object(pycolmap_wrapper, "_CPU_NOTICE_SHOWN", False), \
+                mock.patch.object(pycolmap_wrapper, "_MAPPING_NOTICE_SHOWN", False), \
+                mock.patch("builtins.print") as printed:
+            wrapper._effective_gpu(types.SimpleNamespace(has_cuda=False), True)
+            wrapper._effective_gpu(types.SimpleNamespace(has_cuda=True), True)
+        self.assertEqual(printed.call_count, 2)
+        self.assertIn("no CUDA support", printed.call_args_list[0].args[0])
+        self.assertIn("stays on the CPU", printed.call_args_list[1].args[0])
 
 
 class NativeNodeTests(unittest.TestCase):
@@ -491,6 +621,11 @@ class NativeNodeTests(unittest.TestCase):
     REMOVED_REQUIRED = ("colmap_path", "glomap_path")
     REMOVED_OPTIONAL = ("binary_flavor",)
     OVERRIDDEN = ("mapper_backend", "auto_install_binaries")
+    #: the native node's dense-MVS products - appended LAST so existing
+    #: workflows keep their widget_values positions
+    ADDED_OPTIONAL = ("export_depth_maps", "dense_max_image_size",
+                      "dense_geom_consistency", "fuse_dense_cloud",
+                      "dense_cloud_max_points", "mesh_dense_surface", "mesh_method")
 
     def test_widget_parity_with_the_binary_node(self):
         binary_types = binary.GLOMAPLichtfeldTracker.INPUT_TYPES()
@@ -508,7 +643,9 @@ class NativeNodeTests(unittest.TestCase):
 
         expected_optional = [name for name in binary_types["optional"]
                              if name not in self.REMOVED_OPTIONAL]
-        self.assertEqual(list(native_types["optional"]), expected_optional)
+        # ... plus the depth-export widgets, appended last
+        self.assertEqual(list(native_types["optional"]),
+                         expected_optional + list(self.ADDED_OPTIONAL))
         for name in expected_optional:
             if name in self.OVERRIDDEN:
                 continue
@@ -529,7 +666,10 @@ class NativeNodeTests(unittest.TestCase):
             native.ColmapLichtfeldTracker.track).parameters)
         expected = [p for p in binary_params
                     if p not in self.REMOVED_REQUIRED + self.REMOVED_OPTIONAL]
-        # the native node adds the hidden node id for the live status events
+        # the native node adds only the hidden node id for the live status events;
+        # the depth-export parameters already exist on the shared base signature
+        # (the native node is simply the only one that exposes them as widgets -
+        # see test_widget_parity_with_the_binary_node)
         self.assertEqual(native_params, expected + ["unique_id"])
         self.assertEqual(native.ColmapLichtfeldTracker.FUNCTION, "track")
 
@@ -824,7 +964,10 @@ class PycolmapCudaTests(unittest.TestCase):
         pip.assert_not_called()  # nothing installable -> no pointless pip run
 
     def test_env_wheel_is_used_for_the_cuda_build(self):
+        # the install is verified with pycolmap_info(), so the state is read a third time
+        # (start, verify, re-check after the install)
         states = [{"available": True, "version": "4.2.1", "cuda": False},
+                  {"available": True, "version": "4.2.1", "cuda": True},
                   {"available": True, "version": "4.2.1", "cuda": True}]
         with mock.patch.object(accelerators, "pycolmap_state", side_effect=states), \
                 mock.patch.object(accelerators, "cuda_state",
@@ -838,6 +981,46 @@ class PycolmapCudaTests(unittest.TestCase):
         self.assertEqual(result["mode"], "cuda")
         pip.assert_called_once()
         self.assertIn("D:/wheels/pycolmap_cuda.whl", pip.call_args.args[0])
+        # the reason names the source and the verified version
+        self.assertIn(accelerators.PYCOLMAP_CUDA_WHEEL_ENV, result["reason"])
+        self.assertIn("4.2.1", result["reason"])
+
+    def test_cuda_specs_follow_the_torch_cuda_major(self):
+        self.assertEqual(accelerators.pycolmap_cuda_specs(13),
+                         ("pycolmap-cuda13", "pycolmap-cuda12"))
+        self.assertEqual(accelerators.pycolmap_cuda_specs(12), ("pycolmap-cuda12",))
+        with mock.patch.object(accelerators, "torch_cuda_major", return_value=13):
+            self.assertEqual(accelerators.pycolmap_cuda_specs()[0], "pycolmap-cuda13")
+
+    def test_a_cpu_wheel_never_masquerades_as_a_cuda_build(self):
+        """The install is verified: ``cuda`` must really be True afterwards."""
+        with mock.patch.object(accelerators, "pycolmap_state",
+                               return_value={"available": True, "version": "4.2.1",
+                                             "cuda": False}), \
+                mock.patch.object(accelerators, "cuda_state",
+                                  return_value={"available": True, "version": "13.0",
+                                                "device": "RTX 5090"}), \
+                mock.patch.object(accelerators, "_pip_can_install", return_value=True), \
+                mock.patch.object(accelerators, "pip", return_value=(0, "")):
+            result = accelerators.ensure_pycolmap()
+        self.assertEqual(result["mode"], "cpu-fallback")
+        self.assertIn("without CUDA support", result["reason"])
+        self.assertIn("4.2.1", result["reason"])
+
+    def test_a_broken_cuda_wheel_is_reported_as_a_failure(self):
+        with mock.patch.object(accelerators, "pycolmap_state",
+                               return_value={"available": True, "version": "4.2.1",
+                                             "cuda": False}), \
+                mock.patch.object(accelerators, "cuda_state",
+                                  return_value={"available": True, "version": "13.0",
+                                                "device": "RTX 5090"}), \
+                mock.patch.dict("os.environ",
+                                {accelerators.PYCOLMAP_CUDA_WHEEL_ENV: "D:/wheels/bad.whl"}), \
+                mock.patch.object(accelerators, "_pip_can_install", return_value=False), \
+                mock.patch.object(accelerators, "pip", return_value=(1, "boom")):
+            result = accelerators.ensure_pycolmap()
+        self.assertEqual(result["mode"], "cpu-fallback")
+        self.assertIn("could not be installed", result["reason"])
 
     def test_cuda_detection_prefers_torch(self):
         fake_torch = types.SimpleNamespace(
@@ -893,6 +1076,337 @@ class ColmapLoggingTests(unittest.TestCase):
         with mock.patch.dict("os.environ", {"ENNDEE_COLMAP_VERBOSE": "1"}, clear=True):
             pycolmap_wrapper.silence_colmap_logging(fake)
         self.assertEqual(fake.logging.minloglevel, 0)
+
+class FakePinholeCamera:
+    """Duck-typed camera carrying only what ``_warp_to_original`` touches.
+
+    The real ``pycolmap.Camera`` cannot be used in this suite (it is the reason the
+    whole file fakes pycolmap), and the warp only ever calls ``cam_from_img``,
+    ``img_from_cam``, ``is_undistorted``, ``width`` and ``height``.
+    """
+
+    def __init__(self, width, height, focal, cx=None, cy=None, undistorted=True):
+        self.width = int(width)
+        self.height = int(height)
+        self.focal = float(focal)
+        self.cx = float((width - 1) / 2.0 if cx is None else cx)
+        self.cy = float((height - 1) / 2.0 if cy is None else cy)
+        self._undistorted = bool(undistorted)
+
+    def is_undistorted(self):
+        return self._undistorted
+
+    def cam_from_img(self, pixels):
+        pixels = np.asarray(pixels, dtype=np.float64)
+        return (pixels - np.array([self.cx, self.cy])) / self.focal
+
+    def img_from_cam(self, rays):
+        rays = np.asarray(rays, dtype=np.float64)
+        if rays.ndim != 2 or rays.shape[1] != 3:
+            raise ValueError("img_from_cam wants [N, 3] camera points")
+        return rays[:, :2] * self.focal + np.array([self.cx, self.cy])
+
+
+class DenseMvsTests(unittest.TestCase):
+    """The dense-MVS depth read + the un-warp onto the original camera grid."""
+
+    def test_warp_is_exact_for_a_scaled_pinhole_pair(self):
+        """A half-resolution undistorted camera must map target pixel 2k -> k."""
+        original = FakePinholeCamera(8, 8, focal=4.0, cx=3.5, cy=3.5)
+        undistorted = FakePinholeCamera(4, 4, focal=2.0, cx=1.75, cy=1.75)
+        source = (np.arange(16, dtype=np.float32).reshape(4, 4) + 1.0)
+
+        warped = pycolmap_wrapper.PyColmapWrapper._warp_to_original(
+            source, undistorted, original, (8, 8))
+
+        self.assertEqual(warped.shape, (8, 8))
+        # every even pixel samples the source exactly - no shift, no flip
+        np.testing.assert_allclose(warped[::2, ::2], source, rtol=0, atol=1e-4)
+        # odd pixels are the bilinear midpoint between their two neighbours
+        np.testing.assert_allclose(warped[0, 1], (source[0, 0] + source[0, 1]) / 2,
+                                   rtol=0, atol=1e-4)
+
+    def test_warp_zeroes_pixels_outside_the_undistorted_view(self):
+        """A ray leaving the undistorted image has no depth, so it must be 0."""
+        # same focal as the original but a 2x2 grid -> only the 4 central target
+        # pixels project inside it, everything else falls outside the view
+        original = FakePinholeCamera(8, 8, focal=4.0)
+        undistorted = FakePinholeCamera(2, 2, focal=4.0)
+        source = np.ones((2, 2), dtype=np.float32)
+
+        warped = pycolmap_wrapper.PyColmapWrapper._warp_to_original(
+            source, undistorted, original, (8, 8))
+
+        self.assertEqual(warped.shape, (8, 8))
+        valid = warped > 0
+        self.assertGreater(int(valid.sum()), 0)
+        self.assertLess(float(valid.mean()), 1.0)
+        self.assertEqual(float(warped.min()), 0.0)
+        # the survivors are the ones whose ray lands inside the small view
+        np.testing.assert_allclose(warped[3:5, 3:5], 1.0, rtol=0, atol=1e-4)
+
+    def test_img_from_cam_needs_the_padded_ray(self):
+        """The fake mirrors pycolmap: [N, 2] must be rejected, [N, 3] accepted."""
+        camera = FakePinholeCamera(4, 4, focal=2.0)
+        with self.assertRaises(ValueError):
+            camera.img_from_cam(np.zeros((3, 2)))
+        self.assertEqual(np.asarray(camera.img_from_cam(np.zeros((3, 3)))).shape,
+                         (3, 2))
+
+
+class DenseDepthMapReadTests(unittest.TestCase):
+    """``read_dense_depth_maps`` must index COLMAP's files and pick the right kind."""
+
+    class FakeDepthMap:
+        def __init__(self, recorder):
+            self._recorder = recorder
+            self._value = 0.0
+
+        def read(self, path):
+            self._recorder.append(str(path))
+            # the two kinds are told apart by their value so the test can prove
+            # which one was picked
+            self._value = 2.0 if "geometric" in str(path) else 1.0
+
+        def to_array(self):
+            return np.full((2, 3), self._value, dtype=np.float32)
+
+    def _module(self, recorder):
+        fake = types.SimpleNamespace()
+        fake.DepthMap = lambda: DenseDepthMapReadTests.FakeDepthMap(recorder)
+        return fake
+
+    def test_prefers_geometric_and_strips_the_kind(self):
+        import tempfile
+
+        recorder = []
+        with tempfile.TemporaryDirectory() as folder:
+            depth_maps = Path(folder) / "stereo" / "depth_maps"
+            depth_maps.mkdir(parents=True)
+            # deliberately written photometric FIRST: sorted() must still win
+            for name in ("frame_00.jpg.photometric.bin", "frame_00.jpg.geometric.bin",
+                         "frame_01.jpg.geometric.bin", "notes.txt"):
+                (depth_maps / name).write_bytes(b"")
+
+            with mock.patch.object(pycolmap_wrapper, "import_pycolmap",
+                                   return_value=self._module(recorder)):
+                maps = pycolmap_wrapper.PyColmapWrapper.read_dense_depth_maps(
+                    Path(folder), None, log=lambda _message: None)
+
+        self.assertEqual(sorted(maps), ["frame_00.jpg", "frame_01.jpg"])
+        self.assertEqual(len(recorder), 2)
+        # 2.0 is the geometric value - the filtered map wins
+        np.testing.assert_allclose(maps["frame_00.jpg"], 2.0)
+        self.assertNotIn("notes.txt", recorder)
+
+    def test_missing_folder_is_not_an_error(self):
+        with mock.patch.object(pycolmap_wrapper, "import_pycolmap",
+                               return_value=self._module([])):
+            maps = pycolmap_wrapper.PyColmapWrapper.read_dense_depth_maps(
+                Path("does-not-exist"), None, log=lambda _message: None)
+        self.assertEqual(maps, {})
+
+
+class DenseFusionTests(unittest.TestCase):
+    """``dense_fused_cloud``: the fused cloud that replaces the sparse initialisation."""
+
+    class FakePoint:
+        def __init__(self, xyz, colour):
+            self.xyz = np.asarray(xyz, dtype=np.float64)
+            self.color = np.asarray(colour, dtype=np.int64)
+
+    class FakeReconstruction:
+        def __init__(self, points):
+            self.points3D = {index + 1: point for index, point in enumerate(points)}
+
+    def _module(self, recorder, points, fail=False):
+        fake = types.SimpleNamespace()
+
+        def stereo_fusion(output_path, workspace_path, **kwargs):
+            recorder.append(("stereo_fusion", output_path, workspace_path, kwargs))
+            if fail:
+                raise RuntimeError("fusion exploded")
+            # the fused PLY is what the node copies out of the workspace
+            Path(output_path).write_bytes(b"ply")
+            return DenseFusionTests.FakeReconstruction(points)
+
+        fake.stereo_fusion = stereo_fusion
+        fake.StereoFusionOptions = lambda: types.SimpleNamespace()
+        fake.Reconstruction = lambda: types.SimpleNamespace(
+            import_PLY=lambda _path: None)
+        return fake
+
+    def _wrapper(self, folder):
+        wrapper = pycolmap_wrapper.PyColmapWrapper()
+        wrapper.workspace = str(folder)
+        return wrapper
+
+    def test_uses_output_type_ply_and_subsamples_deterministically(self):
+        recorder = []
+        points = [DenseFusionTests.FakePoint([index, 0.0, 0.0], [255, 128, 0])
+                  for index in range(10)]
+        with tempfile.TemporaryDirectory() as folder:
+            dense = Path(folder) / "dense"
+            dense.mkdir()
+            with mock.patch.object(pycolmap_wrapper, "import_pycolmap",
+                                   return_value=self._module(recorder, points)):
+                fused = self._wrapper(folder).dense_fused_cloud(
+                    max_points=4, log=lambda _message: None)
+
+        self.assertEqual(len(recorder), 1)
+        name, output_path, workspace_path, kwargs = recorder[0]
+        self.assertEqual(name, "stereo_fusion")
+        # "bin" (the default) would treat the output path as a DIRECTORY and fail
+        self.assertEqual(kwargs["output_type"], "ply")
+        self.assertEqual(kwargs["input_type"], "geometric")
+        self.assertEqual(Path(output_path).name, "fused.ply")
+        self.assertEqual(Path(workspace_path), Path(folder) / "dense")
+
+        self.assertEqual(fused["total"], 10)
+        self.assertEqual(len(fused["points"]), 4)
+        # 8-bit colours come back as 0..1 floats
+        self.assertAlmostEqual(float(fused["colors"][0][0]), 1.0)
+        self.assertAlmostEqual(float(fused["colors"][0][1]), 128 / 255)
+        # the same input gives the same subset, so two runs agree
+        self.assertTrue(np.all(np.diff(fused["points"][:, 0]) > 0))
+
+    def test_no_workspace_and_fusion_failure_are_not_fatal(self):
+        with mock.patch.object(pycolmap_wrapper, "import_pycolmap",
+                               return_value=self._module([], [])):
+            self.assertEqual(pycolmap_wrapper.PyColmapWrapper().dense_fused_cloud(
+                log=lambda _message: None), {})
+
+        recorder = []
+        with tempfile.TemporaryDirectory() as folder:
+            (Path(folder) / "dense").mkdir()
+            with mock.patch.object(pycolmap_wrapper, "import_pycolmap",
+                                   return_value=self._module(recorder, [], fail=True)):
+                self.assertEqual(self._wrapper(folder).dense_fused_cloud(
+                    log=lambda _message: None), {})
+
+    def test_stride_subset_keeps_everything_below_the_cap(self):
+        self.assertEqual(list(pycolmap_wrapper.stride_subset(5, 10)), [0, 1, 2, 3, 4])
+        self.assertEqual(list(pycolmap_wrapper.stride_subset(5, 0)), [0, 1, 2, 3, 4])
+        self.assertEqual(len(pycolmap_wrapper.stride_subset(1000, 10)), 10)
+
+    def test_points_from_reconstruction_falls_back_to_the_ply(self):
+        module = types.SimpleNamespace()
+        points = [DenseFusionTests.FakePoint([1, 2, 3], [10, 20, 30])]
+        xyz, rgb = pycolmap_wrapper.points_from_reconstruction(
+            module, DenseFusionTests.FakeReconstruction(points))
+        np.testing.assert_allclose(xyz, [[1, 2, 3]])
+        self.assertAlmostEqual(float(rgb[0][0]), 10 / 255)
+
+        # an empty reconstruction with no PLY is simply empty, never an exception
+        xyz, rgb = pycolmap_wrapper.points_from_reconstruction(module, None, None)
+        self.assertEqual(xyz.shape, (0, 3))
+        self.assertEqual(rgb.shape, (0, 3))
+
+
+class DenseMeshTests(unittest.TestCase):
+    """``dense_mesh``: Poisson in-process, Delaunay through the bundled COLMAP binary."""
+
+    def _module(self, recorder, fail=False):
+        fake = types.SimpleNamespace()
+
+        def poisson_meshing(source, target, options=None):
+            recorder.append(("poisson_meshing", source, target, options))
+            if fail:
+                raise RuntimeError("poisson exploded")
+            Path(target).write_bytes(b"mesh")
+
+        def options():
+            return types.SimpleNamespace(trim=10.0, depth=13)
+
+        fake.poisson_meshing = poisson_meshing
+        fake.PoissonMeshingOptions = options
+        return fake
+
+    def _wrapper(self, folder):
+        wrapper = pycolmap_wrapper.PyColmapWrapper()
+        wrapper.workspace = str(folder)
+        return wrapper
+
+    def test_poisson_overrides_trim_because_the_default_kills_the_mesh(self):
+        recorder = []
+        with tempfile.TemporaryDirectory() as folder:
+            dense = Path(folder) / "dense"
+            dense.mkdir()
+            (dense / "fused.ply").write_bytes(b"ply")
+            with mock.patch.object(pycolmap_wrapper, "import_pycolmap",
+                                   return_value=self._module(recorder)):
+                mesh = self._wrapper(folder).dense_mesh(log=lambda _message: None)
+
+        self.assertEqual(len(recorder), 1)
+        _name, source, target, options = recorder[0]
+        self.assertEqual(Path(source).name, "fused.ply")
+        self.assertEqual(Path(target).name, "mesh_poisson.ply")
+        # MEASURED: trim=10 (the COLMAP default) crops a real scene to 12 vertices /
+        # 20 faces; trim=0 yields ~167k vertices. depth keeps COLMAP's 13.
+        self.assertEqual(options.trim, 0.0)
+        self.assertEqual(options.depth, 13)
+        self.assertEqual(Path(mesh), Path(target))
+
+    def test_poisson_without_a_fused_cloud_is_not_fatal(self):
+        with tempfile.TemporaryDirectory() as folder:
+            (Path(folder) / "dense").mkdir()
+            with mock.patch.object(pycolmap_wrapper, "import_pycolmap",
+                                   return_value=self._module([])):
+                self.assertIsNone(self._wrapper(folder).dense_mesh(
+                    log=lambda _message: None))
+
+    def test_delaunay_shells_out_with_the_documented_flags(self):
+        with tempfile.TemporaryDirectory() as folder:
+            dense = Path(folder) / "dense"
+            dense.mkdir()
+            executable = Path(folder) / "colmap.exe"
+            executable.write_bytes(b"exe")
+            wrapper = self._wrapper(folder)
+            wrapper.colmap_path = str(executable)
+
+            def fake_run(command, **_kwargs):
+                Path(command[command.index("--output_path") + 1]).write_bytes(b"mesh")
+                return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with mock.patch.object(pycolmap_wrapper, "import_pycolmap",
+                                   return_value=self._module([])), \
+                 mock.patch("subprocess.run", side_effect=fake_run) as runner:
+                mesh = wrapper.dense_mesh(method="delaunay", log=lambda _message: None)
+
+            command = runner.call_args[0][0]
+            self.assertEqual(command[1], "delaunay_mesher")
+            # --workspace_path is NOT a valid flag on this build
+            self.assertIn("--input_path", command)
+            self.assertNotIn("--workspace_path", command)
+            self.assertEqual(command[command.index("--input_type") + 1], "dense")
+            self.assertEqual(Path(mesh).name, "mesh_delaunay.ply")
+
+    def test_delaunay_without_a_binary_reports_instead_of_crashing(self):
+        with tempfile.TemporaryDirectory() as folder:
+            (Path(folder) / "dense").mkdir()
+            wrapper = self._wrapper(folder)
+            wrapper.colmap_path = None
+            with mock.patch.object(pycolmap_wrapper, "import_pycolmap",
+                                   return_value=self._module([])):
+                self.assertIsNone(wrapper.dense_mesh(method="delaunay",
+                                                     log=lambda _message: None))
+
+    def test_colmap_executable_resolves_the_bat_launcher(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "bin").mkdir()
+            real = root / "bin" / "colmap.exe"
+            real.write_bytes(b"exe")
+            wrapper = pycolmap_wrapper.PyColmapWrapper()
+
+            wrapper.colmap_path = str(root / "COLMAP.bat")
+            self.assertEqual(wrapper._colmap_executable(), real)
+
+            wrapper.colmap_path = str(real)
+            self.assertEqual(wrapper._colmap_executable(), real)
+
+            wrapper.colmap_path = ""
+            self.assertIsNone(wrapper._colmap_executable())
 
 
 if __name__ == "__main__":

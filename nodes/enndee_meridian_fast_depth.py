@@ -63,7 +63,6 @@ typically completes in well under a second.
 import json
 import math
 import sys
-import types
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -99,11 +98,12 @@ WORLD_UP = np.array([0.0, -1.0, 0.0], dtype=np.float32)   # OpenCV frame: -y is 
 HORIZON_MIN_SIN = 1e-6                # |cross(look, up)| below this = the look is vertical (no horizon)
 HORIZON_RELOCK = 24                   # frames to settle back to level after the look crosses the pole
 
-# Depth-Anything-3 variants the fast backend can load, as Hugging Face repo ids (all
-# Apache-2.0). Small/Base/Large are the any-view series (relative depth + camera poses, the
-# poses unused here); Mono-Large is the monocular series tuned for high-quality single-still
-# depth. Metric-Large is left out because the percentile rescale below re-gauges every
-# prediction anyway, and the Giant/Nested models are much heavier (and CC BY-NC licensed).
+# Depth-Anything-3 variants the fast backend can load, as Hugging Face repo ids. Small/Base
+# are the any-view series (relative depth + camera poses, the poses unused here); Mono-Large
+# is the monocular series tuned for high-quality single-still depth. Metric-Large is left out
+# because the percentile rescale below re-gauges every prediction anyway, and the Giant/Nested
+# models are much heavier. Licences differ per repo: SMALL / BASE / MONO-LARGE are Apache-2.0,
+# while plain LARGE is CC-BY-NC 4.0 (its Apache revision is depth-anything/DA3-LARGE-1.1).
 DA3_PREFIX = "Depth-Anything-3"
 DA3_MODEL_REPOS = {
     "Depth-Anything-3-Small": "depth-anything/DA3-SMALL",
@@ -172,48 +172,18 @@ def _load_da3_api():
     * ``depth_anything_3.utils.pose_align`` - needs ``evo`` and is only reached when input
       extrinsics are handed to ``inference()``; this backend passes none.
 
-    The model code itself needs torch, einops, addict and omegaconf (all present in ComfyUI's
-    embedded python, transformers' DA2 stack aside). The api module also flips
-    ``torch.backends.cudnn.benchmark`` to False at import time - the previous value is
-    restored so other ComfyUI models keep their setting.
+    The stub dance now lives in :mod:`enndee_da3`, shared with the VGGT node's ``DA3-AnyView``
+    backend, so both stay in sync; this name is kept because the unittests and
+    :func:`_predict_da3_depth` call it.
     """
-    cached = sys.modules.get("depth_anything_3.api")
-    if cached is not None:
-        return cached.DepthAnything3
-    benchmark = torch.backends.cudnn.benchmark
-    try:
-        import depth_anything_3.utils  # noqa: F401  (namespace parent for the two stubs)
+    import os
 
-        export_stub = types.ModuleType("depth_anything_3.utils.export")
+    pack = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if pack not in sys.path:
+        sys.path.insert(0, pack)
+    from enndee_da3 import load_da3_api
 
-        def _export_unavailable(*args, **kwargs):
-            raise ImportError("Depth-Anything-3 export formats are not installed; "
-                              "the fast-depth backend only runs in-memory inference.")
-
-        export_stub.export = _export_unavailable
-        export_stub.SUPPORTED_EXPORT_FORMATS = frozenset()
-        sys.modules["depth_anything_3.utils.export"] = export_stub
-
-        pose_stub = types.ModuleType("depth_anything_3.utils.pose_align")
-
-        def _pose_align_unavailable(*args, **kwargs):
-            raise ImportError("Depth-Anything-3 pose alignment needs the 'evo' package and "
-                              "input extrinsics; the fast-depth backend passes neither.")
-
-        pose_stub.align_poses_umeyama = _pose_align_unavailable
-        pose_stub.batch_align_poses_umeyama = _pose_align_unavailable
-        sys.modules["depth_anything_3.utils.pose_align"] = pose_stub
-
-        from depth_anything_3.api import DepthAnything3
-    except ImportError as exc:
-        raise RuntimeError(
-            "Depth-Anything-3 is not installed for this interpreter. In the ComfyUI "
-            "python_embeded run: python -m pip install --no-deps depth-anything-3 "
-            "(addict and omegaconf must be importable too)."
-        ) from exc
-    finally:
-        torch.backends.cudnn.benchmark = benchmark
-    return DepthAnything3
+    return load_da3_api()
 
 
 def _da3_process_res(depth_res, width: int, height: int) -> int:
@@ -457,6 +427,71 @@ def _invert_disparity(pred: torch.Tensor) -> torch.Tensor:
     the percentile clip downstream absorbs the spike.
     """
     return 1.0 / (pred.clamp(min=0.0) + DISPARITY_EPS)
+
+
+def prepare_external_depth(external_depth, height: int, width: int, invert: bool = False,
+                           aspect_tolerance: float = 0.02, device=None):
+    """An external depth map resized onto the working still, in the backend's own gauge.
+
+    Everything downstream needs exactly one convention - **larger value = farther** - because
+    the cloud is built by re-gauging the map through a percentile clip onto
+    ``DEPTH_NEAR``..``DEPTH_FAR``. That also means an external map only has to be *relative*
+    and correctly oriented; its absolute scale is irrelevant. ``invert`` is the switch for
+    "bright = near" (disparity-style) exports.
+
+    ``device`` moves the result onto the device the renderer works on. ComfyUI hands an IMAGE
+    (or MASK) tensor over on the **CPU**, while every tensor ``render_depth_aligned`` builds
+    lives on CUDA - so the map has to be moved here. Leaving it on the CPU did not fail here,
+    it failed much later at the cloud unprojection with ``Expected all tensors to be on the
+    same device, but found at least two devices, cuda:0 and cpu!``. ``None`` keeps the input's
+    device (what the unit tests use).
+
+    Returns ``(depth, note)`` where ``depth`` is ``[height, width]`` float32 and ``note`` is a
+    warning string (or None) when the map's aspect ratio does not match the still - the resize
+    then stretches it, and the reprojected geometry is subtly skewed.
+    """
+    if not isinstance(external_depth, torch.Tensor):
+        raise ValueError("The external depth input must be a ComfyUI IMAGE tensor.")
+    depth = external_depth
+    if depth.ndim == 4:
+        depth = depth[0]                                   # single-still node: the first frame
+    elif depth.ndim == 3:
+        # ComfyUI IMAGE is [frames, H, W, C] and a MASK is [frames, H, W]; anything whose last
+        # dimension is not a plausible channel count is a frame stack, not a channel-last map.
+        if depth.shape[-1] in (1, 3, 4):
+            depth = depth[..., 0] if depth.shape[-1] == 1 else depth[..., :3].mean(dim=-1)
+        else:
+            depth = depth[0]
+    if depth.ndim == 3:
+        depth = depth[..., 0] if depth.shape[-1] == 1 else depth[..., :3].mean(dim=-1)
+    if depth.ndim != 2:
+        raise ValueError("The external depth map must be [H,W] or [frames,H,W,channels].")
+    depth = depth.to(dtype=torch.float32)
+    if not bool(torch.isfinite(depth).all()):
+        raise ValueError("The external depth map contains non-finite values.")
+    span = float(depth.max() - depth.min())
+    if span <= 0.0:
+        raise ValueError("The external depth map is constant - there is no geometry in it.")
+
+    note = None
+    map_h, map_w = int(depth.shape[0]), int(depth.shape[1])
+    if map_h > 0 and map_w > 0 and height > 0 and width > 0:
+        map_aspect = map_w / map_h
+        still_aspect = width / height
+        if abs(map_aspect - still_aspect) > aspect_tolerance * still_aspect:
+            note = (f"the external depth map is {map_w}x{map_h} (aspect {map_aspect:.3f}) but "
+                    f"the still is {width}x{height} (aspect {still_aspect:.3f}) - the map is "
+                    "stretched onto the still, so the geometry will be skewed. Render the "
+                    "depth from the same framing as the image input.")
+
+    resized = F.interpolate(depth.view(1, 1, map_h, map_w), size=(int(height), int(width)),
+                            mode="bilinear", align_corners=False)[0, 0]
+    if invert:
+        # The percentile clip below re-gauges anyway, so a sign flip is all that is needed.
+        resized = -resized
+    if device is not None:
+        resized = resized.to(device)
+    return resized, note
 
 
 def _edge_keep(depth: torch.Tensor, tolerance: float) -> torch.Tensor:
@@ -808,7 +843,8 @@ def _build_parametric_c2w(frames: int, piv: torch.Tensor, zm: float, yaw: float,
 def render_depth_aligned(first, device, model_size="Depth-Anything-V2-Small-hf", frames=73,
                          canvas_mode="auto_meridian480", custom_width=832, custom_height=480,
                          cloud_scale=2, point_size=1, edge_cull=True, edge_threshold=0.30,
-                         back_face_cull=False, camera=None, custom_camera=None, depth_res=DA3_RES):
+                         back_face_cull=False, camera=None, custom_camera=None, depth_res=DA3_RES,
+                         external_depth=None, external_depth_invert=False):
     """Depth-aligned camera-flight condition renderer (Depth-Anything-V2/V3 + GPU point-cloud renderer).
 
     `first`          [1,H,W,3] float tensor in [0,1]: the still the flight starts from.
@@ -826,6 +862,14 @@ def render_depth_aligned(first, device, model_size="Depth-Anything-V2-Small-hf",
                      (maximum depth detail, bounded only by the `MAX_CLOUD_PIXELS` ceiling).
                      The V2 models keep their native 518 depth grid but the still and the cloud
                      follow the same cap.
+    `external_depth` an optional ComfyUI IMAGE depth map that REPLACES the depth model. It is
+                     resized onto the working still and then goes through the very same edge
+                     cull, percentile clip and cloud grid as a predicted map, so it only has to
+                     be *relative* depth with the right orientation: larger value = farther,
+                     unless `external_depth_invert` flips a "bright = near" export. This is the
+                     hook for a prior the model cannot beat - metric depth from a stereo/COLMAP
+                     pass, a hand-painted map, or a multi-view-consistent depth - and it is the
+                     only way to guarantee that two shots of the same scene share one geometry.
 
     Returns exactly what the VGGT geometry pass returns - (source, render, width, height, length) -
     so the pair drops straight into MeridianRefConditioning as `<Video 1>` / `<Video 2>`.
@@ -858,8 +902,17 @@ def render_depth_aligned(first, device, model_size="Depth-Anything-V2-Small-hf",
     else:
         out_w, out_h = _bucket_480(src_w, src_h)
 
-    # --- depth: Depth-Anything-V2 (disparity -> invert) or Depth-Anything-3 (already depth) -------
-    if model_size.startswith(DA3_PREFIX):
+    # --- depth: an EXTERNAL map, Depth-Anything-V3 (already depth) or V2 (disparity -> invert) ---
+    if external_depth is not None:
+        depth_low, aspect_note = prepare_external_depth(
+            external_depth, work_h, work_w, invert=bool(external_depth_invert),
+            device=device)
+        if aspect_note:
+            print(f"[Enndee] Meridian fast depth: {aspect_note}", flush=True)
+        print("[Enndee] Meridian fast depth: using the CONNECTED depth map "
+              f"(external depth, {work_w}x{work_h} working still) - no depth model is loaded.",
+              flush=True)
+    elif model_size.startswith(DA3_PREFIX):
         depth_low = _predict_da3_depth(model_size, first, device,
                                        _da3_process_res(depth_res, work_w, work_h))
     else:
@@ -871,6 +924,11 @@ def render_depth_aligned(first, device, model_size="Depth-Anything-V2-Small-hf",
         with torch.no_grad():
             pred = depth_model(pixel_values=((x518 - mean) / std).half()).predicted_depth[0].float()
         depth_low = _invert_disparity(pred)
+
+    # Every depth source must live on the render device. The external map arrives on the CPU from
+    # ComfyUI, and the unprojection below multiplies it with CUDA meshgrids - without this the run
+    # dies with "Expected all tensors to be on the same device, cuda:0 and cpu".
+    depth_low = depth_low.to(device)
 
     # keep (model grid): Meridian's 3x3 depth-edge rule; the 2 % confidence pruning of
     # recam/geometry.py is not ported for either family, so nothing else is culled

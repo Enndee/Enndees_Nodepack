@@ -100,6 +100,14 @@ except Exception as _e:
     print(f"\033[31m[Enndee] ColmapLichtfeldTracker unavailable: {_e}\033[0m")
     ColmapLichtfeldTracker = None
 
+# VGGT for Lichtfeld: the feed-forward alternative to COLMAP - one forward pass
+# over the frame set yields poses, intrinsics AND depth in a single gauge.
+try:
+    from vggt_lichtfeld_node import VGGTLichtfeldTracker
+except Exception as _e:
+    print(f"\033[31m[Enndee] VGGTLichtfeldTracker unavailable: {_e}\033[0m")
+    VGGTLichtfeldTracker = None
+
 # Global save-behavior hook (no node): strip ComfyUI's running counter and
 # number files only when the target name is already taken. Opt out with the
 # environment variable ENNDEE_KEEP_FILE_COUNTER=1.
@@ -109,6 +117,12 @@ try:
     install_unique_filenames()
 except Exception as _e:
     print(f"\033[31m[Enndee] unique filenames unavailable: {_e}\033[0m")
+
+try:
+    from enndee_block_swap import EnndeeBlockSwap
+except Exception as _e:
+    print(f"\033[31m[Enndee] Block Swap unavailable: {_e}\033[0m")
+    EnndeeBlockSwap = None
 
 NODE_CLASS_MAPPINGS = {}
 NODE_DISPLAY_NAME_MAPPINGS = {}
@@ -170,6 +184,14 @@ if Enndee_MeridianCameraPathLLM is not None:
 if ColmapLichtfeldTracker is not None:
     NODE_CLASS_MAPPINGS["Enndee_ColmapLichtfeldTracker"] = ColmapLichtfeldTracker
     NODE_DISPLAY_NAME_MAPPINGS["Enndee_ColmapLichtfeldTracker"] = "COLMAP for Lichtfeld (Enndee)"
+
+if VGGTLichtfeldTracker is not None:
+    NODE_CLASS_MAPPINGS["Enndee_VGGTLichtfeldTracker"] = VGGTLichtfeldTracker
+    NODE_DISPLAY_NAME_MAPPINGS["Enndee_VGGTLichtfeldTracker"] = "VGGT for Lichtfeld (Enndee)"
+
+if EnndeeBlockSwap is not None:
+    NODE_CLASS_MAPPINGS["Enndee_BlockSwap"] = EnndeeBlockSwap
+    NODE_DISPLAY_NAME_MAPPINGS["Enndee_BlockSwap"] = "Block Swap (Enndee)"
 
 WEB_DIRECTORY = os.path.join(_pack_dir, "web")
 

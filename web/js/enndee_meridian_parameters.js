@@ -25,7 +25,7 @@ const SPIRAL_SWEEP_PANEL = ["path_start_yaw", "path_target_yaw", "path_spiral_st
 const PATH_SHARED = ["path_camera_mode", "path_dolly", "path_pivot_x", "path_pivot_y", "path_pivot_z"];
 const PATH_PIVOTS = ["path_pivot_x", "path_pivot_y", "path_pivot_z"];
 const PATH_PANEL = [...O_ORBIT_PANEL, ...HEIGHT_SWEEP_PANEL, ...SPIRAL_SWEEP_PANEL, ...PATH_SHARED];
-const AUTO_PANEL = ["auto_target", "auto_max_speed", "auto_path_mode", "auto_subject_fill", "auto_orbit_view_angle", "auto_orbit_coverage", "auto_orbit_direction", "auto_pivot_x", "auto_pivot_y", "auto_pivot_z", "auto_orbit_angle", "spiral_end", "spiral_slope"];
+const AUTO_PANEL = ["auto_target", "auto_max_speed", "auto_path_mode", "auto_subject_fill", "auto_orbit_view_angle", "auto_orbit_coverage", "auto_orbit_direction", "auto_pivot_x", "auto_pivot_y", "auto_pivot_z", "auto_orbit_angle", "spiral_end", "spiral_slope", "band_start_angle", "band_count", "band_width", "band_start_yaw", "band_step"];
 // Deprecated widgets: never visible (the saved value survives in the graph, the backend ignores it).
 // `auto_orbit_distance` was the fixed camera stand-off; the distance follows Auto Subject Fill now.
 // `auto_orbit_end` was where the concluding orbit stopped and `auto_orbit_size` scaled the O - the
@@ -108,6 +108,13 @@ const SPIRAL_END_ANGLE_RANGE = [5, 90];
 const SPIRAL_END_ANGLE_DEFAULT = 90;
 const SPIRAL_WINDING_LABEL = "Spiral Winding";
 const SPIRAL_SLOPE_LABEL = "Spiral Center Slope";
+// The 'Banded Orbits' coverage's own widgets. Same idea as the spiral pair: they are always in
+// the automatic panel, and their tooltips name the coverage that reads them.
+const BAND_START_ANGLE_LABEL = "Band Start Angle";
+const BAND_COUNT_LABEL = "Band Count";
+const BAND_WIDTH_LABEL = "Band Width";
+const BAND_START_YAW_LABEL = "Band Start Yaw";
+const BAND_STEP_LABEL = "Band Step (0 = auto)";
 
 function setSpiralLabels(node, spiral) {
   let changed = false;
@@ -134,7 +141,12 @@ function setSpiralLabels(node, spiral) {
     }
   }
   for (const [name, label] of [["spiral_end", SPIRAL_WINDING_LABEL],
-                               ["spiral_slope", SPIRAL_SLOPE_LABEL]]) {
+                               ["spiral_slope", SPIRAL_SLOPE_LABEL],
+                               ["band_start_angle", BAND_START_ANGLE_LABEL],
+                               ["band_count", BAND_COUNT_LABEL],
+                               ["band_width", BAND_WIDTH_LABEL],
+                               ["band_start_yaw", BAND_START_YAW_LABEL],
+                               ["band_step", BAND_STEP_LABEL]]) {
     const widget = findWidget(node, name);
     if (widget && widget.label !== label) {
       widget.label = label;

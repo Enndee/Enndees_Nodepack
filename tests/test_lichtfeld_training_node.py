@@ -15,9 +15,21 @@ sys.path.insert(0, str(PACK_DIR))
 sys.path.insert(0, str(PACK_DIR / "nodes"))
 
 from lichtfeld_training_node import (  # noqa: E402
+    MASK_OPACITY_PENALTIES,
+    EVALUATION_SPLITS,
+    SUBJECT_MODES,
+    _LFS_VALUE_FLAGS,
+    ANCHOR_MESH_NAMES,
+    ANCHOR_SIGMA,
+    ANCHOR_WORK_DIR,
+    UNDISTORT_MODES,
+    dataset_camera_models,
+    dataset_needs_undistort,
     LichtfeldHeadlessTrainer,
     build_conversion_command,
     build_lfs_optimization_section,
+    build_mesh2splat_command,
+    default_eval_steps,
     build_lfs_settings_script,
     build_training_command,
     check_studio_choice,
@@ -26,8 +38,10 @@ from lichtfeld_training_node import (  # noqa: E402
     load_lfs_optimization_template,
     parse_iteration_steps,
     parse_studio_capabilities,
+    prepare_surface_anchors,
     probe_studio_support,
     read_lfs_settings_status,
+    resolve_anchor_mesh,
     resolve_export_support,
     write_lfs_config_file,
     run_streaming_command,
@@ -257,6 +271,49 @@ class LichtfeldDatasetTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "requires Lichtfeld mask PNGs"):
                 LichtfeldHeadlessTrainer().train(**inputs)
+
+    def test_depth_loss_downgrades_to_a_warning_when_the_dataset_has_no_depth(self):
+        # The depth loss is ON by default (it measured better), so a dataset without a
+        # depth/ folder - a GLOMAP-only one - must NOT fail the run. The node warns, drops
+        # the depth term and continues, matching its "adapt, don't fail" pattern (compare
+        # resolve_export_support). make_dataset() deliberately creates no depth folder.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dataset = make_dataset(Path(temp_dir) / "dataset")
+            inputs = {
+                name: metadata.get("default", options[0] if isinstance(options, list) else None)
+                for name, (options, metadata)
+                in LichtfeldHeadlessTrainer.INPUT_TYPES()["required"].items()
+            }
+            inputs.update(
+                studio_executable=sys.executable,
+                dataset_path=str(dataset),
+                preview_only=True,
+            )
+            self.assertTrue(inputs["use_depth_loss"])
+            self.assertFalse((dataset / "depth").exists())
+
+            result = LichtfeldHeadlessTrainer().train(**inputs)
+
+            summary = result["result"][3]
+            self.assertIn("depth loss skipped", summary)
+
+    def test_depth_loss_is_kept_when_the_dataset_carries_depth_maps(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dataset = make_dataset(Path(temp_dir) / "dataset")
+            (dataset / "depth").mkdir()
+            (dataset / "depth" / "0001.depth.png").write_bytes(b"depth test fixture")
+            inputs = {
+                name: metadata.get("default", options[0] if isinstance(options, list) else None)
+                for name, (options, metadata)
+                in LichtfeldHeadlessTrainer.INPUT_TYPES()["required"].items()
+            }
+            inputs.update(
+                studio_executable=sys.executable,
+                dataset_path=str(dataset),
+                preview_only=True,
+            )
+            result = LichtfeldHeadlessTrainer().train(**inputs)
+            self.assertNotIn("depth loss skipped", result["result"][3])
 
 
 class LichtfeldCommandTests(unittest.TestCase):
@@ -506,6 +563,349 @@ class LichtfeldCommandTests(unittest.TestCase):
         self.assertEqual(section["mask_mode"], "segment")
         self.assertEqual(section["bg_mode"], "solidcolor")
         self.assertIn("iterations", section)                       # template keys survive
+
+    def test_build_lfs_optimization_section_applies_the_depth_loss_settings(self):
+        # off by default: Studio's own use_depth_loss=false from the template stands
+        self.assertEqual(build_lfs_optimization_section(), {})
+
+        section = build_lfs_optimization_section(
+            use_depth_loss=True, depth_loss_mode="pearson", depth_loss_weight=3.5)
+        self.assertTrue(section["use_depth_loss"])
+        self.assertEqual(section["depth_loss_mode"], "pearson")
+        self.assertEqual(section["depth_loss_weight"], 3.5)
+
+        # mode / weight are only overridden when they were actually requested
+        plain = build_lfs_optimization_section(use_depth_loss=True)
+        self.assertTrue(plain["use_depth_loss"])
+        self.assertEqual(plain["depth_loss_mode"], "adaptive-warped-l1")   # template default
+        self.assertEqual(plain["depth_loss_weight"], 2.0)                  # template default
+
+    def test_depth_loss_widgets_are_declared_and_covered_by_the_signature(self):
+        spec = LichtfeldHeadlessTrainer.INPUT_TYPES()["required"]
+        for name in ("use_depth_loss", "depth_loss_mode", "depth_loss_weight"):
+            self.assertIn(name, spec, name)
+        self.assertEqual(list(spec["depth_loss_mode"][0]),
+                         ["adaptive-warped-l1", "pearson"])
+        self.assertEqual(spec["depth_loss_mode"][1]["default"], "adaptive-warped-l1")
+        # These are the MEASURED winner of the subject-mode A/B, not Studio's defaults:
+        # depth supervision scored 12.91 vs 12.66 dB held out at 6000 iterations, and
+        # weight 8 only overtakes weight 2 after ~6000 iterations. Both are documented in
+        # the widget tooltips and in the README section "Tuned defaults: the two subject
+        # scenarios". Do not reset them to 2.0 / False without re-running that A/B.
+        self.assertEqual(spec["depth_loss_weight"][1]["default"], 8.0)
+        self.assertEqual(spec["use_depth_loss"][1]["default"], True)
+
+        import inspect
+
+        parameters = set(inspect.signature(LichtfeldHeadlessTrainer.train).parameters)
+        for name in ("use_depth_loss", "depth_loss_mode", "depth_loss_weight"):
+            self.assertIn(name, parameters, name)
+
+    def test_mask_opacity_penalty_maps_to_the_studio_weight(self):
+        # the default must NOT override Studio's own value, so the section stays empty
+        self.assertEqual(build_lfs_optimization_section(), {})
+        self.assertEqual(build_lfs_optimization_section(mask_opacity_penalty="studio default"), {})
+
+        for label, expected in (("off", 0.0), ("low", 1.0), ("medium", 5.0), ("high", 15.0)):
+            section = build_lfs_optimization_section(mask_opacity_penalty=label)
+            self.assertEqual(section["mask_opacity_penalty_weight"], expected, label)
+
+        # an unknown label leaves the value alone instead of guessing
+        self.assertEqual(build_lfs_optimization_section(mask_opacity_penalty="nonsense"), {})
+
+    def test_mask_priority_widgets_are_declared_and_covered_by_the_signature(self):
+        spec = LichtfeldHeadlessTrainer.INPUT_TYPES()["required"]
+        self.assertIn("mask_opacity_penalty", spec)
+        self.assertEqual(list(spec["mask_opacity_penalty"][0]), list(MASK_OPACITY_PENALTIES))
+        self.assertEqual(spec["mask_opacity_penalty"][1]["default"], "studio default")
+        self.assertEqual(spec["mask_mode"][1]["default"], "segment")
+        self.assertEqual(list(spec["mask_mode"][0]),
+                         ["none", "segment", "ignore", "segment_and_ignore", "alpha_consistent"])
+
+        import inspect
+
+        self.assertIn("mask_opacity_penalty",
+                      set(inspect.signature(LichtfeldHeadlessTrainer.train).parameters))
+
+    def test_mask_penalty_and_mask_mode_combine_in_one_section(self):
+        section = build_lfs_optimization_section(
+            mask_mode="segment", mask_opacity_penalty="medium", use_depth_loss=True)
+        self.assertEqual(section["mask_mode"], "segment")
+        self.assertEqual(section["mask_opacity_penalty_weight"], 5.0)
+        self.assertTrue(section["use_depth_loss"])
+
+    def test_geometry_consistency_knobs_land_in_the_section(self):
+        # None everywhere -> nothing requested -> the section collapses to {}
+        self.assertEqual(build_lfs_optimization_section(), {})
+
+        section = build_lfs_optimization_section(
+            pause_refine_after_reset=200, scale_reg=0.02, scale_decay=0.004,
+            lambda_dssim=0.3, grad_threshold=0.0003, growth_grad_threshold=0.004,
+            prune_opacity=0.01, prune_scale2d=0.2, prune_scale3d=0.05,
+            ppisp=False, bg_modulation=False,
+        )
+        # Studio's schema keeps int and float strictly apart
+        self.assertIsInstance(section["pause_refine_after_reset"], int)
+        self.assertEqual(section["pause_refine_after_reset"], 200)
+        for key, expected in (("scale_reg", 0.02), ("scale_decay", 0.004),
+                              ("lambda_dssim", 0.3), ("grad_threshold", 0.0003),
+                              ("growth_grad_threshold", 0.004), ("prune_opacity", 0.01),
+                              ("prune_scale2d", 0.2), ("prune_scale3d", 0.05)):
+            self.assertIsInstance(section[key], float, key)
+            self.assertAlmostEqual(section[key], expected, places=6, msg=key)
+        self.assertIs(section["ppisp"], False)
+        self.assertIs(section["bg_modulation"], False)
+
+    def test_geometry_consistency_widgets_are_declared_and_in_the_signature(self):
+        names = ("pause_refine_after_reset", "scale_reg", "scale_decay", "lambda_dssim",
+                 "grad_threshold", "growth_grad_threshold", "prune_opacity",
+                 "prune_scale2d", "prune_scale3d", "ppisp", "bg_modulation",
+                 "evaluation", "save_eval_images")
+        spec = LichtfeldHeadlessTrainer.INPUT_TYPES()["required"]
+        for name in names:
+            self.assertIn(name, spec, name)
+
+        import inspect
+
+        parameters = set(inspect.signature(LichtfeldHeadlessTrainer.train).parameters)
+        for name in names:
+            self.assertIn(name, parameters, name)
+
+        # defaults mirror the MEASURED subject-mode winner, not Studio's own values - see
+        # the README section "Tuned defaults: the two subject scenarios" and the widget
+        # tooltips. The three below were the anti-inflation cluster that raised held-out
+        # PSNR *and* SSIM together (+0.152 dB / +0.020 over the same run without them).
+        self.assertEqual(spec["evaluation"][1]["default"], "off")
+        self.assertEqual(list(spec["evaluation"][0]), ["off", "1/2", "1/3", "1/4"])
+        self.assertEqual(spec["save_eval_images"][1]["default"], False)
+        self.assertEqual(spec["pause_refine_after_reset"][1]["default"], 200)
+        self.assertAlmostEqual(spec["scale_reg"][1]["default"], 0.03)
+        self.assertAlmostEqual(spec["lambda_dssim"][1]["default"], 0.3)
+        self.assertAlmostEqual(spec["scale_decay"][1]["default"], 0.002)
+        self.assertEqual(spec["ppisp"][1]["default"], False)
+        self.assertEqual(spec["bg_modulation"][1]["default"], False)
+        # The cap is a RASTERIZER limit: above ~1.9M primitives the FastGS int32
+        # (primitive x tile) counter overflows and the run aborts.
+        self.assertEqual(spec["max_gaussians"][1]["default"], 1000000)
+
+    def test_subject_mode_presets_are_declared_and_land_in_the_section(self):
+        spec = LichtfeldHeadlessTrainer.INPUT_TYPES()["required"]
+        self.assertIn("subject_mode", spec)
+        self.assertEqual(list(spec["subject_mode"][0]), list(SUBJECT_MODES))
+        self.assertEqual(spec["subject_mode"][1]["default"],
+                         "subject priority (background kept)")
+
+        import inspect
+
+        self.assertIn("subject_mode",
+                      set(inspect.signature(LichtfeldHeadlessTrainer.train).parameters))
+
+        # Both presets keep the mask AND keep the opacity penalty on: 0.0 was measured to
+        # crash the rasterizer (2,424 tiles per splat), and mask_mode='none' crashed at
+        # 2,261. Only `segment` + penalty >= 1.0 survives.
+        soft = SUBJECT_MODES["subject priority (background kept)"]
+        hard = SUBJECT_MODES["subject cut-out (background removed)"]
+        for preset in (soft, hard):
+            self.assertEqual(preset["mask_mode"], "segment")
+            self.assertGreaterEqual(MASK_OPACITY_PENALTIES[preset["mask_opacity_penalty"]], 1.0)
+        self.assertLess(MASK_OPACITY_PENALTIES[soft["mask_opacity_penalty"]],
+                        MASK_OPACITY_PENALTIES[hard["mask_opacity_penalty"]])
+        self.assertIsNone(SUBJECT_MODES["custom (use the widgets below)"])
+
+        section = build_lfs_optimization_section(
+            mask_mode=soft["mask_mode"],
+            mask_opacity_penalty=soft["mask_opacity_penalty"],
+        )
+        self.assertEqual(section["mask_mode"], "segment")
+        self.assertEqual(section["mask_opacity_penalty_weight"], 1.0)
+
+    def test_subject_mode_is_the_last_widget_so_saved_workflows_keep_their_mapping(self):
+        # ComfyUI maps a saved workflow's widget_values by INSERTION ORDER, so appending a
+        # new widget in the middle would silently remap every later widget of existing
+        # workflows. Any new control must therefore go last.
+        spec = LichtfeldHeadlessTrainer.INPUT_TYPES()["required"]
+        names = list(spec)
+        # the anchor block is the newest addition, so it owns the tail; subject_mode is the
+        # newest control BEFORE it and must still precede it.
+        self.assertEqual(names[-5:], ["use_surface_anchors", "surface_anchor_mesh",
+                                      "anchor_resolution", "anchor_freeze",
+                                      "undistort_cameras"])
+        self.assertEqual(names[names.index("subject_mode") + 1], "use_surface_anchors")
+
+    # ---------------------------------------------------------------- surface anchors
+    def test_surface_anchor_widgets_are_declared_and_in_the_signature(self):
+        spec = LichtfeldHeadlessTrainer.INPUT_TYPES()["required"]
+        names = ("use_surface_anchors", "surface_anchor_mesh", "anchor_resolution",
+                 "anchor_freeze")
+        for name in names:
+            self.assertIn(name, spec, name)
+
+        import inspect
+
+        parameters = set(inspect.signature(LichtfeldHeadlessTrainer.train).parameters)
+        for name in names:
+            self.assertIn(name, parameters, name)
+
+        # OFF by default: anchors are a HARD constraint (`--freeze` gives them no gradients
+        # and no densification), so they must never switch themselves on.
+        self.assertEqual(spec["use_surface_anchors"][1]["default"], False)
+        self.assertEqual(spec["surface_anchor_mesh"][1]["default"], "")
+        self.assertEqual(spec["anchor_freeze"][1]["default"], True)
+        # MEASURED anchor counts on a 167k-vertex Poisson mesh: 128 -> 30,398,
+        # 256 -> 121,434, 512 -> 486,479. Studio's own 1024 default lands near the whole
+        # 1,000,000 cap, and frozen anchors cannot be pruned, so 256 is the sane start.
+        self.assertEqual(spec["anchor_resolution"][1]["default"], 256)
+
+    def test_build_training_command_appends_anchors_and_freezes_after_them(self):
+        # Studio's own wording: --freeze freezes "the immediately preceding --add-splat
+        # rows", so the freeze has to come AFTER the rows it pins.
+        command = build_training_command(**default_command_options(),
+                                         anchor_splats=[Path("a.ply")],
+                                         anchor_freeze=True)
+        self.assertEqual(command[-3:], ["--add-splat", "a.ply", "--freeze"])
+        self.assertLess(command.index("--add-splat"), command.index("--freeze"))
+
+        # without anchors nothing is emitted at all
+        plain = build_training_command(**default_command_options(), anchor_freeze=True)
+        self.assertNotIn("--freeze", plain)
+        self.assertNotIn("--add-splat", plain)
+
+        # anchors without the freeze: a warm start, not a constraint
+        warm = build_training_command(**default_command_options(),
+                                      anchor_splats=[Path("a.ply"), Path("b.ply")],
+                                      anchor_freeze=False)
+        self.assertEqual(warm.count("--add-splat"), 2)
+        self.assertNotIn("--freeze", warm)
+
+    def test_add_splat_is_a_value_flag_so_an_old_build_cannot_leave_a_stray_path(self):
+        # filter_supported_flags drops flags an older Studio rejects. If --add-splat were
+        # not known to take a value, the anchor PATH would survive as a bare argument and
+        # Studio would fail to parse the command.
+        self.assertIn("--add-splat", _LFS_VALUE_FLAGS)
+        command = build_training_command(**default_command_options(),
+                                         anchor_splats=[Path("anchors.ply")],
+                                         anchor_freeze=True)
+        filtered, dropped = filter_supported_flags(command, {"--data-path", "--iter"})
+        self.assertIn("--add-splat", dropped)
+        self.assertIn("--freeze", dropped)
+        self.assertNotIn("anchors.ply", filtered)
+
+    def test_resolve_anchor_mesh_prefers_the_dataset_mesh_folder(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dataset = Path(temp_dir)
+            self.assertIsNone(resolve_anchor_mesh(dataset))
+
+            (dataset / "mesh").mkdir()
+            self.assertIsNone(resolve_anchor_mesh(dataset))
+
+            for name in ANCHOR_MESH_NAMES:
+                candidate = dataset / "mesh" / name
+                candidate.write_bytes(b"mesh")
+                self.assertEqual(resolve_anchor_mesh(dataset), candidate)
+                candidate.unlink()
+
+            # any .obj / .glb is the fallback, then the dataset root
+            obj = dataset / "mesh" / "surface.obj"
+            obj.write_bytes(b"mesh")
+            self.assertEqual(resolve_anchor_mesh(dataset), obj)
+
+            explicit = dataset / "elsewhere.ply"
+            explicit.write_bytes(b"mesh")
+            self.assertEqual(resolve_anchor_mesh(dataset, str(explicit)), explicit)
+
+            with self.assertRaises(ValueError):
+                resolve_anchor_mesh(dataset, str(dataset / "missing.obj"))
+
+    def test_build_mesh2splat_command_pins_the_documented_defaults(self):
+        command = build_mesh2splat_command("studio.exe", "m.ply", "a.ply", 256)
+        self.assertEqual(command[:3], ["studio.exe", "mesh2splat", "m.ply"])
+        self.assertEqual(command[command.index("-o") + 1], "a.ply")
+        self.assertEqual(command[command.index("--resolution") + 1], "256")
+        # --sigma is pinned so a future Studio release cannot silently change the look
+        self.assertEqual(command[command.index("--sigma") + 1], str(ANCHOR_SIGMA))
+        self.assertEqual(command[-1], "-y")
+
+    def test_prepare_surface_anchors_reports_and_degrades_instead_of_raising(self):
+        notes = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            work_dir = Path(temp_dir) / "anchors"
+            with mock.patch("lichtfeld_training_node.subprocess.run") as runner:
+                runner.return_value = types.SimpleNamespace(returncode=1, stdout="boom",
+                                                            stderr="")
+                self.assertEqual(prepare_surface_anchors("studio.exe", "m.ply", work_dir,
+                                                         256, notes), [])
+            self.assertEqual(len(notes), 1)
+            self.assertIn("no anchors", notes[0])
+            self.assertIn("boom", notes[0])
+
+            notes.clear()
+            anchors = work_dir / "surface_anchors_m_128.ply"
+
+            def fake_run(command, **_kwargs):
+                # the anchors must land in work_dir, never in the training output
+                self.assertEqual(Path(command[command.index("-o") + 1]).parent, work_dir)
+                anchors.write_bytes(b"ply")
+                return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with mock.patch("lichtfeld_training_node.subprocess.run", fake_run):
+                result = prepare_surface_anchors("studio.exe", "m.ply", work_dir, 128,
+                                                 notes)
+            self.assertEqual(result, [anchors])
+            self.assertEqual(notes, [])
+
+    def test_anchor_work_dir_is_outside_the_training_output(self):
+        # A file written into the output folder would make it non-empty and trip the
+        # node's own overwrite guard on the very next run.
+        self.assertTrue(ANCHOR_WORK_DIR.is_absolute())
+        self.assertEqual(ANCHOR_WORK_DIR.name, "enndee_lichtfeld_anchors")
+
+    def test_undistort_cameras_widget_and_flag(self):
+        spec = LichtfeldHeadlessTrainer.INPUT_TYPES()["required"]
+        self.assertIn("undistort_cameras", spec)
+        self.assertEqual(list(spec["undistort_cameras"][0]), list(UNDISTORT_MODES))
+        self.assertEqual(spec["undistort_cameras"][1]["default"], "auto")
+
+        import inspect
+
+        self.assertIn("undistort_cameras",
+                      set(inspect.signature(LichtfeldHeadlessTrainer.train).parameters))
+
+        plain = build_training_command(**default_command_options())
+        self.assertNotIn("--undistort", plain)
+        forced = build_training_command(**default_command_options(), undistort=True)
+        self.assertIn("--undistort", forced)
+
+    def test_dataset_needs_undistort_reads_the_camera_model(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dataset = Path(temp_dir)
+            # no cameras.txt at all -> never add a flag we cannot justify
+            self.assertEqual(dataset_camera_models(dataset), set())
+            self.assertFalse(dataset_needs_undistort(dataset))
+
+            sparse = dataset / "sparse" / "0"
+            sparse.mkdir(parents=True)
+            cameras = sparse / "cameras.txt"
+            header = "# Camera list with one line of data per camera:\n"
+            for model, expected in (("PINHOLE", False), ("SIMPLE_PINHOLE", False),
+                                    ("SIMPLE_RADIAL", True), ("OPENCV", True),
+                                    ("RADIAL", True)):
+                cameras.write_text(f"{header}1 {model} 3456 2304 2786.2 1728 1152\n",
+                                   encoding="utf-8")
+                self.assertEqual(dataset_camera_models(dataset), {model})
+                self.assertIs(dataset_needs_undistort(dataset), expected, model)
+
+            # a mixed dataset counts as distorted if ANY camera is
+            cameras.write_text(f"{header}1 PINHOLE 3456 2304 2786.2 1728 1152\n"
+                               f"2 OPENCV 3456 2304 2786.2 1728 1152 0 0 0 0\n",
+                               encoding="utf-8")
+            self.assertTrue(dataset_needs_undistort(dataset))
+
+            # a bare sparse/ folder (Lichtfeld also accepts this) is probed too
+            (dataset / "sparse" / "0").rename(dataset / "sparse_only")
+            (dataset / "sparse" / "cameras.txt").write_text(
+                f"{header}1 SIMPLE_RADIAL 3456 2304 2786.2 1728 1152 0.01\n",
+                encoding="utf-8")
+            self.assertTrue(dataset_needs_undistort(dataset))
 
     def test_write_lfs_config_file_merges_a_user_config(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1076,6 +1476,67 @@ class ComfyNodeRegistrationTests(unittest.TestCase):
         self.assertEqual(
             len(glomap_lichtfeld_node.GLOMAPLichtfeldTracker._empty(1)), 4
         )
+
+
+class LichtfeldEvaluationTests(unittest.TestCase):
+    """`--test-every` / `--no-save-eval-images` plumbing (held-out evaluation)."""
+
+    @staticmethod
+    def _kwargs(**overrides):
+        values = dict(
+            executable="studio", dataset="dataset", output="output", log_file="",
+            iterations=1000, strategy="mcmc", sh_degree=3, max_cap=1000,
+            steps_scaler=1.0, mask_mode="none", invert_masks=False,
+            bg_mode="solidcolor", bg_color="#FFFFFF", enable_mip=False,
+            bilateral_grid=False, enable_eval=True, enable_sparsity=False,
+            log_level="info",
+        )
+        values.update(overrides)
+        return values
+
+    def test_split_labels_map_to_studios_test_every(self):
+        self.assertEqual(EVALUATION_SPLITS, {"off": 0, "1/2": 2, "1/3": 3, "1/4": 4})
+
+    def test_off_sends_no_test_every_flag(self):
+        command = build_training_command(**self._kwargs(
+            test_every=EVALUATION_SPLITS["off"]))
+        self.assertNotIn("--test-every", command)
+
+    def test_each_ratio_sends_its_test_every_value(self):
+        for label, expected in (("1/2", "2"), ("1/3", "3"), ("1/4", "4")):
+            command = build_training_command(**self._kwargs(
+                test_every=EVALUATION_SPLITS[label]))
+            self.assertIn("--test-every", command, label)
+            self.assertEqual(command[command.index("--test-every") + 1], expected, label)
+
+    def test_evaluation_still_sends_the_eval_flag(self):
+        command = build_training_command(**self._kwargs(enable_eval=True, test_every=2))
+        self.assertIn("--eval", command)
+
+    def test_save_eval_images_is_an_opt_out(self):
+        keep = build_training_command(**self._kwargs(test_every=2, save_eval_images=True))
+        self.assertNotIn("--no-save-eval-images", keep)
+        drop = build_training_command(**self._kwargs(test_every=2, save_eval_images=False))
+        self.assertIn("--no-save-eval-images", drop)
+
+    def test_a_degenerate_split_is_rejected(self):
+        for bad in (1, -1):
+            with self.assertRaises(ValueError):
+                build_training_command(**self._kwargs(test_every=bad))
+
+    def test_test_every_counts_as_a_value_flag(self):
+        # filter_supported_flags must drop its value together with the flag
+        self.assertIn("--test-every", _LFS_VALUE_FLAGS)
+
+    def test_default_eval_steps_always_include_the_final_iteration(self):
+        # Studio writes an empty report when eval_steps is empty, so the node
+        # fills it in whenever evaluation is on without explicit steps.
+        self.assertEqual(default_eval_steps(8000), [2000, 4000, 6000, 8000])
+        self.assertEqual(default_eval_steps(30000), [7500, 15000, 22500, 30000])
+        self.assertEqual(default_eval_steps(4), [1, 2, 3, 4])
+        self.assertEqual(default_eval_steps(3), [1, 2, 3])
+        self.assertEqual(default_eval_steps(1), [1])
+        self.assertEqual(default_eval_steps(0), [1])
 
 
 if __name__ == "__main__":

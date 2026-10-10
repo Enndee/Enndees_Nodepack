@@ -52,11 +52,20 @@ class MeridianGeometryFastDepthTests(unittest.TestCase):
             list(inputs["required"]),
             ["video", "args", "model_size", "canvas_mode", "custom_width", "custom_height",
              "cloud_scale", "point_size", "edge_cull", "edge_threshold", "back_face_cull",
-             "depth_res"],
+             "depth_res", "external_depth_polarity"],
         )
-        self.assertEqual(list(inputs["optional"]), ["image", "args_override", "custom_camera"])
+        self.assertEqual(list(inputs["optional"]),
+                         ["image", "args_override", "custom_camera", "external_depth"])
         for name, (_options, metadata) in inputs["required"].items():
             self.assertIn("tooltip", metadata, f"{name} needs a tooltip")
+
+    def test_the_external_depth_inputs_are_appended_last(self):
+        # ComfyUI maps a saved workflow's widget_values by INSERTION ORDER, so a widget added
+        # in the middle would silently remap every later widget of existing workflows. Any new
+        # control therefore goes last.
+        inputs = geometry.EnndeeMeridianGeometry.INPUT_TYPES()
+        self.assertEqual(list(inputs["required"])[-1], "external_depth_polarity")
+        self.assertEqual(list(inputs["optional"])[-1], "external_depth")
 
     def test_the_vggt_surface_is_gone(self):
         inputs = geometry.EnndeeMeridianGeometry.INPUT_TYPES()
@@ -167,10 +176,66 @@ class MeridianGeometryFastDepthTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "video path"):
             geometry.EnndeeMeridianGeometry().build(video="missing.mp4", args="--frames 73")
 
-    def test_model_size_options_cover_both_depth_families(self):
-        options = geometry.EnndeeMeridianGeometry.INPUT_TYPES()["required"]["model_size"][0]
-        self.assertTrue(all("Depth-Anything-V2" in option for option in options[:3]))
-        self.assertTrue(set(fast_depth.DA3_MODEL_REPOS) <= set(options))
+    def test_model_size_offers_only_da3_mono_large_or_external(self):
+        spec = geometry.EnndeeMeridianGeometry.INPUT_TYPES()["required"]["model_size"]
+        self.assertEqual(list(spec[0]), ["Depth Anything 3 Mono Large", "external"])
+        self.assertEqual(spec[1]["default"], "Depth Anything 3 Mono Large")
+
+        self.assertEqual(geometry.resolve_depth_model("Depth Anything 3 Mono Large"),
+                         ("Depth-Anything-3-Mono-Large", False))
+        self.assertEqual(geometry.resolve_depth_model("external"),
+                         ("Depth-Anything-3-Mono-Large", True))
+        # a workflow saved before the picker shrank must still route instead of exploding
+        for legacy in geometry.LEGACY_DEPTH_MODELS:
+            self.assertEqual(geometry.resolve_depth_model(legacy), (legacy, False))
+        with self.assertRaisesRegex(ValueError, "Unsupported depth model"):
+            geometry.resolve_depth_model("nonsense")
+
+    def test_external_depth_replaces_the_depth_model(self):
+        capture = _FastCapture()
+        depth = torch.linspace(0.0, 1.0, 64 * 112).view(1, 64, 112, 1)
+        with mock.patch.object(geometry, "render_depth_aligned", capture):
+            geometry.EnndeeMeridianGeometry().build(
+                video="unused.mp4", args="--frames 73", image=torch.zeros(1, 64, 112, 3),
+                model_size="external", external_depth=depth)
+        self.assertIs(capture.kwargs["external_depth"], depth)
+        self.assertIs(capture.kwargs["external_depth_invert"], False)
+        # the backend still receives a usable model id (it is simply never consulted)
+        self.assertEqual(capture.kwargs["model_size"], "Depth-Anything-3-Mono-Large")
+
+    def test_external_depth_polarity_sets_the_invert_flag(self):
+        depth = torch.linspace(0.0, 1.0, 64 * 112).view(1, 64, 112, 1)
+        for label, expected in geometry.EXTERNAL_DEPTH_POLARITIES.items():
+            capture = _FastCapture()
+            with mock.patch.object(geometry, "render_depth_aligned", capture):
+                geometry.EnndeeMeridianGeometry().build(
+                    video="unused.mp4", args="--frames 73", image=torch.zeros(1, 64, 112, 3),
+                    model_size="external", external_depth=depth,
+                    external_depth_polarity=label)
+            self.assertIs(capture.kwargs["external_depth_invert"], expected, label)
+
+    def test_external_model_without_a_map_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "external_depth input"):
+            geometry.EnndeeMeridianGeometry().build(
+                video="unused.mp4", args="--frames 73", image=torch.zeros(1, 64, 112, 3),
+                model_size="external")
+
+    def test_a_connected_map_is_ignored_unless_the_model_is_external(self):
+        capture = _FastCapture()
+        depth = torch.linspace(0.0, 1.0, 64 * 112).view(1, 64, 112, 1)
+        with mock.patch.object(geometry, "render_depth_aligned", capture):
+            geometry.EnndeeMeridianGeometry().build(
+                video="unused.mp4", args="--frames 73", image=torch.zeros(1, 64, 112, 3),
+                model_size="Depth Anything 3 Mono Large", external_depth=depth)
+        self.assertIsNone(capture.kwargs["external_depth"])
+
+    def test_an_unknown_polarity_is_rejected(self):
+        depth = torch.linspace(0.0, 1.0, 64 * 112).view(1, 64, 112, 1)
+        with self.assertRaisesRegex(ValueError, "polarity"):
+            geometry.EnndeeMeridianGeometry().build(
+                video="unused.mp4", args="--frames 73", image=torch.zeros(1, 64, 112, 3),
+                model_size="external", external_depth=depth,
+                external_depth_polarity="sideways")
 
     def test_registration_maps_the_geometry_node(self):
         spec = importlib.util.spec_from_file_location(
@@ -182,6 +247,65 @@ class MeridianGeometryFastDepthTests(unittest.TestCase):
         spec.loader.exec_module(nodepack)
         self.assertIs(nodepack.NODE_CLASS_MAPPINGS["Enndee_MeridianGeometry"],
                       geometry.EnndeeMeridianGeometry)
+
+
+class MeridianExternalDepthMapTests(unittest.TestCase):
+    """The external depth map contract: resize, ordering, polarity, and the guards."""
+
+    def test_resizes_onto_the_working_still_and_keeps_the_ordering(self):
+        depth = torch.zeros(1, 32, 64, 1)
+        depth[..., :, :32, :] = 1.0                # left half of the WIDTH is far
+        out, note = fast_depth.prepare_external_depth(depth, 64, 128)
+        self.assertEqual(tuple(out.shape), (64, 128))
+        self.assertIsNone(note)                    # 64/32 == 128/64, so the aspect matches
+        self.assertGreater(float(out[:, :32].mean()), float(out[:, -32:].mean()))
+
+    def test_invert_flips_the_ordering(self):
+        depth = torch.zeros(1, 32, 64, 1)
+        depth[..., :, :32, :] = 1.0
+        out, _note = fast_depth.prepare_external_depth(depth, 64, 128, invert=True)
+        self.assertLess(float(out[:, :32].mean()), float(out[:, -32:].mean()))
+
+    def test_a_colourised_map_is_averaged_to_luminance(self):
+        depth = torch.zeros(1, 32, 64, 3)
+        depth[..., :, :32, 0] = 1.0                # pure red on the left half of the WIDTH
+        out, _note = fast_depth.prepare_external_depth(depth, 64, 128)
+        self.assertEqual(tuple(out.shape), (64, 128))
+        # the map is resized 64 -> 128 wide, so the boundary lands on column 64; keep a margin
+        self.assertAlmostEqual(float(out[:, :56].mean()), 1.0 / 3.0, places=5)
+        self.assertAlmostEqual(float(out[:, 72:].mean()), 0.0, places=5)
+
+    def test_an_aspect_mismatch_is_reported_instead_of_hidden(self):
+        depth = torch.linspace(0.0, 1.0, 32 * 64).view(1, 32, 64, 1)   # aspect 2.0
+        _out, note = fast_depth.prepare_external_depth(depth, 64, 64)  # still is 1.0
+        self.assertIsNotNone(note)
+        self.assertIn("stretched", note)
+
+    def test_a_constant_map_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "constant"):
+            fast_depth.prepare_external_depth(torch.ones(1, 32, 64, 1), 64, 64)
+
+    def test_non_finite_values_are_rejected(self):
+        bad = torch.zeros(1, 32, 64, 1)
+        bad[0, 0, 0, 0] = float("nan")
+        with self.assertRaisesRegex(ValueError, "non-finite"):
+            fast_depth.prepare_external_depth(bad, 64, 64)
+
+    def test_a_non_tensor_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "IMAGE tensor"):
+            fast_depth.prepare_external_depth([[1.0, 2.0]], 64, 64)
+
+    def test_the_result_moves_to_the_requested_device(self):
+        """`device=` is the fix for the Marigold/ComfyUI CPU-map crash."""
+        depth = torch.linspace(0.0, 1.0, 32 * 64).view(1, 32, 64, 1)
+        target = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        moved, _note = fast_depth.prepare_external_depth(depth, 64, 128, device=target)
+        self.assertEqual(moved.device.type, target.type)
+
+        # no device argument keeps the input's device - what every other test here relies on
+        kept, _note = fast_depth.prepare_external_depth(depth, 64, 128)
+        self.assertEqual(kept.device.type, "cpu")
 
 
 if __name__ == "__main__":

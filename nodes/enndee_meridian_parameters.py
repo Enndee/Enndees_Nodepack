@@ -46,6 +46,22 @@ import torch
 
 from enndee_meridian_auto_camera import (
     AUTO_TARGETS,
+    BAND_COUNT_DEFAULT,
+    BAND_COUNT_MAX,
+    BAND_COUNT_MIN,
+    BAND_ELEVATION_LIMIT,
+    BAND_START_ANGLE_DEFAULT,
+    BAND_START_ANGLE_MAX,
+    BAND_START_ANGLE_MIN,
+    BAND_START_YAW_DEFAULT,
+    BAND_START_YAW_MAX,
+    BAND_START_YAW_MIN,
+    BAND_STEP_DEFAULT,
+    BAND_STEP_MAX,
+    BAND_STEP_MIN,
+    BAND_WIDTH_DEFAULT,
+    BAND_WIDTH_MAX,
+    BAND_WIDTH_MIN,
     COLLISION_MARGIN,
     DEFAULT_MAX_SPEED,
     FRONT_ORBIT_ANGLE_DEFAULT,
@@ -66,7 +82,6 @@ from enndee_meridian_auto_camera import (
     ORBIT_VIEW_ANGLE_DEFAULT,
     ORBIT_VIEW_ANGLE_MAX,
     ORBIT_VIEW_ANGLE_MIN,
-    SCENE_FILL,
     SPIRAL_END_ARC_DEFAULT,
     SPIRAL_END_ARC_MAX,
     SPIRAL_END_ARC_MIN,
@@ -442,7 +457,21 @@ class MeridianParametersAndCamera:
                         f"reads smooth in every view. Auto Max Speed never shortens the spiral (the "
                         f"winding and the end angle are your parameters, not the fit's): the console "
                         f"line reports the per-frame drift against the cap instead, so more Output "
-                        f"Frames or a higher Auto Max Speed are the levers."
+                        f"Frames or a higher Auto Max Speed are the levers. "
+                        f"'{ORBIT_COVERAGES[3]}' stacks several PARTIAL orbits instead - circle "
+                        f"segments at increasing elevation. The camera starts on the first (lowest) "
+                        f"band at the 'Band Start Yaw' (the 'on the right' side), flies it towards "
+                        f"the left until it has covered 'Band Width' degrees, steps STRAIGHT UP to "
+                        f"the next band at that same azimuth, flies that one back the other way, "
+                        f"then up to the next and back again. 'Band Start Angle' sets where the "
+                        f"stack begins ({BAND_START_ANGLE_DEFAULT:g} = level, "
+                        f"{BAND_START_ANGLE_MIN:g} = from below, {BAND_START_ANGLE_MAX:g} = from "
+                        f"above the head), 'Band Count' how many bands and 'Band Step' how far "
+                        f"apart they are (auto = spread over the whole range). Every band lives on "
+                        f"the same sphere around the pivot, so the framing and the distance never "
+                        f"change and the camera never rolls. A {BAND_WIDTH_MAX:g} deg 'Band Width' "
+                        f"is a full turn, which ends where it began - so it does NOT alternate: the "
+                        f"camera carries on the way it was going, one turn per band."
                     ),
                 }),
                 # The front O's angular radius, appended last (same reason as the shape widgets
@@ -515,6 +544,80 @@ class MeridianParametersAndCamera:
                         f"straight below ('from straight below'). The pivot, the camera distance and "
                         f"the aim are untouched - only the axis the O-orbit family winds around "
                         f"moves. Clamped to {SPIRAL_SLOPE_MIN:g}..{SPIRAL_SLOPE_MAX:g} deg."
+                    ),
+                }),
+                # The 'Banded Orbits' coverage's own slots. Every number the path needs lives
+                # here (the O-orbit amplitude, the view angle and the direction play no part),
+                # so the JS panel labels them and only shows them while that mode is picked.
+                "band_start_angle": ("FLOAT", {
+                    "default": round(BAND_START_ANGLE_DEFAULT, 1),
+                    "min": BAND_START_ANGLE_MIN, "max": BAND_START_ANGLE_MAX, "step": 5.0,
+                    "tooltip": (
+                        f"Automatic camera, '{ORBIT_COVERAGES[3]}' coverage: the elevation of the "
+                        f"FIRST (lowest) band, in degrees above/below the pivot. "
+                        f"{BAND_START_ANGLE_DEFAULT:g} (the default) starts level with the subject; "
+                        f"{BAND_START_ANGLE_MIN:g} starts from the farthest point below - looking up "
+                        f"at the subject from downstairs, feet first; {BAND_START_ANGLE_MAX:g} starts "
+                        f"from straight above the head. The camera steps to the NEXT band from "
+                        f"there, so the stack is always built upwards (or downwards) from this "
+                        f"angle. Clamped to {BAND_START_ANGLE_MIN:g}..{BAND_START_ANGLE_MAX:g} deg; "
+                        f"the bands themselves are held {BAND_ELEVATION_LIMIT:g} deg off the "
+                        f"poles so the camera's up vector stays sane."
+                    ),
+                }),
+                "band_count": ("INT", {
+                    "default": int(BAND_COUNT_DEFAULT),
+                    "min": int(BAND_COUNT_MIN), "max": int(BAND_COUNT_MAX), "step": 1,
+                    "tooltip": (
+                        f"Automatic camera, '{ORBIT_COVERAGES[3]}' coverage: how many circle "
+                        f"segments (bands) the path is made of. One band is a plain partial orbit "
+                        f"at the Band Start Angle; every extra one adds a full sweep at a new "
+                        f"elevation, and the camera steps straight between them. Three bands "
+                        f"starting at -90 deg cover the whole sphere (below, level, above); more "
+                        f"than {BAND_COUNT_MAX:g} buy nothing at 73-243 frames."
+                    ),
+                }),
+                "band_width": ("FLOAT", {
+                    "default": round(BAND_WIDTH_DEFAULT, 1),
+                    "min": BAND_WIDTH_MIN, "max": BAND_WIDTH_MAX, "step": 5.0,
+                    "tooltip": (
+                        f"Automatic camera, '{ORBIT_COVERAGES[3]}' coverage: how many degrees of "
+                        f"azimuth ONE band sweeps, measured around the subject. "
+                        f"{BAND_WIDTH_DEFAULT:g} deg (the default) is half a turn: the camera flies "
+                        f"from the Band Start Yaw to the opposite side, steps to the next band "
+                        f"there and flies back, so consecutive bands cover the same arc from the "
+                        f"other direction. {BAND_WIDTH_MAX:g} deg is a full circle - then the band "
+                        f"ends where it began, so the camera does NOT turn around but carries on "
+                        f"the way it was going, one full turn per band. Clamped to "
+                        f"{BAND_WIDTH_MIN:g}..{BAND_WIDTH_MAX:g} deg."
+                    ),
+                }),
+                "band_start_yaw": ("FLOAT", {
+                    "default": round(BAND_START_YAW_DEFAULT, 1),
+                    "min": BAND_START_YAW_MIN, "max": BAND_START_YAW_MAX, "step": 5.0,
+                    "tooltip": (
+                        f"Automatic camera, '{ORBIT_COVERAGES[3]}' coverage: where around the "
+                        f"subject the FIRST band BEGINS, in degrees about the subject's vertical "
+                        f"axis. {BAND_START_YAW_DEFAULT:g} (the default) is the frontal azimuth - "
+                        f"the same side the source camera saw. POSITIVE values start on the "
+                        f"subject's RIGHT (its viewer-left), NEGATIVE values on its LEFT; 180 is "
+                        f"directly behind it. The camera then flies from here towards the LEFT "
+                        f"(decreasing angle) for the band's width, steps to the next band and comes "
+                        f"back, so this angle is the near edge of every band. Clamped to "
+                        f"{BAND_START_YAW_MIN:g}..{BAND_START_YAW_MAX:g} deg."
+                    ),
+                }),
+                "band_step": ("FLOAT", {
+                    "default": round(BAND_STEP_DEFAULT, 1),
+                    "min": BAND_STEP_MIN, "max": BAND_STEP_MAX, "step": 5.0,
+                    "tooltip": (
+                        f"Automatic camera, '{ORBIT_COVERAGES[3]}' coverage: how many degrees of "
+                        f"ELEVATION separate two neighbouring bands. {BAND_STEP_DEFAULT:g} (the "
+                        f"default) is AUTO: the stack is spread over the whole range that is left "
+                        f"in the direction with more room, so three bands from -90 deg become "
+                        f"-90 / 0 / +90 and three from +90 become +90 / 0 / -90. Set it explicitly "
+                        f"to keep the stack tight (e.g. 20 deg bands around a level orbit). Clamped "
+                        f"to {BAND_STEP_MIN:g}..{BAND_STEP_MAX:g} deg."
                     ),
                 }),
             },
@@ -623,6 +726,14 @@ class MeridianParametersAndCamera:
                 spiral_end=float(kwargs["spiral_end"]),
                 # Spiral Center Slope: the lean of the spiral's central axis (-90..90).
                 spiral_slope=float(kwargs["spiral_slope"]),
+                # 'Banded Orbits': the stack of circle segments. Every number that path needs is
+                # its own widget - the O-orbit amplitude, the view angle and the direction play no
+                # part in it, so these five are all the backend reads.
+                bands_start_angle=float(kwargs["band_start_angle"]),
+                bands_count=int(kwargs["band_count"]),
+                bands_width=float(kwargs["band_width"]),
+                bands_start_yaw=float(kwargs["band_start_yaw"]),
+                bands_step=float(kwargs["band_step"]),
             )
             print(f"[Enndee] Meridian {format_summary(summary)}", flush=True)
             return signal

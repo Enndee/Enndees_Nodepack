@@ -189,9 +189,10 @@ BACK_ORBIT_HOME_FACTOR = 1.0                         # the 8 o'clock -> dial-cen
 ORBIT_VIEW_ANGLE_DEFAULT = 0.0    # deg, 0 = the orbit is centred on the frontal view
 ORBIT_VIEW_ANGLE_MIN = -180.0
 ORBIT_VIEW_ANGLE_MAX = 360.0
-ORBIT_COVERAGES = ("Front only", "Front and Back", "Spiral")
+ORBIT_COVERAGES = ("Front only", "Front and Back", "Spiral", "Banded Orbits")
 ORBIT_COVERAGE_DEFAULT = ORBIT_COVERAGES[1]
 SPIRAL_COVERAGE = ORBIT_COVERAGES[2]
+BAND_COVERAGE = ORBIT_COVERAGES[3]
 ORBIT_COVERAGE_DEGREES = 180.0    # deg from the front circle's middle to the back circle's middle
                                   # (the level connection stops one O radius short of this, at the
                                   # back orbit's own edge - see `_back_orbit_point`)
@@ -322,6 +323,146 @@ def resolve_spiral_slope(degrees=None):
     if degrees is None:
         return SPIRAL_SLOPE_DEFAULT
     return max(SPIRAL_SLOPE_MIN, min(SPIRAL_SLOPE_MAX, _finite(degrees, "Spiral slope")))
+
+
+# --- "Banded Orbits": a stack of circle SEGMENTS on the orbit sphere -------------
+# The fourth coverage. Each band is a partial orbit at ONE elevation; the camera
+# sweeps a band, steps to the next one at a constant azimuth, sweeps back the other
+# way, and so on - a boustrophedon over the sphere. It is the multi-elevation
+# capture the other subject paths were missing: a single ring leaves the top and the
+# bottom of the subject unconstrained, and this mode visits them in one continuous
+# move without ever rolling (see `_band_samples`).
+#
+#   * Band Start Angle - the elevation of the FIRST band. 0 = level with the pivot,
+#     -90 = from straight below (the feet, looking up), +90 = from straight above the
+#     head. Clamped to BAND_ELEVATION_LIMIT so the look/up frame stays sane.
+#   * Band Count - how many bands (1, 2, 3 ...).
+#   * Band Width - the azimuth each band sweeps, 1..360 deg.
+#   * Band Start Yaw - the azimuth the FIRST band BEGINS at, measured around the
+#     subject (negative = from its left, positive = from its right). The first sweep
+#     runs from there towards the LEFT, i.e. with DECREASING yaw.
+#   * Band Step - the elevation rise per band; 0 = auto (spread the bands over the
+#     full available range, in whichever direction has more room - see
+#     `band_elevations`).
+#
+# Every band's sweep ENDS exactly where the next one BEGINS, so the step between
+# two bands is a pure elevation move at ONE azimuth: the "straight up" the spec asks
+# for. A 360 deg width ends where it started, so it cannot alternate - it keeps
+# turning the same way instead, exactly as the spec requires. The bands live on the
+# orbit sphere (`_place`), so the camera keeps one radius for the whole path.
+BAND_START_ANGLE_DEFAULT = 0.0    # deg, the built-in first band is level with the pivot
+BAND_START_ANGLE_MIN = -90.0      # deg, the farthest below: looking up at the feet
+BAND_START_ANGLE_MAX = 90.0       # deg, straight above the head
+BAND_COUNT_DEFAULT = 3            # bands, the built-in stack
+BAND_COUNT_MIN = 1
+BAND_COUNT_MAX = 12               # more bands than this buy nothing at 73-243 frames
+BAND_WIDTH_DEFAULT = 180.0        # deg of azimuth one band sweeps (half a turn)
+BAND_WIDTH_MIN = 1.0
+BAND_WIDTH_MAX = 360.0            # a full turn - and then the bands never alternate
+BAND_START_YAW_DEFAULT = 0.0      # deg, the built-in start is the frontal azimuth
+BAND_START_YAW_MIN = -360.0
+BAND_START_YAW_MAX = 360.0
+BAND_STEP_DEFAULT = 0.0           # deg, 0 = auto (spread over the available range)
+BAND_STEP_MIN = 0.0
+BAND_STEP_MAX = 90.0
+BAND_ELEVATION_LIMIT = 88.0       # deg: keep the look/up frame away from the poles
+BAND_MIN_STEP = 5.0               # deg, below this the auto step is degenerate
+
+# The node's band widgets travel the same way as the O Orbit Angle and the spiral
+# ones: module globals, set and restored around the estimate by `estimate_camera_path`.
+_ACTIVE_BAND_START_ANGLE = BAND_START_ANGLE_DEFAULT
+_ACTIVE_BAND_COUNT = BAND_COUNT_DEFAULT
+_ACTIVE_BAND_WIDTH = BAND_WIDTH_DEFAULT
+_ACTIVE_BAND_START_YAW = BAND_START_YAW_DEFAULT
+_ACTIVE_BAND_STEP = BAND_STEP_DEFAULT
+
+
+def band_start_angle():
+    """Elevation (deg) of the first band in the estimate being built."""
+    return _ACTIVE_BAND_START_ANGLE
+
+
+def band_count():
+    """How many bands the estimate being built flies."""
+    return _ACTIVE_BAND_COUNT
+
+
+def band_width():
+    """Azimuth (deg) one band sweeps in the estimate being built."""
+    return _ACTIVE_BAND_WIDTH
+
+
+def band_start_yaw():
+    """Azimuth (deg) the first band begins at in the estimate being built."""
+    return _ACTIVE_BAND_START_YAW
+
+
+def band_step():
+    """Elevation rise (deg) per band in the estimate being built (0 = auto)."""
+    return _ACTIVE_BAND_STEP
+
+
+def resolve_band_start_angle(degrees=None):
+    """Clamp a Band Start Angle widget value; None keeps `BAND_START_ANGLE_DEFAULT`."""
+    if degrees is None:
+        return BAND_START_ANGLE_DEFAULT
+    return max(BAND_START_ANGLE_MIN,
+               min(BAND_START_ANGLE_MAX, _finite(degrees, "Band start angle")))
+
+
+def resolve_band_count(count=None):
+    """Clamp a Band Count widget value; None keeps `BAND_COUNT_DEFAULT`."""
+    if count is None:
+        return BAND_COUNT_DEFAULT
+    return max(BAND_COUNT_MIN, min(BAND_COUNT_MAX, int(_finite(count, "Band count"))))
+
+
+def resolve_band_width(degrees=None):
+    """Clamp a Band Width widget value; None keeps `BAND_WIDTH_DEFAULT`."""
+    if degrees is None:
+        return BAND_WIDTH_DEFAULT
+    return max(BAND_WIDTH_MIN, min(BAND_WIDTH_MAX, _finite(degrees, "Band width")))
+
+
+def resolve_band_start_yaw(degrees=None):
+    """Clamp a Band Start Yaw widget value; None keeps `BAND_START_YAW_DEFAULT`."""
+    if degrees is None:
+        return BAND_START_YAW_DEFAULT
+    return max(BAND_START_YAW_MIN,
+               min(BAND_START_YAW_MAX, _finite(degrees, "Band start yaw")))
+
+
+def resolve_band_step(degrees=None):
+    """Clamp a Band Step widget value; None keeps `BAND_STEP_DEFAULT` (auto)."""
+    if degrees is None:
+        return BAND_STEP_DEFAULT
+    return max(BAND_STEP_MIN, min(BAND_STEP_MAX, _finite(degrees, "Band step")))
+
+
+def band_elevations(count=None, start=None, step=None):
+    """The elevation (deg) of every band, the first one first.
+
+    `step = 0` (auto) spreads the bands over the FULL available range in whichever
+    direction has more room, so the requested count always gives a real stack: start
+    -88 with three bands becomes -88 / 0 / +88 and start +88 becomes +88 / 0 / -88.
+    A stack pushed at a pole is clamped to BAND_ELEVATION_LIMIT, so it flattens there
+    instead of flipping the up vector.
+
+    A `None` argument means **the widget the estimate is currently flying**
+    (`band_start_angle()` / `band_count()` / `band_step()`), not the built-in default:
+    a caller that passes nothing must get the stack the node asked for.
+    """
+    count = band_count() if count is None else resolve_band_count(count)
+    start = band_start_angle() if start is None else resolve_band_start_angle(start)
+    step = band_step() if step is None else resolve_band_step(step)
+    if count <= 1:
+        return [max(-BAND_ELEVATION_LIMIT, min(BAND_ELEVATION_LIMIT, start))]
+    if step <= 1e-9:
+        up = BAND_ELEVATION_LIMIT - start
+        down = start + BAND_ELEVATION_LIMIT
+        step = (up if up >= down else -down) / (count - 1)
+    return [max(-BAND_ELEVATION_LIMIT, min(BAND_ELEVATION_LIMIT, start + index * step))
+            for index in range(count)]
 
 
 # The direction the estimated clip is *levelled to*: the camera frame keeps this up, so nothing
@@ -1721,6 +1862,118 @@ def _spiral_key_frames(samples, frames, turn=SPIRAL_KEY_TURN):
     return ticks
 
 
+def _band_orbit(index, count, width, start_yaw):
+    """(yaw_begin, yaw_end) of band `index`: the arc that band sweeps, in flight order.
+
+    Band 0 begins at `start_yaw` and sweeps towards the LEFT (decreasing yaw, the
+    spec's "starts on the right side and goes to the left"); the next one begins
+    exactly where it stopped and sweeps back, and so on. That is what makes every
+    band END where the following one BEGINS, so the step between two bands is a pure
+    elevation move at ONE azimuth - the "straight up to the higher orbit" of the spec.
+    A 360 deg width ends where it began, so alternating would be a no-op: that width
+    keeps turning the SAME way instead (`start_yaw -> start_yaw - 360` on every band),
+    which is the spec's own rule for a full circle.
+    """
+    width = resolve_band_width(width)
+    start_yaw = resolve_band_start_yaw(start_yaw)
+    if width >= FULL_CIRCLE - 1e-6 or index % 2 == 0:
+        return start_yaw, start_yaw - width
+    return start_yaw - width, start_yaw
+
+
+def _band_legs(start_yaw, elevations, width):
+    """(travel, yaw0, elevation0, yaw1, elevation1) for every leg, in flight order.
+
+    One leg per band (its sweep) plus one per step between two bands (the pure
+    elevation move at the azimuth the band ended on). The travel is measured on the
+    unit sphere - `d(yaw) * cos(elevation)` along a band, `d(elevation)` along a step
+    - so the frames can be split by it and the camera holds ONE angular speed. That
+    is also why a narrow stack near a pole (a small circle) takes fewer frames than a
+    wide sweep at the equator, instead of crawling there.
+    """
+    legs = []
+    for index, elevation in enumerate(elevations):
+        begin, end = _band_orbit(index, len(elevations), width, start_yaw)
+        travel = math.radians(abs(end - begin)) * math.cos(math.radians(elevation))
+        legs.append((travel, begin, elevation, end, elevation))
+        if index + 1 < len(elevations):
+            nxt = elevations[index + 1]
+            legs.append((abs(math.radians(nxt - elevation)), end, elevation, end, nxt))
+    return legs
+
+
+def _band_samples(frames, pivot, radius, start_yaw=None, elevations=None, width=None):
+    """Per-frame positions of the "Banded Orbits" path - the spec's own choreography.
+
+    The camera starts on the FIRST (lowest) band at `start_yaw` - the spec's "on the
+    right side" - flies it towards the left until it has covered `width`, steps to the
+    next band AT THAT AZIMUTH (a pure elevation move: the bands share their
+    endpoints), flies that one back the other way, then up to the next band and back
+    again. With a 360 deg width the bands cannot alternate, so the camera keeps
+    turning the same way instead.
+
+    The frames are split by the legs' *travel on the sphere*, so the camera holds one
+    angular speed: a narrow band near a pole (a small circle) gets fewer frames than a
+    wide sweep at the equator, exactly as it should. `_place` puts every pose on the
+    orbit sphere, so the radius - and with it the framing - never changes; levelling
+    to the WORLD up means the camera never rolls, unlike the spiral (whose axis leans
+    and which therefore needs the tilted up of `_ACTIVE_ROLL_UP`).
+
+    `elevations` may be given (a list, lowest first) or left to `band_elevations()`;
+    `width` and `start_yaw` likewise fall back to the module's active widgets.
+    """
+    frames = int(frames)
+    width = band_width() if width is None else resolve_band_width(width)
+    start_yaw = band_start_yaw() if start_yaw is None else resolve_band_start_yaw(start_yaw)
+    if elevations is None:
+        elevations = band_elevations()
+    elevations = [float(value) for value in elevations] or [BAND_START_ANGLE_DEFAULT]
+    legs = _band_legs(start_yaw, elevations, width)
+    total = sum(leg[0] for leg in legs)
+    if frames <= 1 or total <= 1e-12:
+        # one frame (or a degenerate stack): the path is a point - report its start
+        return [_place(pivot, radius, legs[0][1], legs[0][2]) for _ in range(max(1, frames))]
+    span = float(frames - 1)
+    positions = []
+    for index in range(frames):
+        distance = total * (index / span)
+        yaw, elevation = legs[-1][3], legs[-1][4]      # the last frame lands exactly on the end
+        for leg in legs:
+            if distance <= leg[0] or leg is legs[-1]:
+                phase = min(1.0, max(0.0, distance / leg[0])) if leg[0] > 1e-12 else 1.0
+                yaw = leg[1] + (leg[3] - leg[1]) * phase
+                elevation = leg[2] + (leg[4] - leg[2]) * phase
+                break
+            distance -= leg[0]
+        positions.append(_place(pivot, radius, yaw, elevation))
+    return positions
+
+
+def _band_info(start_yaw=None, width=None):
+    """The `info` fields the "Banded Orbits" coverage reports."""
+    width = band_width() if width is None else resolve_band_width(width)
+    start_yaw = band_start_yaw() if start_yaw is None else resolve_band_start_yaw(start_yaw)
+    elevations = band_elevations()
+    legs = _band_legs(start_yaw, elevations, width)
+    # `band_step` is the WIDGET value as well (0 = auto). With an auto step the flown gap is
+    # reported instead, so the summary always names a real number; `band_elevations` lists the
+    # stack as flown, which is where a clamped first band shows up.
+    step = band_step()
+    if step <= 1e-9:
+        step = (elevations[1] - elevations[0]) if len(elevations) > 1 else 0.0
+    return {"front_yaw": 0.0, "orbit_end": width, "front_share": 1.0,
+            "back_span": 0.0, "back_orbit": False,
+            # `band_start_angle` is the WIDGET value; `band_elevations` is the stack the path really
+            # flies, whose first entry is clamped to BAND_ELEVATION_LIMIT (so a requested -90 is
+            # flown as -88). The report shows both, so the difference is never a surprise.
+            "band_start_angle": band_start_angle(), "band_count": len(elevations),
+            "band_width": width, "band_start_yaw": start_yaw, "band_step": step,
+            "band_elevations": elevations, "band_lowest": min(elevations),
+            "band_highest": max(elevations), "band_travel": sum(leg[0] for leg in legs),
+            "band_end_yaw": legs[-1][3], "band_end_elevation": legs[-1][4],
+            "orbit_coverage": min(FULL_CIRCLE, abs(width)), "view_angle": None}
+
+
 def _legacy_samples(frames, pivot, radius, scale=1.0, size=1.0, orbit_end=None,
                     direction=ORBIT_DIRECTION_DEFAULT, share=None):
     """The pre-`coverage` choreography: the front O, then the concluding orbit to `orbit_end`.
@@ -1814,6 +2067,13 @@ def subject_samples(frames, pivot, radius, scale=1.0, size=1.0, orbit_end=None,
         # degrees around the axis - exactly the spec. The frames are the parameter itself; the
         # rendered path stays smooth because the keys follow the path's own turning.
         return _spiral_samples(frames, pivot, radius, centre, mirror, slope=spiral_slope)
+    if mode == BAND_COVERAGE:
+        # A stack of circle SEGMENTS on the orbit sphere: sweep a band, step straight
+        # to the next one at the same azimuth, sweep back, and so on. Every number the
+        # path needs is its own widget (start angle, count, width, start yaw, step), so
+        # the O-orbit amplitude, the view angle and the direction play no part here -
+        # the *width* is the swing and `band_start_yaw` is the azimuth, by design.
+        return _band_samples(frames, pivot, radius)
     back = mode == ORBIT_COVERAGES[1]
     # The level connection ends where the back orbit begins: its near edge, one O radius (half the
     # circle's span) short of the back circle's middle. That is the shortest way to reach the back
@@ -2022,16 +2282,19 @@ def _orbit_candidate(pool, surface, frames, pivot, radius, scale, size, end, dir
         info = {"front_yaw": amplitude, "orbit_end": end,
                 "front_share": balanced_front_share(amplitude, max(0.0, end - amplitude))}
         return scale, samples, drift, typical, info
-    if str(coverage) == SPIRAL_COVERAGE:
-        # Nothing to cut here: the winding is the node's Spiral End parameter, so one sample run and
-        # one drift measurement describe the whole path. The samples are the constant-speed ones
-        # (`_spiral_samples`, spaced along the path and held to `cap_px`) - they are what the emitted
-        # keys come from, so the fit and the keys must never disagree about where a frame sits.
+    if str(coverage) in (SPIRAL_COVERAGE, BAND_COVERAGE):
+        # Nothing to cut here: the spiral's winding and the band stack are the node's own
+        # widgets, so one sample run and one drift measurement describe the whole path.
+        # The samples are the constant-speed ones (`_spiral_samples` / `_band_samples`,
+        # spaced along the path) - they are what the emitted keys come from, so the fit
+        # and the keys must never disagree about where a frame sits.
         samples = subject_samples(frames, pivot, radius, scale, size, None, direction,
                                   motion_pool=pool, motion_surface=surface, motion_cap=cap_px,
                                   **path_options(view_angle, coverage))
         drift, typical = subject_drift(pool, samples, pivot, surface)
-        return scale, samples, drift, typical, _spiral_info(view_angle, direction)
+        info = (_spiral_info(view_angle, direction) if str(coverage) == SPIRAL_COVERAGE
+                else _band_info())
+        return scale, samples, drift, typical, info
     span, samples, drift, typical = _cut_back_span(pool, surface, frames, pivot, radius, scale, size,
                                                    direction, cap_px, view_angle, coverage)
     amplitude = front_amplitudes(scale, size)[0]
@@ -2074,10 +2337,11 @@ def _fit_subject_amplitude(frames, pivot, radius, surface, size, cap_px, amplitu
     pool = _decimate(surface["content_cloud"], DRIFT_POOL)
     size = max(1e-3, float(size))
     end = ORBIT_END_DEFAULT if orbit_end is None else max(ORBIT_END_MIN, float(orbit_end))
-    if str(coverage) == SPIRAL_COVERAGE:
-        # The spiral's winding is the node's Spiral End parameter, not a rung the ladder may trade
-        # away: fly the path exactly as asked and *report* the drift, so the speed cap names the
-        # price instead of silently shortening the coil. (That cut is what kept a requested 840 deg
+    if str(coverage) in (SPIRAL_COVERAGE, BAND_COVERAGE):
+        # The spiral's winding and the band stack (start angle / count / width / start yaw /
+        # step) are the node's own widgets, not rungs the ladder may trade away: fly the
+        # path exactly as asked and *report* the drift, so the speed cap names the price
+        # instead of silently shortening the path. (That cut is what kept a requested 840 deg
         # from ever being flown: the ladder only paid for whole rounds it could afford.)
         chosen = _orbit_candidate(pool, surface, frames, pivot, radius, 1.0, size, end,
                                   direction, cap_px, view_angle, coverage)
@@ -2184,12 +2448,14 @@ def _fit_orbit_world(frames, pivot, radius, surface, size, budget, orbit_end=Non
         info = {"front_yaw": amplitude, "orbit_end": end,
                 "front_share": balanced_front_share(amplitude, max(0.0, end - amplitude))}
         return scale, samples, travel, info
-    if str(coverage) == SPIRAL_COVERAGE:
-        # Same rule as the pixel fit: the winding is the node's Spiral End parameter, so it is not a
-        # ladder to trade away - one sample run, measured, never cut.
+    if str(coverage) in (SPIRAL_COVERAGE, BAND_COVERAGE):
+        # Same rule as the pixel fit: the winding and the band stack are the node's own widgets, so
+        # they are not a ladder to trade away - one sample run, measured, never cut.
         options = path_options(view_angle, coverage)
         samples = subject_samples(frames, pivot, radius, 1.0, size, None, direction, **options)
-        return 1.0, samples, _largest_step(samples), _spiral_info(view_angle, direction)
+        info = (_spiral_info(view_angle, direction) if str(coverage) == SPIRAL_COVERAGE
+                else _band_info())
+        return 1.0, samples, _largest_step(samples), info
     options = path_options(view_angle, coverage)
     # The connection ends at the back orbit's near edge (the clock's 9 o'clock), so the azimuth it
     # has to cover is the circle-to-circle distance MINUS the O's own diameter - the back orbit's
@@ -2406,6 +2672,7 @@ def automatic_keys(frames, pivot, radius, content_radius, target, max_speed=DEFA
     meta = {}
     if str(target).strip().lower() == SUBJECT_TARGET:
         style = ("spherical spiral" if str(coverage) == SPIRAL_COVERAGE
+                 else "banded orbits" if str(coverage) == BAND_COVERAGE
                  else "front O-orbit + closing orbit")
         fitted = _fit_subject_amplitude(frames, pivot, radius, surface, orbit_size, cap_px,
                                         amplitude_cap, orbit_end, direction, view_angle, coverage)
@@ -2426,9 +2693,11 @@ def automatic_keys(frames, pivot, radius, content_radius, target, max_speed=DEFA
         scale, samples, travel = _fit_amplitude(samples_of, budget)
     # The spiral's keys follow its own turning (`_spiral_key_frames`): its fastest heading change is
     # right after the pole, where an evenly spaced key list would cut the corner the renderer's
-    # spline then follows. Every other path keeps the even frame list.
-    ticks = (_spiral_key_frames(samples, frames) if str(coverage) == SPIRAL_COVERAGE
-             else _key_frames(frames))
+    # spline then follows. The banded path turns sharply at every band end and every elevation step,
+    # so it uses the same turning walk - a frame-even list would cut exactly those corners. Every
+    # other path keeps the even frame list.
+    ticks = (_spiral_key_frames(samples, frames)
+             if str(coverage) in (SPIRAL_COVERAGE, BAND_COVERAGE) else _key_frames(frames))
     keys = [{
         "pos": [round(value, 6) for value in samples[tick]],
         "look": [round(float(value), 6) for value in pivot],
@@ -2456,6 +2725,13 @@ def automatic_keys(frames, pivot, radius, content_radius, target, max_speed=DEFA
             # that winding is the user's Spiral End parameter - the fit does not scale it, so the
             # scale really is 1.0 and the summary reports the drift instead of a cut.
             info["amplitude_scale"] = 1.0
+        elif str(coverage) == BAND_COVERAGE:    # the band stack: exactly the widgets asked for
+            requested = float(meta.get("band_width") or BAND_WIDTH_DEFAULT)
+            span = 0.0
+            # Same story as the spiral: the band geometry IS the user's widgets (start angle,
+            # count, width, start yaw, step), so nothing is fitted and the scale really is 1.0 -
+            # the summary reports the drift and the band list instead of a cut.
+            info["amplitude_scale"] = 1.0
         else:                                  # the front/back path: the request is the full back
             requested = amplitude + max(0.0, ORBIT_COVERAGE_DEGREES - 2.0 * amplitude)
             span = max(0.0, meta.get("back_span", 0.0))
@@ -2470,6 +2746,16 @@ def automatic_keys(frames, pivot, radius, content_radius, target, max_speed=DEFA
                      "spiral_slope": meta.get("spiral_slope"),
                      "spiral_end_clock": meta.get("spiral_end_clock"),
                      "spiral_end_elevation": meta.get("spiral_end_elevation"),
+                     "band_start_angle": meta.get("band_start_angle"),
+                     "band_count": meta.get("band_count"),
+                     "band_width": meta.get("band_width"),
+                     "band_start_yaw": meta.get("band_start_yaw"),
+                     "band_step": meta.get("band_step"),
+                     "band_elevations": meta.get("band_elevations"),
+                     "band_lowest": meta.get("band_lowest"),
+                     "band_highest": meta.get("band_highest"),
+                     "band_end_yaw": meta.get("band_end_yaw"),
+                     "band_end_elevation": meta.get("band_end_elevation"),
                      "orbit_coverage": min(FULL_CIRCLE, meta.get(
                          "orbit_coverage",
                          amplitude + max(amplitude, meta["orbit_end"])))})
@@ -2640,7 +2926,8 @@ def estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DEF
                          orbit_distance=None, orbit_size=None, subject_fill=None, orbit_end=None,
                          direction=ORBIT_DIRECTION_DEFAULT, view_angle=None, coverage=None,
                          orbit_amplitude=None, spiral_end=None, spiral_end_arc=None,
-                         spiral_slope=None):
+                         spiral_slope=None, bands_start_angle=None, bands_count=None,
+                         bands_width=None, bands_start_yaw=None, bands_step=None):
     """(signal JSON, summary) for one still, with the O Orbit Angle and the spiral widgets applied.
 
     `orbit_amplitude` (deg) is the front O's angular radius - the swing AND the rise, because the O
@@ -2657,20 +2944,37 @@ def estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DEF
     `spiral_slope` (deg) is the "Spiral Center Slope": the lean of that axis in the vertical plane
     through the view axis, 0 = the view axis itself (the first frame is the framed frontal view),
     +90 = straight up ("from straight above"), -90 = straight down; clamped to
-    `SPIRAL_SLOPE_MIN .. SPIRAL_SLOPE_MAX` and ignored by every other coverage. Everything else is
-    documented on `_estimate_camera_path`, which does the work.
+    `SPIRAL_SLOPE_MIN .. SPIRAL_SLOPE_MAX` and ignored by every other coverage. The `bands_*` group
+    belongs to the "Banded Orbits" coverage and is ignored by every other one: `bands_start_angle`
+    (deg) is the elevation of the FIRST band - the node's "Band Start Angle", 0 = level with the
+    pivot, -90 = from straight below the subject (looking up at the feet), +90 = from straight above
+    its head; `bands_count` is how many bands (1, 2, 3 ...); `bands_width` (deg, 1..360) is the
+    azimuth each band sweeps (360 = a full turn, which never alternates); `bands_start_yaw` (deg) is
+    the azimuth the FIRST band begins at, measured around the subject (negative = from its left,
+    positive = from its right) and `bands_step` (deg) is the elevation rise per band, 0 = auto
+    (spread the stack over the full available range in whichever direction has more room).
+    Everything else is documented on `_estimate_camera_path`, which does the work.
     """
     global _ACTIVE_FRONT_ORBIT_AMPLITUDE, _ACTIVE_SPIRAL_END, _ACTIVE_SPIRAL_END_ARC
     global _ACTIVE_SPIRAL_SLOPE, _ACTIVE_ROLL_UP
+    global _ACTIVE_BAND_START_ANGLE, _ACTIVE_BAND_COUNT, _ACTIVE_BAND_WIDTH
+    global _ACTIVE_BAND_START_YAW, _ACTIVE_BAND_STEP
     previous = _ACTIVE_FRONT_ORBIT_AMPLITUDE
     previous_end = _ACTIVE_SPIRAL_END
     previous_arc = _ACTIVE_SPIRAL_END_ARC
     previous_slope = _ACTIVE_SPIRAL_SLOPE
     previous_up = _ACTIVE_ROLL_UP
+    previous_bands = (_ACTIVE_BAND_START_ANGLE, _ACTIVE_BAND_COUNT, _ACTIVE_BAND_WIDTH,
+                      _ACTIVE_BAND_START_YAW, _ACTIVE_BAND_STEP)
     _ACTIVE_FRONT_ORBIT_AMPLITUDE = resolve_front_orbit_amplitude(orbit_amplitude)
     _ACTIVE_SPIRAL_END = resolve_spiral_end(spiral_end)
     _ACTIVE_SPIRAL_END_ARC = resolve_spiral_end_arc(spiral_end_arc)
     _ACTIVE_SPIRAL_SLOPE = resolve_spiral_slope(spiral_slope)
+    _ACTIVE_BAND_START_ANGLE = resolve_band_start_angle(bands_start_angle)
+    _ACTIVE_BAND_COUNT = resolve_band_count(bands_count)
+    _ACTIVE_BAND_WIDTH = resolve_band_width(bands_width)
+    _ACTIVE_BAND_START_YAW = resolve_band_start_yaw(bands_start_yaw)
+    _ACTIVE_BAND_STEP = resolve_band_step(bands_step)
     # The clip is levelled to the spiral's own up when it flies a sloped coil, the world up
     # otherwise (see `_ACTIVE_ROLL_UP`); the slope is ignored by every other coverage, so the tilt
     # only ever reaches the frame where it belongs.
@@ -2689,6 +2993,8 @@ def estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DEF
         _ACTIVE_SPIRAL_END_ARC = previous_arc
         _ACTIVE_SPIRAL_SLOPE = previous_slope
         _ACTIVE_ROLL_UP = previous_up
+        (_ACTIVE_BAND_START_ANGLE, _ACTIVE_BAND_COUNT, _ACTIVE_BAND_WIDTH,
+         _ACTIVE_BAND_START_YAW, _ACTIVE_BAND_STEP) = previous_bands
 
 
 def _estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DEFAULT_MAX_SPEED,
@@ -2946,6 +3252,16 @@ def _estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DE
                       f"{info['spiral_end_elevation']:.0f} deg. The frames follow that parameter "
                       f"(the angle growing evenly along the path) and the keys the renderer splines "
                       f"follow the path's own turning, so the path reads smooth in every view")
+        elif info.get("coverage") == BAND_COVERAGE:
+            elevations = "/".join(f"{value:.0f}" for value in info["band_elevations"])
+            beyond = (f", then the band stack: {info['band_count']} circle segments of "
+                      f"{info['band_width']:.0f} deg each at {elevations} deg elevation "
+                      f"({info['band_step']:+.0f} deg per step). The camera sweeps the first band "
+                      f"from {info['band_start_yaw']:.0f} deg towards the left, steps STRAIGHT to "
+                      f"the next one at the azimuth it stopped on, sweeps that one back, and so on "
+                      f"- ending at {info['band_end_yaw']:.0f} deg / "
+                      f"{info['band_end_elevation']:.0f} deg elevation and covering "
+                      f"{info['orbit_coverage']:.0f} deg around the subject")
         elif info.get("coverage"):
             beyond = (f", the back visit giving way to the speed cap: the path ends at "
                       f"{info['orbit_end']:.0f} deg of the requested "
@@ -2964,9 +3280,16 @@ def _estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DE
     # `front_yaw` (the scene survey reports rows instead), hence the guard.
     opening = ""
     if info.get("orbit_coverage"):
-        opening = (f"the O-orbit family / spherical spiral (0 -> {info['spiral_end_arc']:.0f} deg "
-                   f"out of the spiral's axis)" if info.get("coverage") == SPIRAL_COVERAGE
-                   else f"the front O (+/-{info['front_yaw']:.0f} deg)")
+        if info.get("coverage") == SPIRAL_COVERAGE:
+            opening = (f"the O-orbit family / spherical spiral (0 -> {info['spiral_end_arc']:.0f} "
+                       f"deg out of the spiral's axis)")
+        elif info.get("coverage") == BAND_COVERAGE:
+            opening = (f"a stack of {info['band_count']} banded orbits of "
+                       f"{info['band_width']:.0f} deg each, starting at "
+                       f"{info['band_start_angle']:.0f} deg elevation and stepping "
+                       f"{info['band_step']:+.0f} deg per band")
+        else:
+            opening = f"the front O (+/-{info['front_yaw']:.0f} deg)"
     description = (
         f"Estimated from the still's surface ({surface['source']}): pivot "
         f"[{pivot[0]:.3g}, {pivot[1]:.3g}, {pivot[2]:.3g}] is the cylindrical centre of the "
@@ -3177,6 +3500,17 @@ def _estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DE
         "spiral_slope_deg": info.get("spiral_slope"),
         "spiral_end_clock_deg": info.get("spiral_end_clock"),
         "spiral_end_elevation_deg": info.get("spiral_end_elevation"),
+        # Banded Orbits coverage only: the stack the path is made of (the first band's elevation,
+        # how many bands, the azimuth each sweeps, where the first one begins and the elevation
+        # step between neighbours) plus the pose the last frame looks from.
+        "band_start_angle_deg": info.get("band_start_angle"),
+        "band_count": info.get("band_count"),
+        "band_width_deg": info.get("band_width"),
+        "band_start_yaw_deg": info.get("band_start_yaw"),
+        "band_step_deg": info.get("band_step"),
+        "band_elevations_deg": info.get("band_elevations"),
+        "band_end_yaw_deg": info.get("band_end_yaw"),
+        "band_end_elevation_deg": info.get("band_end_elevation"),
     }
     if info.get("fit") == "subject pixels":
         summary.update({"drift_px": info["drift_px"], "drift_typical_px": info["drift_typical_px"],

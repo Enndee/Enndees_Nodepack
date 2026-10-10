@@ -29,13 +29,14 @@ Lichtfeld Studio dataset in a single step.
 | Node | ID | Purpose |
 |------|----|---------|
 | **GLOMAP Lichtfeld Tracker (Enndee)** | `Enndee_GLOMAPLichtfeldTracker` | Global SfM camera tracking + Lichtfeld dataset export |
-| **COLMAP for Lichtfeld (Enndee)** | `Enndee_ColmapLichtfeldTracker` | The same tracker through COLMAP's **native Python API** (pycolmap) - GLOMAP is part of COLMAP >= 3.12, so no GLOMAP binary is needed; installs/repairs `pycolmap` + `onnxruntime-gpu` on demand and, on Windows (no CUDA pycolmap wheel), downloads the CUDA COLMAP build so the SIFT stages still run on the GPU |
+| **COLMAP for Lichtfeld (Enndee)** | `Enndee_ColmapLichtfeldTracker` | The same tracker through COLMAP's **native Python API** (pycolmap) - GLOMAP is part of COLMAP >= 3.12, so no GLOMAP binary is needed; installs/repairs `pycolmap` + `onnxruntime-gpu` on demand and, on Windows (no CUDA pycolmap wheel), downloads the CUDA COLMAP build so the SIFT stages still run on the GPU. Also exports **COLMAP's own dense-MVS depth maps** (`export_depth_maps`) in the VGGT node's layout |
+| **VGGT for Lichtfeld (Enndee)** | `Enndee_VGGTLichtfeldTracker` | Feed-forward multi-view reconstruction in one pass (VGGT-Omega / **DA3-AnyView** / VGG-T3) with the same Lichtfeld dataset export - poses and depth in one gauge, so the depth loss cannot inject drift |
 | **Video Frame Extractor + Audio (Enndee)** | `Enndee_VideoFrameExtractorWithAudio` | Frame/audio extraction with an in-node timeline widget |
 | **MiniMax H3 Direct Promptor (Enndee)** | `H3_Multimodal_Promptor_Enndee` | Official-format MiniMax H3 prompts from reference images (vision LLM) |
 | **Resolution Selector (Enndee)** | `Enndee_ResolutionSelector` | Aspect-ratio + megapixel sizing plus the nine core resize types and a resized image output |
 | **Load & Resize Image (Enndee)** | `Enndee_ImageLoaderResize` | Load an image with the classic load-and-resize widgets, core resize types, mask channel, and original-size output |
 | **Meridian Parameters and Camera (Enndee)** | `Enndee_MeridianParametersAndCamera` | Meridian geometry arguments plus the camera path: hand-authored O orbits / alternating-height pendulum / spiral sweeps, or an automatic mode that estimates the subject's (or scene's) geometric pivot from the still's depth profile and flies a speed-capped, collision-guarded path around it (subject: almost a full circle; scene: lateral survey rows for side coverage) |
-| **Meridian Geometry (Enndee)** | `Enndee_MeridianGeometry` | Run VGGT geometry preview; optionally repeat the first frame to a connected custom path's required length |
+| **Meridian Geometry (Enndee)** | `Enndee_MeridianGeometry` | Run the geometry condition pass for one still: the Depth-Anything-3 Mono-Large point-cloud flight, or an **external depth map** you connect (the only way several shots get one consistent geometry) |
 | **Meridian Camera Path LLM (Enndee)** | `Enndee_MeridianCameraPathLLM` | Author a custom camera path with a local vision LLM (LM Studio / Ollama): describe the move in plain language, the LLM sees the still + depth map and outputs an orbit trajectory, and the node renders it into a `MERIDIAN_CAMERA_PATH` signal using the real pivot/framing geometry |
 | **Lichtfeld Headless Trainer (Enndee)** | `Enndee_LichtfeldHeadlessTrainer` | Start configurable Lichtfeld Studio Gaussian-splat training from a tracker dataset and export the result as .ply, .sog or .spz |
 | **Standby On Signal (Enndee)** | `Enndee_StandbyOnSignal` | Puts the PC into S3 standby when the workflow reaches the node and the ComfyUI queue is empty (last queued prompt) |
@@ -386,6 +387,52 @@ geometry - the back-facing views are depth reprojections - so inspect the render
 for holes or stretching before feeding it to H3. Restart ComfyUI after updating
 the node pack to register the new node.
 
+### Meridian Geometry: where the depth comes from
+
+`Model Size` offers exactly two choices:
+
+- **Depth Anything 3 Mono Large** - the node runs the depth model itself (one
+  forward pass per queue; `python -m pip install --no-deps depth-anything-3` in
+  the ComfyUI `python_embeded`, weights land in the Hugging Face cache,
+  Apache-2.0). The best depth for a single still.
+- **external** - no model is loaded at all. Connect your own map to the
+  `external_depth` socket and the node uses that instead.
+
+The former V2 trio and the V3 Small/Base/Large options were removed: none of them
+beat Mono-Large on a still, and a shorter list is a shorter decision. A workflow
+saved before the picker shrank still routes (the old names are accepted), but
+pick one of the two in the UI.
+
+**Why you would want `external`.** A depth *estimate* is only self-consistent
+frame by frame. Shoot a scene in several takes, or render the same set from
+different angles, and every estimate gives you a slightly different geometry -
+the pivot moves, the scale drifts, and cuts between shots jump. One map shared by
+every shot removes that class of error: the reprojection is a deterministic
+function of the map, so two shots built from the same map agree exactly.
+
+**What the map has to be.** Only two things matter:
+
+1. **Ordering and sign** - the renderer needs "larger value = farther" and
+   re-gauges the map through the same 1 %/99 % percentile clip it uses for a
+   model prediction, so the absolute scale, the units and the bit depth are all
+   irrelevant. `External Depth Polarity` picks `white is far (depth)`
+   (Depth-Anything and most 16-bit depth exports) or `white is near (disparity)`
+   (MiDaS/DPT and many "depth preview" PNGs). Getting it wrong mirrors the scene:
+   the background becomes the foreground and the flight flies backwards.
+2. **Framing** - the map must cover the same view as the `image` input. The node
+   warns when the aspect ratios disagree, because the resize then stretches the
+   map and the geometry is subtly skewed.
+
+A colour map is averaged to luminance, a batch uses its first frame, and a map
+that is constant or carries NaN/inf is rejected with a clear message instead of
+producing a silently broken flight. Everything else - `depth_res`, the canvas,
+`cloud_scale`, `point_size`, the edge cull and `back_face_cull` - applies to an
+external map exactly as it does to a predicted one.
+
+Good sources for a consistent map: a stereo/COLMAP metric depth pass, the
+multi-view depth of a tracker run, a hand-painted ramp, or a single
+Depth-Anything render of a *canonical* framing that every shot is aligned to.
+
 ## Node: Meridian Camera Path LLM (Enndee)
 
 Author a **custom camera path** with a **local vision LLM** (LM Studio or Ollama). You describe the
@@ -518,7 +565,70 @@ finishes. The node outputs `output_path`, `command`, `log_file`, and `summary`;
 a `.sog`/`.spz` export adds its converted path to the summary as a `Splat:` line
 and streams the converter's own progress to the console.
 
-### Older and free Studio builds
+### Tuned defaults: the two subject scenarios
+
+The node's defaults are **not** Studio's defaults - they are the winner of a controlled A/B on a
+175-frame subject dataset (VGGT-Omega tracker output: 175 images + masks + depth maps + a 400k-point
+COLMAP model), trained at `max_width=1920` with a held-out split of 131 train / 44 validation frames,
+ranked on Studio's own held-out PSNR/SSIM at the final iteration. Two runs of the same configuration
+differed by 0.007 dB, so **gaps under 0.05 dB PSNR / 0.02 SSIM are ties.**
+
+**`Subject Mode` picks the scenario.** It sets only *Mask Mode* and *Mask Opacity Penalty*; every other
+widget (the geometry cluster, the depth loss, the cap) is shared and stays as you set it. Use `custom`
+to set those two knobs yourself.
+
+| | `subject priority (background kept)` | `subject cut-out (background removed)` |
+|---|---|---|
+| `mask_mode` | `segment` | `segment` |
+| `mask opacity penalty` | `low` (1.0 - Studio's own value) | `high` (15.0) |
+| what you get | the subject gets all the photometric gradient; the surroundings stay visible but soft | the background is pushed to nothing, for a clean cut-out splat to composite |
+| held-out PSNR / SSIM @6000 | **12.91 / 0.386** (measured) | not run separately - and strictly *safer* to run than the measured one |
+
+**Both scenarios keep `mask_mode='segment'` AND keep the opacity penalty at 1.0 or higher, and that
+is a measured constraint rather than a simplification.** Tiles per splat at a 1,000,000 cap:
+
+| configuration | tiles/splat | outcome |
+|---|---|---|
+| `segment` + penalty **1.0** | - | **survives** - 12.91 dB / 0.386 SSIM |
+| `segment` + penalty **0.0** | **2,424** | **crashed** at iteration 2300 |
+| `none` + penalty 1.0 | 2,261 | **crashed** at iteration ~4300 |
+| `none` + penalty 1.0 + the geometry cluster | 2,205 | **crashed** at iteration ~3500 |
+| `alpha_consistent` | - | ran cleanly but rendered an **empty picture** (PSNR 2.52) |
+
+The background is a large low-detail region. If it is not actively pushed down it inflates until the
+rasterizer's 32-bit `(primitive x tile)` counter overflows (`FastGS instance count exceeds 32-bit
+range`), and *lowering* Max Gaussians makes it worse, because the surviving splats each have to cover
+more screen. So the opacity penalty is a **stability control**, not just a soft priority dial, and
+there is no reliable "background fully in the loss" recipe on this Studio build at 1920 px. The two
+scenarios therefore differ in *how hard the background is faded*, not in whether it is supervised -
+`high` is safe to turn up, `off` will kill the run.
+
+#### What changed from Studio's defaults, and why
+
+| widget | new default | reason |
+|---|---|---|
+| Max Gaussians | `1000000` (was 6,000,000) | the 32-bit overflow above; 1,000,000 is Studio's own default and survived every measured arm |
+| Use Depth Loss | **on** (was off) | 12.91 vs 12.66 dB at 6000 iters |
+| Depth Loss Weight | `8.0` (was 2.0) | wins at 6000 iters - but it is a *longer-run* setting: at iteration 3000 weight 2 leads by +0.92 dB |
+| Scale Reg | `0.03` (was 0.01) | part of the winning anti-inflation cluster |
+| Prune Scale2D | `0.1` (was 0.15) | a lower threshold prunes oversized splats earlier |
+| Pause Refine After Reset | `200` (was 0) | stops new Gaussians being added while the old ones re-learn opacity |
+| Lambda DSSIM | `0.3` (was 0.2) | more weight on structure; the cluster raised PSNR *and* SSIM together |
+
+Two settings are deliberately left at Studio's values: **Scale Decay** (0.002) and **Iterations**
+(30000). The measured optimum at 1920 px was 10000-12000 iterations - 10000 -> 20000 gained only
++0.074 dB PSNR while SSIM fell 0.0075 - so shorten the run for comparisons, but scale the
+densification schedule with it (see *Grow Until Iter* / *Stop Refine*).
+
+#### Two measurement traps worth knowing
+
+- **The evaluation point decides the winner.** The ranking at iteration 3000 was almost the exact
+  reverse of the ranking at 6000, and the early leader finished third. Evaluate at the final iteration
+  (the node's *Eval Steps* default does) and never judge a setting from the midpoint.
+- **Never rank on the logged loss.** It is `rgb + weight x depth`, so it is not comparable between
+  runs with different depth weights, and a masked run reports a lower loss simply because its depth
+  term has fewer valid pixels. Use held-out PSNR/SSIM.
+
 
 The node asks the executable itself what it supports - `--version`, `--help`, and
 `convert --help` when the build advertises that subcommand - and adapts the run instead of
@@ -547,6 +657,59 @@ capability probing is the only reliable trigger. Read-only and cached per execut
   enums `mask_mode` / `bg_mode` as **strings**, and keeps integers and floats distinct -
   hence the bundled template. If the template is missing (or a future Studio rejects it)
   the node silently falls back to the `--python-script` hook below.
+
+### Surface anchors (the strongest consistency lever)
+
+`use_surface_anchors` (off by default) turns a surface mesh into Gaussians and trains
+with them **pinned as scaffolding**. It runs Studio's `mesh2splat` subcommand to
+rasterise the mesh into a splat, then passes `--add-splat <file>` (loaded before the
+optimiser is built) and `--freeze` (no gradients, no densification, no pruning). The rest
+of the splat then *has* to agree with the surface - which is exactly what you want on
+drifting AI video, and exactly why it is off by default: a wrong surface stays wrong
+forever.
+
+| Widget | Default | What it does |
+| --- | --- | --- |
+| `use_surface_anchors` | off | Master switch. |
+| `surface_anchor_mesh` | `""` | Explicit mesh path. Empty auto-detects `<dataset>/mesh/dense_mesh.ply` - what the COLMAP node's `mesh_dense_surface` writes - then any `.obj`/`.glb` beside the dataset. |
+| `anchor_resolution` | 256 | `mesh2splat`'s rasterisation target, i.e. the anchor Gaussian budget. |
+| `anchor_freeze` | on | `--freeze` (hard constraint) vs. a plain warm start. |
+
+**Budget this before you raise it.** Measured anchor counts:
+
+| mesh | `--resolution 128` | 256 | 512 |
+| --- | --- | --- | --- |
+| Poisson, 167k vertices | 30,398 | 121,434 | 486,479 |
+| Delaunay, 12.6k vertices | 24,272 | 97,046 | 388,642 |
+
+Studio's own `mesh2splat` default is 1024, which lands near **1,000,000** - the entire
+`max_gaussians` cap - and frozen anchors can never be pruned, so the training would have
+nothing left to grow into. 256 (about a tenth of the cap) is the recommended start; keep
+anchors under ~10 % of `max_gaussians`.
+
+The anchors are written to `<temp>/enndee_lichtfeld_anchors/`, deliberately **not** the
+training output folder: they are an intermediate, and a file there would make the output
+folder non-empty and trip the node's own overwrite guard. The full path is printed.
+
+Everything degrades to a warning instead of failing the queue: no mesh found, no
+`mesh2splat` in the build, or a rasterisation failure all continue the run **without**
+anchors and say so in the node summary.
+
+### Distorted cameras need `--undistort`
+
+Lichtfeld Studio **refuses** a dataset whose cameras carry lens distortion:
+
+    [error] Training error: Distorted images detected. Use --gut or --undistort ...
+
+The COLMAP node produces exactly that when `camera_model` is `SIMPLE_RADIAL`, `RADIAL` or
+`OPENCV` - so without this flag the two nodes could not be used together at all. It is a
+contract between the two nodes, not a Studio quirk.
+
+`undistort_cameras` (default `auto`) reads the dataset's `sparse/0/cameras.txt` and adds
+`--undistort` only when a model actually has distortion. `PINHOLE` / `SIMPLE_PINHOLE` -
+the COLMAP node's default, and what the VGGT node always writes - need nothing. `on`
+forces the flag, `off` never sends it. Studio undistorts on the fly and adjusts the
+intrinsics itself (measured: 3456x2304 -> 3422x2281 with fx/fy unchanged).
 
 ### Tracker features vs. trained splats
 
@@ -689,6 +852,44 @@ enter the SfM dataset.
 * Fast camera motion / shaky footage: increase `sequential_overlap` (20-30) and
   `max_features`, lower `frame_step` to 1.
 * Very large images (> 4K): `downscale_factor=0.5` - the export stays full res.
+
+### RMBG 2.0 (the default background remover)
+
+`rmbg_mode` selects the background removal model, and **`2.0` is the default**
+since the nodes gained it. RMBG-2.0 (`briaai/RMBG-2.0`, a BiRefNet at 1024 px) has
+a noticeably cleaner matte around hair, motion blur and semi-transparent edges
+than RMBG-1.4's InSPyReNet - and that matte is used twice: as the Lichtfeld
+**splat mask** *and* as the **feature mask**.
+
+| `rmbg_mode` | model | how it runs |
+| --- | --- | --- |
+| `2.0` (default) | RMBG-2.0, BiRefNet 1024 px | `transformers`, `trust_remote_code` |
+| `base` | RMBG-1.4, best quality | `transparent_background` |
+| `fast` | RMBG-1.4, quicker / lower quality | `transparent_background` |
+| `base-nightly` | newest RMBG-1.4 base build | `transparent_background` |
+
+The three 1.4 ids stay selectable on purpose: they need no `transformers`
+download, they are ~4x faster, and workflows that already selected `base` keep
+validating.
+
+**`briaai/RMBG-2.0` is a gated model.** Before the first run you have to
+
+1. accept the licence at <https://huggingface.co/briaai/RMBG-2.0> - it is free for
+   **non-commercial** use only (licence `bria-rmbg-2.0`),
+2. make a token available: set `HF_TOKEN` (or run `huggingface-cli login`) and
+   restart ComfyUI.
+
+The checkpoint (~900 MB, fp32) is downloaded into the Hugging Face cache on first
+use. If the load fails - gated, offline, out of VRAM - the node logs the reason and
+**falls back to RMBG-1.4 `base` for that run** instead of failing, so a missing
+token never costs you a reconstruction. `ENNDEE_RMBG2_REPO` points the loader at
+another repo id or at a local copy of the checkpoint (the offline path).
+
+`rmbg_threshold` keeps its meaning for both generations: it is the binarisation
+point of the probability map (`0.5` = hard matte, `0.3`-`0.4` keeps more
+foreground, `0.6`-`0.7` keeps less). `rmbg_resize` only affects the RMBG-1.4
+modes - RMBG-2.0 always runs at its native 1024 px.
+
 
 ---
 
@@ -870,7 +1071,160 @@ While it runs the label looks like this:
     attention: flash_attn=yes, sageattention=yes
     status   : feature extraction 42/113 images
 
+### Dense MVS depth maps (shared geometry)
+
+`export_depth_maps` (off by default) adds COLMAP's dense multi-view stereo stage
+after the sparse reconstruction and writes a `depth/` folder next to `images/` -
+`<image stem>.depth.png`, 16-bit, `larger = farther`, `0 = no depth`. That is the
+**exact layout the VGGT node writes**, so the Lichtfeld trainer's
+`use_depth_loss` works with either node and the maps can be fed straight into the
+Meridian Geometry node's `external_depth` socket (one geometry shared by several
+shots of the same place).
+
+    <export>/
+    ├── images/         0001.png ...
+    ├── masks/          splat masks
+    ├── depth/          0001.depth.png ...      (16-bit)   <- new
+    └── sparse/0/       cameras.txt, images.txt, points3D.txt
+
+Why this is worth a CUDA pass: PatchMatch stereo fits the depth *photometrically
+to the very poses the sparse model produced*, so depth and poses are in one gauge
+by construction. A depth prior that disagrees with the poses fights the
+reconstruction; this one can only reinforce it. That is the same property the
+VGGT node gets from predicting poses and depth in one forward pass - just arrived
+at from the other direction.
+
+Two details that make the maps line up with `images/`:
+
+* COLMAP's PatchMatch only runs on the **undistorted** workspace (it aborts on a
+  `SIMPLE_RADIAL` model - verified), so its maps live on a different pixel grid in
+  a different projection. The node inverts that warp exactly: every pixel becomes
+  a ray through the *original* camera, the ray is projected with the *undistorted*
+  camera, and the depth is sampled there. A plain resize would be off by more than
+  a dozen pixels at the corners of a 3456x2304 orbit.
+* `dense_geom_consistency` (on) exports the filtered `.geometric` maps - about
+  79 % valid pixels, no outliers - instead of the raw `.photometric` ones, which
+  fill every pixel but contain wild values (measured max 7828 vs 143).
+
+`dense_max_image_size` (default 1024) is the runtime lever; cost grows with its
+square. Measured on a 5090 with 3456x2304 frames: ~9 s per frame at 640 px, so
+~22 s at 1024 px and ~35 s at 1600 px. The maps are upsampled to the image
+resolution afterwards, and Lichtfeld's depth loss only needs the relative ordering
+inside one image, so 1024 is usually plenty.
+
+Frames the sparse model never registered - or that PatchMatch found too little
+texture for - keep an all-zero map, which Lichtfeld reads as "no depth": the same
+convention the VGGT node uses.
+
+### Dense MVS products: fused cloud and surface (options A and B)
+
+The same dense pass can produce two more things, each behind its own switch. Both are
+about **consistency**: they hand the trainer geometry that already agrees with the poses
+instead of letting 3DGS discover (and fight over) the geometry itself.
+
+**A - `fuse_dense_cloud` (off by default).** Runs `colmap stereo_fusion` over the depth
+maps, which gives one multi-view consistent cloud in the sparse model's own world frame,
+and writes it as the dataset's `sparse/0/points3D.txt` initialisation in place of the
+sparse SIFT points. Only `points3D.txt` is touched - the poses in `images.txt` are left
+exactly as exported, and the cloud lives in that same model's frame, so the two cannot
+disagree. 3DGS is initialisation-sensitive, and the difference is large: measured on a
+10-frame clip, **666 SIFT points became 5,990 fused points**. `dense_cloud_max_points`
+(default 400,000) caps it, because the real budget is the rasterizer's 32-bit
+`(primitive x tile)` counter, not the point count.
+
+Unlike a mesh, a point cloud **constrains nothing** - it only seeds the Gaussians - so it
+cannot freeze an error in. That makes A the safe one to try first.
+
+**B - `mesh_dense_surface` (off by default).** Also reconstructs a *surface* and writes it
+to `mesh/dense_mesh.ply` in the dataset:
+
+    <export>/
+    ├── images/         0001.png ...
+    ├── depth/          0001.depth.png ...      (16-bit)
+    ├── mesh/           dense_mesh.ply          <- surface, for the trainer's anchors
+    │                   fused_points.ply        <- the fused cloud, kept for inspection
+    └── sparse/0/       cameras.txt, images.txt, points3D.txt
+
+`mesh_method` picks the algorithm: **`poisson`** runs in-process from the fused cloud
+(smooth, watertight, rounds off thin structures) and **`delaunay`** shells out to the
+bundled COLMAP `delaunay_mesher` (keeps depth discontinuities and fine detail, noisier).
+The trainer's `use_surface_anchors` then picks that file up automatically.
+
+Both switches need `export_depth_maps`-style dense maps, so turn that on too - the three
+options share one PatchMatch pass, it never runs twice.
+
 ---
+
+---
+
+## Node: VGGT for Lichtfeld (Enndee)
+
+A drop-in alternative to the COLMAP/GLOMAP tracker: instead of SIFT features plus
+a global mapper it runs a **feed-forward multi-view model** over the whole frame
+set in **one forward pass** and exports the same Lichtfeld dataset
+(`images/`, `masks/`, `depth/`, `sparse/0/`).
+
+Why one model instead of COLMAP plus a monocular depth estimator: Lichtfeld's
+`use_depth_loss` only helps when the depth prior agrees with the camera poses the
+trainer optimises. A per-frame monocular depth model produces an independent scale
+and shift for every frame, so the prior *fights* the geometry. A feed-forward
+multi-view model predicts all views jointly, so poses and depth come out of one
+bundle in one gauge - the prior can only reinforce the reconstruction.
+
+### The three models
+
+| `model` | what it is | weights |
+| --- | --- | --- |
+| **VGGT-Omega** (default) | Meta / Oxford, CVPR 2026. The reference pointmap model. | needs a **local checkpoint** (`vggt_omega_1b_512.pt`) |
+| **DA3-AnyView** | ByteDance **Depth Anything 3**, any-view series, ICLR 2026. A single plain DINO transformer predicting a *depth-ray* field; returns depth + confidence + extrinsics + intrinsics in one pass. Its report puts it **+35.7 % ahead of VGGT on camera pose and +23.6 % on geometry**. | Hugging Face hub |
+| **VGG-T3** | NVIDIA VGG-T^3, CVPR 2026. Replaces the quadratic softmax global attention with a linear test-time-training one, so cost grows **linearly** with the frame count (~1000 images in under a minute) at a small accuracy cost. | Hugging Face hub |
+
+`DA3-AnyView` and `VGG-T3` are **hub backends**: each has a default repo id and
+downloads on first use, so an empty `model_path` is fine. Only VGGT-Omega needs a
+local file.
+
+### `model_path` doubles as the variant picker
+
+Leave it empty for the default, otherwise:
+
+* **VGGT-Omega** - the `.pt` checkpoint file, or a checkout folder.
+* **DA3-AnyView** - a repo id: `depth-anything/DA3-SMALL` (fastest, Apache-2.0),
+  `depth-anything/DA3-BASE`, or the default `depth-anything/DA3-LARGE-1.1`
+  (Apache-2.0). Note that plain `DA3-LARGE` is **CC-BY-NC 4.0** - the `-1.1`
+  revision is the Apache one. A local model folder works too.
+* **VGG-T3** - `nvidia/vgg-ttt` (the default) or a local model folder.
+
+`ENNDEE_DA3_REPO` / `ENNDEE_VGG_T3_REPO` override the repo id, and
+`ENNDEE_VGGT_OMEGA_PATH` / `ENNDEE_DA3_PATH` / `ENNDEE_VGGT_T3_PATH` the checkpoint.
+
+### Installing the backends
+
+**VGGT-Omega** is used as the importable `vggt_omega` package plus a checkpoint
+under `Tools/vggt-omega/`.
+
+**DA3-AnyView** needs the `depth-anything-3` wheel, installed **`--no-deps`** (its
+pins would fight ComfyUI's numpy/torch); `enndee_da3.py` applies the two import
+stubs that go with it, so the Meridian fast-depth node and this backend share one
+loader.
+
+**VGG-T3** needs the `vggttt` package. Install it from the official repo and
+**do not** install its requirements - they pin `torch==2.7.1`, which would
+downgrade your CUDA 13 build:
+
+    python -m pip install --no-deps git+https://github.com/nv-dvl/vgg-ttt
+
+The 1B weights (~4 GB) download from `nvidia/vgg-ttt` on the first run. VGG-T^3 is
+released under the NVIDIA OneWay **non-commercial** licence, VGGT-Omega under the
+VGGT research licence.
+
+### Failures are shown on the node
+
+The node answers with ComfyUI's `{"ui": {"text": [...]}}` form, so a backend that
+cannot start - missing package, missing checkpoint, no CUDA, or a failure inside
+the pipeline - puts the reason **and** a one-line availability report for all
+three models into the node's text preview. It still returns an empty dataset so a
+batch workflow survives, but it no longer looks like "the node did nothing".
+
 
 ## Node: Resolution Selector (Enndee)
 

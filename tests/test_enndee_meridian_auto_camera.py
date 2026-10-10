@@ -20,6 +20,21 @@ sys.path.insert(0, str(PACK_DIR / "nodes"))
 
 import enndee_meridian_fast_depth as fast_depth  # noqa: E402
 from enndee_meridian_auto_camera import (  # noqa: E402
+    BAND_COUNT_DEFAULT,
+    BAND_COUNT_MAX,
+    BAND_COUNT_MIN,
+    BAND_COVERAGE,
+    BAND_ELEVATION_LIMIT,
+    BAND_START_ANGLE_DEFAULT,
+    BAND_START_ANGLE_MAX,
+    BAND_START_ANGLE_MIN,
+    BAND_START_YAW_MAX,
+    BAND_START_YAW_MIN,
+    BAND_STEP_DEFAULT,
+    BAND_STEP_MAX,
+    BAND_STEP_MIN,
+    BAND_WIDTH_MAX,
+    BAND_WIDTH_MIN,
     CANVAS_HEIGHT,
     COLLISION_MARGIN,
     DEFAULT_MAX_SPEED,
@@ -55,6 +70,7 @@ from enndee_meridian_auto_camera import (  # noqa: E402
     VISIBILITY_QUARTILES,
     automatic_keys,
     balanced_front_share,
+    band_elevations,
     direction_mirror,
     document_from_keys,
     depth_from_reference,
@@ -74,6 +90,11 @@ from enndee_meridian_auto_camera import (  # noqa: E402
     probe_surface,
     project_points,
     resolve_front_orbit_amplitude,
+    resolve_band_count,
+    resolve_band_start_angle,
+    resolve_band_start_yaw,
+    resolve_band_step,
+    resolve_band_width,
     scene_coverage,
     scene_samples,
     scene_survey_fill,
@@ -85,6 +106,10 @@ from enndee_meridian_auto_camera import (  # noqa: E402
     subject_share_curve,
     surface_points,
     visibility_clearances,
+    _band_info,
+    _band_legs,
+    _band_orbit,
+    _band_samples,
     _decimate,
     _envelope_angles,
     _fit_subject_amplitude,
@@ -94,7 +119,6 @@ from enndee_meridian_auto_camera import (  # noqa: E402
     _path_fits,
     _place,
     _shrink_amplitude,
-    _spiral_geometry,
     _spiral_key_frames,
     _spiral_point,
     _spiral_sweep,
@@ -1734,7 +1758,9 @@ class AutoCameraSpiralCoverageTests(unittest.TestCase):
 
     def test_spiral_is_a_coverage_option(self):
         self.assertIn(SPIRAL_COVERAGE, ORBIT_COVERAGES)
-        self.assertEqual(ORBIT_COVERAGES[-1], SPIRAL_COVERAGE)
+        # The coverages are appended in order and "Banded Orbits" was appended AFTER the Spiral,
+        # so pin the index - "last" stopped meaning the spiral the moment a fourth mode arrived.
+        self.assertEqual(ORBIT_COVERAGES[2], SPIRAL_COVERAGE)
 
     def _with_winding(self, winding):
         """Fly the spiral with one winding (the module state `estimate_camera_path` sets)."""
@@ -2169,6 +2195,205 @@ class AutoCameraSpiralCoverageTests(unittest.TestCase):
         self.assertAlmostEqual(summary.get("spiral_end_deg"), 810.0, places=6)
         self.assertAlmostEqual(summary.get("spiral_end_elevation_deg"), 0.0, places=6)
         self.assertEqual(auto_camera.spiral_end(), SPIRAL_END_DEFAULT)   # restored afterwards
+
+
+class AutoCameraBandCoverageTests(unittest.TestCase):
+    """The 'Banded Orbits' coverage: a stack of circle SEGMENTS on the orbit sphere.
+
+    The spec: start on the lowest band at the start yaw, fly it to the left for `width`, step
+    straight up to the next band at that same azimuth, fly that one back, then up to the next and
+    back again - all on one sphere around the pivot, without ever rolling. A 360 deg width cannot
+    alternate (it ends where it began), so it keeps turning the same way instead.
+    """
+
+    PIVOT = [0.3, -0.2, 4.0]
+    RADIUS = 3.0
+
+    def test_banded_orbits_is_a_coverage_option(self):
+        self.assertIn(BAND_COVERAGE, ORBIT_COVERAGES)
+        self.assertEqual(ORBIT_COVERAGES[3], BAND_COVERAGE)
+
+    @staticmethod
+    def _angles(position, pivot):
+        """(yaw, elevation) of a camera position about the pivot, in `_place` terms."""
+        yaw = math.degrees(math.atan2(position[0] - pivot[0], -(position[2] - pivot[2])))
+        horizontal = math.hypot(position[0] - pivot[0], position[2] - pivot[2])
+        elevation = math.degrees(math.atan2(-(position[1] - pivot[1]), horizontal))
+        return yaw, elevation
+
+    def _sample(self, frames=121, start_yaw=0.0, elevations=None, width=180.0):
+        elevations = [-45.0, 0.0, 45.0] if elevations is None else elevations
+        positions = _band_samples(frames, self.PIVOT, self.RADIUS, start_yaw, elevations, width)
+        return positions, [self._angles(position, self.PIVOT) for position in positions]
+
+    def test_band_elevations_spread_the_auto_stack_over_the_available_range(self):
+        """`step = 0` uses the whole range left, in whichever direction has more room."""
+        self.assertEqual(band_elevations(1, -88.0, 0.0), [-88.0])
+        self.assertEqual(band_elevations(3, -88.0, 0.0), [-88.0, 0.0, 88.0])
+        self.assertEqual(band_elevations(3, 88.0, 0.0), [88.0, 0.0, -88.0])
+        self.assertEqual(band_elevations(3, 0.0, 0.0), [0.0, 44.0, 88.0])
+        self.assertEqual(band_elevations(2, 0.0, 30.0), [0.0, 30.0])
+        self.assertEqual(band_elevations(4, -30.0, 20.0), [-30.0, -10.0, 10.0, 30.0])
+        # a stack pushed at a pole flattens there instead of flipping the up vector
+        self.assertEqual(band_elevations(3, 0.0, 60.0), [0.0, 60.0, BAND_ELEVATION_LIMIT])
+
+    def test_resolve_band_widgets_clamp_to_their_windows(self):
+        self.assertEqual(resolve_band_start_angle(None), BAND_START_ANGLE_DEFAULT)
+        self.assertEqual(resolve_band_start_angle(-999.0), BAND_START_ANGLE_MIN)
+        self.assertEqual(resolve_band_start_angle(999.0), BAND_START_ANGLE_MAX)
+        self.assertEqual(resolve_band_count(None), BAND_COUNT_DEFAULT)
+        self.assertEqual(resolve_band_count(0), BAND_COUNT_MIN)
+        self.assertEqual(resolve_band_count(99), BAND_COUNT_MAX)
+        self.assertEqual(resolve_band_width(-5.0), BAND_WIDTH_MIN)
+        self.assertEqual(resolve_band_width(999.0), BAND_WIDTH_MAX)
+        self.assertEqual(resolve_band_start_yaw(-999.0), BAND_START_YAW_MIN)
+        self.assertEqual(resolve_band_start_yaw(999.0), BAND_START_YAW_MAX)
+        self.assertEqual(resolve_band_step(None), BAND_STEP_DEFAULT)
+        self.assertEqual(resolve_band_step(-1.0), BAND_STEP_MIN)
+        self.assertEqual(resolve_band_step(999.0), BAND_STEP_MAX)
+
+    def test_band_orbit_alternates_but_a_full_circle_does_not(self):
+        """Band 0 -> left, band 1 -> back, band 2 -> left ... unless the width is a full turn."""
+        for index in range(4):
+            want = (0.0, -180.0) if index % 2 == 0 else (-180.0, 0.0)
+            self.assertEqual(_band_orbit(index, 4, 180.0, 0.0), want)
+        for index in range(3):
+            # a full turn ends where it began: alternating would be a no-op, so it keeps going
+            self.assertEqual(_band_orbit(index, 3, 360.0, 0.0), (0.0, -360.0))
+
+    def test_every_band_leg_ends_where_the_next_one_begins(self):
+        """That is what makes the step between bands a PURE elevation move (constant azimuth)."""
+        legs = _band_legs(0.0, [-45.0, 0.0, 45.0], 180.0)
+        self.assertEqual(len(legs), 5)                    # 3 bands + 2 steps
+        for index in range(0, len(legs) - 1, 2):
+            sweep, step = legs[index], legs[index + 1]
+            self.assertAlmostEqual(sweep[3], step[1], places=9)      # band end == step start
+            self.assertAlmostEqual(step[1], step[3], places=9)       # the step holds one azimuth
+            self.assertNotAlmostEqual(step[2], step[4], places=9)    # ... and changes elevation
+
+
+    def test_the_stack_starts_low_and_steps_straight_up(self):
+        """The spec's own choreography, measured on the positions `_place` builds."""
+        positions, angles = self._sample(frames=121)
+        for position in positions:
+            self.assertAlmostEqual(math.dist(position, self.PIVOT), self.RADIUS, places=9)
+        self.assertAlmostEqual(angles[0][1], -45.0, places=6)        # the FIRST (lowest) band
+        self.assertAlmostEqual(angles[0][0], 0.0, places=6)          # ... at the start yaw
+        self.assertAlmostEqual(angles[-1][1], 45.0, places=6)        # the last band
+        self.assertAlmostEqual(abs(angles[-1][0]), 180.0, places=6)  # ... on the far side
+        elevations = [elevation for _yaw, elevation in angles]
+        self.assertGreaterEqual(min(elevations), -45.0 - 1e-9)
+        self.assertLessEqual(max(elevations), 45.0 + 1e-9)
+        # Every frame interval INSIDE a step holds one azimuth (the "straight up" move). The single
+        # interval that straddles a corner - finishing the step and starting the next band - is a
+        # diagonal by construction, so it is left out here.
+        for low, high in ((-45.0, 0.0), (0.0, 45.0)):
+            inside = [index for index, value in enumerate(elevations)
+                      if low + 1e-9 < value < high - 1e-9]
+            self.assertGreater(len(inside), 3)
+            yaws = [angles[index][0] for index in inside]
+            self.assertLess(max(yaws) - min(yaws), 1e-9)
+            self.assertTrue(all(elevations[index] > elevations[index - 1] for index in inside[1:]))
+
+    def test_the_bands_alternate_left_then_back(self):
+        """Band 0 towards the left, band 1 back to the right, band 2 to the left again."""
+        _positions, angles = self._sample(frames=121)
+        runs = []
+        for band in (-45.0, 0.0, 45.0):
+            runs.append([yaw for yaw, elevation in angles if abs(elevation - band) < 1e-9])
+        self.assertGreater(len(runs[0]), 10)
+        self.assertLess(runs[0][-1] - runs[0][0], -170.0)     # 0 -> -180 (the spec's "to the left")
+        self.assertGreater(runs[1][-1] - runs[1][0], 170.0)   # -180 -> 0 (back)
+        self.assertLess(runs[2][-1] - runs[2][0], -170.0)     # 0 -> -180 again
+
+    def test_a_full_circle_never_alternates(self):
+        """360 deg ends where it began, so the camera carries on the same way - the spec's rule."""
+        _positions, angles = self._sample(frames=121, elevations=[0.0, 45.0], width=360.0)
+        for band in (0.0, 45.0):
+            yaws = [yaw for yaw, elevation in angles if abs(elevation - band) < 1e-9]
+            self.assertGreater(len(yaws), 10)
+            # The per-frame step, wrapped to +-180: every one of them must go the SAME way round
+            # (towards the left, i.e. decreasing yaw) and the run must add up to one full turn.
+            steps = [(yaws[index] - yaws[index - 1] + 180.0) % 360.0 - 180.0
+                     for index in range(1, len(yaws))]
+            self.assertTrue(all(step < 0.0 for step in steps),
+                            f"band {band} turned back: {min(steps):.3f} .. {max(steps):.3f}")
+            self.assertAlmostEqual(sum(steps), -360.0, delta=10.0)
+
+    def test_the_active_widgets_drive_the_default_stack(self):
+        """`band_elevations()` with no arguments reads the ACTIVE widgets, not the built-in ones."""
+        previous = (auto_camera._ACTIVE_BAND_START_ANGLE, auto_camera._ACTIVE_BAND_COUNT,
+                    auto_camera._ACTIVE_BAND_STEP)
+        self.addCleanup(setattr, auto_camera, "_ACTIVE_BAND_START_ANGLE", previous[0])
+        self.addCleanup(setattr, auto_camera, "_ACTIVE_BAND_COUNT", previous[1])
+        self.addCleanup(setattr, auto_camera, "_ACTIVE_BAND_STEP", previous[2])
+        auto_camera._ACTIVE_BAND_START_ANGLE, auto_camera._ACTIVE_BAND_COUNT = -88.0, 3
+        auto_camera._ACTIVE_BAND_STEP = 0.0
+        self.assertEqual(band_elevations(), [-88.0, 0.0, 88.0])
+        auto_camera._ACTIVE_BAND_STEP = 20.0
+        self.assertEqual(band_elevations(), [-88.0, -68.0, -48.0])
+        # ... and the default stack is what the path flies and what the report names
+        self.assertEqual(_band_samples(9, self.PIVOT, self.RADIUS)[0],
+                         _place(self.PIVOT, self.RADIUS, 0.0, -88.0))
+        self.assertEqual(_band_info()["band_elevations"], [-88.0, -68.0, -48.0])
+
+    def test_a_small_band_near_a_pole_takes_fewer_frames(self):
+        """The frames follow the legs' travel on the sphere, so the camera holds one speed."""
+        _positions, angles = self._sample(frames=241, elevations=[80.0, 85.0], width=360.0)
+        elevations = [elevation for _yaw, elevation in angles]
+        self.assertLess(elevations.count(85.0), elevations.count(80.0))
+
+
+    def test_subject_samples_routes_the_coverage_and_ignores_the_o_widgets(self):
+        direct = _band_samples(73, self.PIVOT, self.RADIUS)
+        self.assertEqual(subject_samples(73, self.PIVOT, self.RADIUS, coverage=BAND_COVERAGE),
+                         direct)
+        self.assertEqual(subject_samples(73, self.PIVOT, self.RADIUS, coverage=BAND_COVERAGE,
+                                         view_angle=137.0, direction="clockwise", scale=0.4),
+                         direct)
+
+    def test_band_info_reports_the_stack(self):
+        info = _band_info(start_yaw=20.0, width=120.0)
+        for key in ("band_start_angle", "band_count", "band_width", "band_start_yaw", "band_step",
+                    "band_elevations", "band_lowest", "band_highest", "band_end_yaw",
+                    "band_end_elevation", "orbit_coverage"):
+            self.assertIn(key, info)
+        self.assertEqual(info["band_count"], BAND_COUNT_DEFAULT)
+        self.assertEqual(info["band_width"], 120.0)
+        self.assertEqual(info["band_start_yaw"], 20.0)
+        self.assertEqual(info["band_elevations"], [0.0, 44.0, 88.0])
+        # the step widget is at AUTO here, so the flown gap (44 deg) is what the report names
+        self.assertAlmostEqual(info["band_step"], 44.0, places=9)
+        self.assertAlmostEqual(info["band_end_yaw"], 20.0 - 120.0, places=9)
+
+    def test_the_entry_point_sets_and_restores_the_band_widgets(self):
+        """`estimate_camera_path(bands_*=...)` drives the whole estimate, then puts them back."""
+        before = (auto_camera.band_start_angle(), auto_camera.band_count(), auto_camera.band_width(),
+                  auto_camera.band_start_yaw(), auto_camera.band_step())
+        _document, summary = _estimate(_depth_with_subject(), coverage=BAND_COVERAGE,
+                                       bands_start_angle=-90.0, bands_count=3, bands_width=360.0,
+                                       bands_start_yaw=45.0, bands_step=45.0)
+        self.assertEqual(summary.get("coverage"), BAND_COVERAGE)
+        self.assertAlmostEqual(summary.get("band_start_angle_deg"), -90.0, places=6)
+        self.assertEqual(summary.get("band_count"), 3)
+        self.assertAlmostEqual(summary.get("band_width_deg"), 360.0, places=6)
+        self.assertAlmostEqual(summary.get("band_start_yaw_deg"), 45.0, places=6)
+        self.assertAlmostEqual(summary.get("band_step_deg"), 45.0, places=6)
+        # the FIRST band is held BAND_ELEVATION_LIMIT off the pole, so -90 is flown as -88
+        self.assertEqual(summary.get("band_elevations_deg"), [-BAND_ELEVATION_LIMIT, -45.0, 0.0])
+        self.assertEqual(before, (auto_camera.band_start_angle(), auto_camera.band_count(),
+                                  auto_camera.band_width(), auto_camera.band_start_yaw(),
+                                  auto_camera.band_step()))
+
+    def test_the_other_coverages_report_no_band_fields(self):
+        """A band widget never leaks into the other modes."""
+        for coverage in ORBIT_COVERAGES[:3]:
+            with self.subTest(coverage=coverage):
+                _document, summary = _estimate(_depth_with_subject(), coverage=coverage,
+                                               bands_start_angle=-90.0, bands_count=5)
+                self.assertIsNone(summary.get("band_start_angle_deg"))
+                self.assertIsNone(summary.get("band_count"))
+                self.assertIsNone(summary.get("band_elevations_deg"))
 
 
 if __name__ == "__main__":

@@ -39,7 +39,7 @@ import os
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional, Sequence, Tuple
+from typing import Dict, Optional
 
 import numpy as np
 import torch
@@ -53,10 +53,15 @@ if str(_PACK_DIR) not in sys.path:
     sys.path.insert(0, str(_PACK_DIR))
 
 from enndee_bin import (  # noqa: E402  (path setup must run first)
-    KINDS,
     ensure_binaries,
     resolve_binary,
     source_of,
+)
+from enndee_rmbg import (  # noqa: E402  (path setup must run first)
+    RMBG_DEFAULT_MODE,
+    RMBG_MODES,
+    RMBG_MODE_TOOLTIP,
+    remove_background,
 )
 
 try:
@@ -85,13 +90,13 @@ except Exception:  # pragma: no cover - running outside ComfyUI
 IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
 MASK_GLOMAP_DIR = "masks_GLOMAP"
 MASK_LICHTFELD_DIR = "masks"
+#: sub folder Lichtfeld scans for depth maps; files are ``<image stem>.depth.png``
+#: (``depths/`` is accepted by Studio as well, but ``depth/`` is what we write).
+#: Shared with the VGGT node so both nodes produce a byte-identical layout.
+DEPTH_DIR = "depth"
 SPLAT_SUBDIR = "Splat_Frames"
 
-# Cached RMBG remover (transparent_background)
-_rmbg_remover = None
-# Set when the GPU could not initialise the RMBG model (then stay on the CPU
-# instead of retrying the failed CUDA load on every run).
-_rmbg_device_fallback = False
+# Cached RMBG models live in :mod:`enndee_rmbg` (shared by every tracker node).
 
 
 def log(message: str) -> None:
@@ -112,6 +117,34 @@ def auto_download_enabled() -> bool:
 def tooltip(text: str) -> Dict[str, str]:
     """Small helper for readable INPUT_TYPES."""
     return {"tooltip": text}
+
+
+#: One-time hint: the mapping is CPU-bound, so the widgets are the only lever.
+_SLOW_MAPPING_HINT_SHOWN = False
+
+
+def maybe_warn_slow_mapping(matcher: str, frame_step: int, max_features: int) -> None:
+    """Warn *once* when the widget combination makes the CPU-bound mapping slow.
+
+    The mapping (global positioning + bundle adjustment) runs on the CPU on every build:
+    a CUDA pycolmap only accelerates SIFT extraction and matching (81 images: 8.85 s ->
+    1.65 s and 47.42 s -> 0.89 s; the mapping was 87.6/70.2 s on the CPU wheel vs
+    115.7/67.0 s on the CUDA wheel - noise). Exhaustive matching, every frame and ~24k
+    features is the combination that costs the most, so it gets one hint per session.
+    """
+    global _SLOW_MAPPING_HINT_SHOWN
+    if _SLOW_MAPPING_HINT_SHOWN:
+        return
+    if str(matcher).lower() != "exhaustive":
+        return
+    if int(frame_step) != 1 or int(max_features) < 24000:
+        return
+    _SLOW_MAPPING_HINT_SHOWN = True
+    log_warn("exhaustive matching + frame_step=1 + "
+             f"{int(max_features)} features makes the CPU-bound mapping (and the "
+             "matching) slow - the fast path is matcher=sequential, frame_step=2 "
+             "and about 10000 features")
+
 
 def default_tool_path(kind: str) -> str:
     """
@@ -172,7 +205,9 @@ class GLOMAPLichtfeldTracker:
                     **tooltip(
                         "sequential = match neighbouring frames (fast, perfect "
                         "for video orbits). exhaustive = every image against "
-                        "every image (slow but robust for shuffled image sets)."
+                        "every image (slow but robust for shuffled image sets). "
+                        "This is the main lever for mapping time - the mapper "
+                        "is CPU-bound, and exhaustive multiplies its input."
                     ),
                 }),
                 "max_features": ("INT", {
@@ -180,7 +215,9 @@ class GLOMAPLichtfeldTracker:
                     **tooltip(
                         "SIFT features per image. More features = more stable "
                         "reconstruction but slower and more RAM. 24000 works "
-                        "well for high resolution 360 deg orbits."
+                        "well for high resolution 360 deg orbits. This is the "
+                        "main lever for mapping time - the mapper is CPU-bound "
+                        "(about 10000 features is the fast path)."
                     ),
                 }),
                 "images_path": ("STRING", {
@@ -231,18 +268,15 @@ class GLOMAPLichtfeldTracker:
                 "use_rmbg": ("BOOLEAN", {
                     "default": True,
                     **tooltip(
-                        "Run the built in RMBG background removal "
-                        "(transparent_background). The alpha channel is reused "
-                        "as the Lichtfeld splat mask. Disable when masks come "
-                        "from other nodes."
+                        "Run the built in RMBG background removal (RMBG-2.0 "
+                        "by default, see rmbg_mode). The alpha channel is "
+                        "reused as the Lichtfeld splat mask. Disable when "
+                        "masks come from other nodes."
                     ),
                 }),
-                "rmbg_mode": (["base", "fast", "base-nightly"], {
-                    "default": "base",
-                    **tooltip(
-                        "RMBG model. base = best quality, fast = quicker with "
-                        "lower quality, base-nightly = newest base build."
-                    ),
+                "rmbg_mode": (list(RMBG_MODES), {
+                    "default": RMBG_DEFAULT_MODE,
+                    **tooltip(RMBG_MODE_TOOLTIP),
                 }),
                 "rmbg_threshold": ("FLOAT", {
                     "default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05,
@@ -254,9 +288,10 @@ class GLOMAPLichtfeldTracker:
                 "rmbg_resize": (["static", "dynamic"], {
                     "default": "static",
                     **tooltip(
-                        "static = resize to the fixed model resolution "
-                        "(consistent). dynamic = up to 1280 px for better large "
-                        "image results (slower, base models only)."
+                        "RMBG-1.4 modes only (RMBG-2.0 always runs at its "
+                        "native 1024 px). static = resize to the fixed model "
+                        "resolution (consistent). dynamic = up to 1280 px for "
+                        "better large image results (slower, base models only)."
                     ),
                 }),
                 "use_gpu": ("BOOLEAN", {
@@ -286,7 +321,8 @@ class GLOMAPLichtfeldTracker:
                     **tooltip(
                         "Neighbouring frames compared by the sequential matcher. "
                         "15 is reliable for 360 deg orbits, raise it for fast "
-                        "camera motions, lower it for speed."
+                        "camera motions, lower it for speed. This is the main "
+                        "lever for mapping time - the mapper is CPU-bound."
                     ),
                 }),
                 "max_image_size": ("INT", {
@@ -302,7 +338,8 @@ class GLOMAPLichtfeldTracker:
                     **tooltip(
                         "Use only every n-th frame. 1 = all frames (best "
                         "quality), 2 = half the frames (recommended for 24 fps "
-                        "orbits, roughly half the runtime)."
+                        "orbits, roughly half the runtime). This is the main "
+                        "lever for mapping time - the mapper is CPU-bound."
                     ),
                 }),
                 "downscale_factor": ("FLOAT", {
@@ -402,14 +439,18 @@ class GLOMAPLichtfeldTracker:
     def track(self, colmap_path, glomap_path, camera_model, matcher, max_features,
               images_path="", masks_path="", lichtfeld_export_path="",
               images=None, masks_glomap=None, masks_lichtfeld=None,
-              use_rmbg=True, rmbg_mode="base", rmbg_threshold=0.5,
+              use_rmbg=True, rmbg_mode=RMBG_DEFAULT_MODE, rmbg_threshold=0.5,
               rmbg_resize="static",
               use_gpu=True, keep_workspace=False, auto_align=True,
               sequential_overlap=15, max_image_size=5120, frame_step=2,
               downscale_factor=1.0, offset_glomap=4, offset_splat=12,
                mapper_backend="glomap", auto_install_binaries=True,
                binary_flavor="auto", embed_alpha_in_images=False,
-               image_format="PNG", jpeg_quality=90):
+               image_format="PNG", jpeg_quality=90,
+               export_depth_maps=False, dense_max_image_size=1024,
+               dense_geom_consistency=True, fuse_dense_cloud=False,
+               dense_cloud_max_points=400000, mesh_dense_surface=False,
+               mesh_method="poisson"):
         """Run the complete tracking + export pipeline for one frame batch."""
 
         # ---------- 1. Make sure COLMAP / GLOMAP are available ------------
@@ -423,6 +464,7 @@ class GLOMAPLichtfeldTracker:
                      "or set ENNDEE_COLMAP_PATH.")
             return self._empty(1)
         log(self.BACKEND_READY_MESSAGE)
+        maybe_warn_slow_mapping(matcher, frame_step, max_features)
 
         # ---------- 2. Load the input images -----------------------------
         export_images, sf_images, images_from_path = self._load_input_images(
@@ -559,6 +601,15 @@ class GLOMAPLichtfeldTracker:
             # ---------- 9. Sparse model for Lichtfeld --------------------
             if export_dir is not None:
                 self._export_sparse(sparse_path, export_dir, parser)
+
+            # ---------- 10. Dense MVS products (optional) ----------------
+            self._export_dense_geometry(
+                wrapper, sparse_path, export_dir, export_images, parser,
+                bool(export_depth_maps), int(dense_max_image_size),
+                bool(dense_geom_consistency), bool(fuse_dense_cloud),
+                int(dense_cloud_max_points), bool(mesh_dense_surface),
+                str(mesh_method),
+            )
 
             log(f"Done: {len(poses)}/{frames_out} poses registered, "
                 f"{len(points)} 3D points, confidence={confidence:.2f}")
@@ -1007,6 +1058,223 @@ class GLOMAPLichtfeldTracker:
             return
         self._save_masks(alpha_images[..., 3:4], masks_dir, "Lichtfeld (alpha)")
 
+    def _export_dense_geometry(self, wrapper, sparse_path, export_dir, export_images,
+                               parser, export_depth_maps, max_image_size,
+                               geom_consistency, fuse_dense_cloud,
+                               dense_cloud_max_points, mesh_dense_surface,
+                               mesh_method):
+        """The dense MVS products: depth maps, one fused cloud, one surface.
+
+        All three fall out of the SAME PatchMatch pass, so it runs at most once. Each is
+        an independent switch and each degrades to a warning - a dense product must never
+        take the poses down with it.
+
+        Why the cloud is the safe half of "consistent geometry": it lives in the sparse
+        model's own world frame (``stereo_fusion`` works in that frame) and only *seeds*
+        the Gaussians, so it can neither contradict the poses nor freeze an error in.
+        The mesh is the opposite - a hard constraint - which is why it is the one that
+        gets frozen only on request.
+        """
+        wanted = [name for name, enabled in (("export_depth_maps", export_depth_maps),
+                                             ("fuse_dense_cloud", fuse_dense_cloud),
+                                             ("mesh_dense_surface", mesh_dense_surface))
+                  if enabled]
+        if not wanted:
+            return
+        if export_dir is None:
+            log_warn(f"{', '.join(wanted)} is on but no Lichtfeld export folder was "
+                     "given - nothing written")
+            return
+
+        runner = getattr(wrapper, "dense_depth_maps", None)
+        if runner is None:
+            log_warn(f"{type(wrapper).__name__} has no dense MVS stage - the dense "
+                     "products need the COLMAP node's native pycolmap backend on a "
+                     "CUDA build")
+            return
+
+        try:
+            maps = runner(sparse_path, max_image_size=int(max_image_size),
+                          geom_consistency=bool(geom_consistency), log=log)
+        except Exception as exc:  # noqa: BLE001 - dense products are optional
+            log_warn(f"Dense MVS failed: {type(exc).__name__}: {exc}")
+            return
+        if not maps:
+            log_warn("Dense MVS produced no depth maps - nothing exported")
+            return
+
+        if export_depth_maps:
+            self._write_dense_depth(wrapper, export_dir, export_images, maps)
+        if fuse_dense_cloud:
+            self._write_fused_cloud(wrapper, export_dir, parser,
+                                    int(dense_cloud_max_points))
+        if mesh_dense_surface:
+            self._write_dense_mesh(wrapper, export_dir, str(mesh_method))
+
+    def _write_fused_cloud(self, wrapper, export_dir, parser, max_points):
+        """Replace the dataset's sparse SIFT points with the fused dense cloud.
+
+        Only ``points3D.txt`` is rewritten - the poses in ``images.txt`` stay exactly as
+        exported, and the cloud is in that same model's world frame, so the two cannot
+        disagree. Lichtfeld reads ``points3D.txt`` purely to seed Gaussians, so the empty
+        per-point tracks are harmless: the VGGT node has always written them that way.
+
+        ``parser`` MUST be the one that read the original *binary* sparse model. Re-parsing
+        the exported folder does NOT work: ``parse_all`` only reads BIN models, the export
+        deletes those, and the re-write then emits an EMPTY ``images.txt`` - which Lichtfeld
+        rejects with "File is empty" (measured).
+
+        The cloud is subsampled to ``max_points`` because the real budget is the
+        rasterizer's 32-bit (primitive x tile) counter, not the point count.
+        """
+        fuse = getattr(wrapper, "dense_fused_cloud", None)
+        if fuse is None:
+            log_warn(f"{type(wrapper).__name__} has no dense fusion stage - keeping the "
+                     "sparse initialisation")
+            return
+        if parser is None:
+            log_warn("No parsed sparse model available - keeping the sparse initialisation")
+            return
+
+        import shutil
+
+        try:
+            fused = fuse(max_points=int(max_points), log=log)
+        except Exception as exc:  # noqa: BLE001
+            log_warn(f"Dense fusion failed: {type(exc).__name__}: {exc}")
+            return
+        points = fused.get("points") if fused else None
+        colors = fused.get("colors") if fused else None
+        if points is None or len(points) == 0:
+            log_warn("Dense fusion produced no points - keeping the sparse initialisation")
+            return
+
+        target = Path(export_dir) / "sparse" / "0"
+        images_dir = Path(export_dir) / "images"
+        if not target.is_dir():
+            log_warn(f"No sparse model at {target} - the fused cloud has nowhere to go")
+            return
+
+        try:
+            parser.points3d = {}
+            rgb = np.clip(np.asarray(colors, dtype=np.float64) * 255.0, 0, 255)
+            for index in range(len(points)):
+                parser.points3d[index + 1] = {
+                    "xyz": np.asarray(points[index], dtype=np.float64),
+                    "rgb": rgb[index].round().astype(np.int64),
+                    "error": 0.0,
+                    "track": [],
+                }
+            parser.write_txt(target, images_dir if images_dir.is_dir() else None)
+        except Exception as exc:  # noqa: BLE001
+            log_warn(f"Could not write the fused cloud into points3D.txt: "
+                     f"{type(exc).__name__}: {exc}")
+            return
+
+        # keep the cloud itself: it is a useful artefact on its own, and the only copy
+        # otherwise lives in the SfM workspace, which is deleted at the end of the run
+        source = Path(fused.get("ply")) if fused.get("ply") else None
+        if source is not None and source.is_file():
+            try:
+                mesh_dir = Path(export_dir) / "mesh"
+                mesh_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, mesh_dir / "fused_points.ply")
+            except Exception as exc:  # noqa: BLE001
+                log_warn(f"Could not keep fused_points.ply: {type(exc).__name__}: {exc}")
+
+        log(f"Dense cloud initialisation: {len(points)} points -> "
+            f"sparse/0/points3D.txt (fused total {int(fused.get('total', len(points)))})")
+
+    def _write_dense_mesh(self, wrapper, export_dir, mesh_method):
+        """Write the dense surface to ``mesh/dense_mesh.ply`` for the trainer's anchors.
+
+        The name matters: the Lichtfeld Headless Trainer looks for exactly
+        ``mesh/dense_mesh.ply`` (or a ``.obj``) once its surface anchors are switched on.
+        """
+        import shutil
+
+        build = getattr(wrapper, "dense_mesh", None)
+        if build is None:
+            log_warn(f"{type(wrapper).__name__} has no dense meshing stage - no surface")
+            return
+        try:
+            mesh = build(method=str(mesh_method), log=log)
+        except Exception as exc:  # noqa: BLE001
+            log_warn(f"Dense meshing failed: {type(exc).__name__}: {exc}")
+            return
+        if mesh is None or not Path(mesh).is_file():
+            log_warn(f"Dense meshing ({mesh_method}) produced no surface")
+            return
+
+        target_dir = Path(export_dir) / "mesh"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / "dense_mesh.ply"
+        try:
+            shutil.copy2(mesh, target)
+        except Exception as exc:  # noqa: BLE001
+            log_warn(f"Could not copy the surface to {target}: {type(exc).__name__}: {exc}")
+            return
+        log(f"Dense surface: {mesh_method} -> mesh/dense_mesh.ply "
+            f"({Path(mesh).stat().st_size / 1e6:.1f} MB)")
+
+    def _write_dense_depth(self, wrapper, export_dir, export_images, maps):
+        """Dense MVS depth maps -> ``depth/<stem>.depth.png`` in the VGGT node's layout.
+
+        COLMAP's PatchMatch depth is fitted *photometrically to the sparse model's
+        own poses*, so it cannot disagree with them - which is what makes it safe
+        for Lichtfeld's depth loss **and** for the Meridian Geometry node's
+        ``external_depth`` socket (one geometry shared by several shots).
+
+        The wrapper returns one map per view PatchMatch covered, already warped
+        onto the original image grid.  Views the sparse model never registered -
+        or that had too little texture - stay all-zero, which Lichtfeld reads as
+        "no depth": the same convention the VGGT node uses.
+        """
+        from enndee_feedforward import (depth_to_uint16, upsample_depth_maps,
+                                        write_depth_maps)
+
+        count = int(export_images.shape[0])
+        image_hw = (int(export_images.shape[1]), int(export_images.shape[2]))
+
+        # the workspace frames are frame_<i>.jpg, the dataset images are <i+1:04d>
+        try:
+            workspace_names = sorted(p.name for p in Path(wrapper.image_dir).iterdir()
+                                     if p.is_file())
+        except Exception:  # noqa: BLE001
+            workspace_names = []
+        if not workspace_names:
+            log_warn("Cannot list the SfM workspace frames - no depth maps written")
+            return
+
+        found = {}
+        for index in range(min(count, len(workspace_names))):
+            name = workspace_names[index]
+            depth = maps.get(name)
+            if depth is None:
+                depth = maps.get(Path(name).stem)
+            if depth is not None and depth.size:
+                found[index] = depth
+        if not found:
+            log_warn("Dense MVS depth maps match none of the exported frames - "
+                     "nothing written")
+            return
+
+        shape = next(iter(found.values())).shape
+        depth_small = np.zeros((count, int(shape[0]), int(shape[1])), np.float32)
+        for index, depth in found.items():
+            if depth.shape == shape:
+                depth_small[index] = depth
+            else:
+                log_warn(f"Depth map {index} has an unexpected shape {depth.shape} "
+                         f"(expected {shape}) - left empty")
+
+        depth_full = upsample_depth_maps(depth_small, depth_small > 0, image_hw)
+        stems = [f"{index + 1:04d}" for index in range(count)]
+        written = write_depth_maps(export_dir / DEPTH_DIR, stems,
+                                   depth_to_uint16(depth_full, depth_full > 0),
+                                   log=log)
+        log(f"Dense depth: {len(found)}/{count} frames covered, {written} written")
+
     def _export_sparse(self, sparse_path, export_dir, parser):
         """Copy the sparse model and write the TXT files Lichtfeld expects."""
         import shutil
@@ -1109,83 +1377,48 @@ class GLOMAPLichtfeldTracker:
     # Helpers: RMBG background removal
     # =======================================================================
 
-    def _run_rmbg(self, images, use_gpu=True, mode="base", threshold=0.5,
-                  resize="static"):
+    def _run_rmbg(self, images, use_gpu=True, mode=RMBG_DEFAULT_MODE,
+                  threshold=0.5, resize="static"):
         """
-        Remove the background with ``transparent_background`` (RMBG).
+        Remove the background and return an RGBA float tensor [N,H,W,4].
 
-        Returns an RGBA float tensor [N,H,W,4] where alpha = foreground, or None
-        when the optional dependency is missing / the model fails to load.
+        Delegates to :mod:`enndee_rmbg`, which serves **RMBG-2.0**
+        (``briaai/RMBG-2.0``, BiRefNet through ``transformers``) as well as the
+        older **RMBG-1.4** modes (``transparent_background`` / InSPyReNet).
+        Returns ``None`` when nothing could be loaded - the caller then keeps the
+        frames untouched.
         """
-        global _rmbg_remover, _rmbg_device_fallback
-
-        try:
-            from transparent_background import Remover
-        except ImportError:
-            log("transparent_background is not installed - RMBG disabled "
-                "(pip install transparent_background)")
-            return None
-
-        # `transparent_background` is a PyTorch model (InSPyReNet) - it does NOT use
-        # onnxruntime, so only torch decides whether the RMBG pass can use the GPU.
-        # (The old onnxruntime check here forced the CPU whenever onnxruntime-gpu was
-        # missing, which made a 113 frame run take ~10 minutes instead of ~25 seconds.)
-        want_gpu = bool(use_gpu) and torch.cuda.is_available()
-        if want_gpu and _rmbg_device_fallback:
-            want_gpu = False
-        if bool(use_gpu) and not want_gpu:
-            log_warn("torch reports no CUDA device - RMBG runs on the CPU")
-        device = "cuda" if want_gpu else "cpu"
-
-        cache_key = (mode, resize, device)
-        if _rmbg_remover is None or getattr(_rmbg_remover, "_enndee_key", None) != cache_key:
-            for candidate in ([device, "cpu"] if device != "cpu" else ["cpu"]):
-                try:
-                    _rmbg_remover = Remover(mode=mode, device=candidate, resize=resize)
-                    _rmbg_remover._enndee_key = (mode, resize, candidate)
-                    log(f"RMBG model loaded (mode={mode}, device={candidate}, "
-                        f"resize={resize})")
-                    break
-                except Exception as exc:  # noqa: BLE001
-                    _rmbg_remover = None
-                    if candidate != "cpu":
-                        _rmbg_device_fallback = True
-                    log_warn(f"RMBG could not start on {candidate}: {exc}")
-            if _rmbg_remover is None:
-                return None
-
         batch = self._as_image_batch(images)
         if batch is None or batch.shape[0] == 0:
             return None
 
+        # Both generations are plain PyTorch models - only torch decides whether
+        # the pass can use the GPU.  (The old onnxruntime check here forced the
+        # CPU whenever onnxruntime-gpu was missing, which made a 113 frame run
+        # take ~10 minutes instead of ~25 seconds.)
+        want_gpu = bool(use_gpu) and torch.cuda.is_available()
+        if bool(use_gpu) and not want_gpu:
+            log_warn("torch reports no CUDA device - RMBG runs on the CPU")
+        device = "cuda" if want_gpu else "cpu"
+
         frames = []
-        total = int(batch.shape[0])
-        with torch.inference_mode():
-            for index, frame in enumerate(batch):
-                image_uint8 = (torch.clamp(frame, 0.0, 1.0) * 255.0) \
-                    .round().to(torch.uint8).cpu().numpy()
-                if image_uint8.shape[-1] == 4:
-                    image_uint8 = image_uint8[..., :3]
+        for frame in batch:
+            image_uint8 = (torch.clamp(frame, 0.0, 1.0) * 255.0) \
+                .round().to(torch.uint8).cpu().numpy()
+            if image_uint8.shape[-1] == 4:
+                image_uint8 = image_uint8[..., :3]
+            frames.append(image_uint8)
 
-                try:
-                    rgba = _rmbg_remover.process(image_uint8, threshold=threshold)
-                    frames.append(np.asarray(rgba, dtype=np.uint8))
-                except Exception as exc:  # noqa: BLE001
-                    log_warn(f"RMBG failed for frame {index}: {exc}")
-                    height, width = image_uint8.shape[:2]
-                    frames.append(np.dstack([
-                        image_uint8,
-                        np.full((height, width), 255, dtype=np.uint8),
-                    ]))
+        mattes = remove_background(
+            frames, mode=str(mode), device=device, threshold=threshold,
+            resize=resize, log=log, log_warn=log_warn,
+        )
+        if mattes is None:
+            return None
 
-                if (index + 1) % 10 == 0 or index + 1 == total:
-                    log(f"RMBG {index + 1}/{total} frames")
-
-        stacked = np.stack(frames).astype(np.float32) / 255.0
-        if stacked.shape[-1] == 3:
-            stacked = np.concatenate(
-                [stacked, np.ones_like(stacked[..., :1])], axis=-1)
-        return torch.from_numpy(stacked)
+        rgb = np.stack([frame.astype(np.float32) / 255.0 for frame in frames])
+        alpha = np.stack(mattes).astype(np.float32)[..., None]
+        return torch.from_numpy(np.concatenate([rgb, alpha], axis=-1))
 
 
 # ---------------------------------------------------------------------------

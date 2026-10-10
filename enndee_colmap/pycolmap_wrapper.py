@@ -36,8 +36,8 @@ import re
 import sys
 from typing import Callable, List, Optional, Sequence, Tuple
 
-from .colmap_wrapper import (COLMAPWrapper, GLOG_LEVEL_WARNING, VERBOSE_ENV, _timeout_from_env,
-                             colmap_child_env, colmap_verbose, run_streaming_command)
+from .colmap_wrapper import (_timeout_from_env, colmap_child_env, colmap_verbose,
+                             run_streaming_command)
 from .glomap_wrapper import GLOMAPWrapper
 
 #: ``callable(value, total, label)`` - drives ComfyUI's progress bar.
@@ -62,11 +62,26 @@ GLOG_LEVEL_WARNING = "1"
 GLOG_LEVEL_INFO = "0"
 #: ``ENNDEE_PYCOLMAP_GPU_BRIDGE=0`` keeps the native node on pycolmap alone (no download).
 BRIDGE_ENV = "ENNDEE_PYCOLMAP_GPU_BRIDGE"
+#: ``ENNDEE_PYCOLMAP_GPU_BA=1`` opts back into the GPU bundle adjustment solvers. Only a
+#: COLMAP built with cuDSS/Caspar can use them - see :meth:`PyColmapWrapper.mapper`.
+GPU_BA_ENV = "ENNDEE_PYCOLMAP_GPU_BA"
 
 
 def gpu_bridge_enabled() -> bool:
     """False when the user switched the CUDA bridge off via ``ENNDEE_PYCOLMAP_GPU_BRIDGE=0``."""
     return not str(os.environ.get(BRIDGE_ENV) or "").strip() in ("0", "false", "no", "off")
+
+
+def gpu_ba_requested() -> bool:
+    """True when the user forced the GPU solvers back on via ``ENNDEE_PYCOLMAP_GPU_BA=1``.
+
+    COLMAP's global mapper pins ``linear_solver_type = SPARSE_SCHUR`` together with
+    ``auto_select_solver_type = false`` (``src/colmap/sfm/global_mapper.h``), so its GPU
+    solver is unreachable unless COLMAP was built with cuDSS/Caspar - which the standard
+    builds are not. This switch exists for such a build; on everything else it only brings
+    back the misleading "Falling back to CPU" warnings.
+    """
+    return str(os.environ.get(GPU_BA_ENV) or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 class GpuBridge:
@@ -148,6 +163,9 @@ def resolve_gpu_bridge(auto_install: bool = True, log: Callable[[str], None] = p
 #: the "no CUDA build" situation is a property of the build, not of a stage - one
 #: clear line per session is enough (extraction + matching + mapping would repeat it).
 _CPU_NOTICE_SHOWN = False
+#: same for the "a CUDA build still maps on the CPU" explanation - it is a property of
+#: COLMAP's global mapper, not of this run.
+_MAPPING_NOTICE_SHOWN = False
 
 
 def _cpu_notice() -> None:
@@ -165,6 +183,23 @@ def _cpu_notice() -> None:
           "CPU only) - SIFT extraction, matching and the bundle adjustment run on the "
           "CPU here; the binary tracker (COLMAP CUDA build) does the same work on the "
           "GPU and is faster")
+
+
+def _mapping_notice() -> None:
+    """Explain *once* that even a CUDA build maps on the CPU (see `mapper`).
+
+    SIFT extraction and matching are the stages the GPU really accelerates (81 images:
+    8.85 s -> 1.65 s and 47.42 s -> 0.89 s). The mapping (global positioning + bundle
+    adjustment) is CPU-bound on both builds, so a CUDA build that maps on the CPU is
+    not a broken install - only a COLMAP with cuDSS/Caspar would change that.
+    """
+    global _MAPPING_NOTICE_SHOWN
+    if _MAPPING_NOTICE_SHOWN:
+        return
+    _MAPPING_NOTICE_SHOWN = True
+    print("[pycolmap] SIFT extraction + matching run on the GPU; the mapping (global "
+          "positioning + bundle adjustment) stays on the CPU - COLMAP's global mapper "
+          "uses a CPU sparse solver unless COLMAP is built with cuDSS")
 
 
 def silence_colmap_logging(module=None) -> None:
@@ -202,16 +237,92 @@ def import_pycolmap():
     return pycolmap
 
 
+def _cuda_device_name(module=None) -> str:
+    """Best effort CUDA device name (torch knows it, pycolmap only counts devices)."""
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return str(torch.cuda.get_device_name(0))
+    except Exception:  # noqa: BLE001 - torch is optional and may have no CUDA device
+        pass
+    try:
+        if module is not None and int(module.get_num_cuda_devices()) > 0:
+            return "CUDA device"
+    except Exception:  # noqa: BLE001 - older/newer bindings may not expose it
+        pass
+    return ""
+
+
 def pycolmap_info() -> dict:
-    """``{'available': bool, 'version': str, 'cuda': bool}`` for reporting."""
+    """What the installed pycolmap can do - for the node's header and the reports.
+
+    Keys: ``available``, ``version``, ``cuda`` (the *build* has CUDA), ``device_name``,
+    ``sift_on_gpu`` (this build can run SIFT on the GPU; the node additionally reports
+    its CUDA COLMAP bridge, which covers the SIFT stages for a CPU-only build) and
+    ``mapping_on_gpu`` - that stays False unless ``ENNDEE_PYCOLMAP_GPU_BA=1`` is set,
+    because COLMAP's global mapper only reaches its GPU solver with cuDSS/Caspar
+    (see :meth:`PyColmapWrapper.mapper`).
+    """
     module = import_pycolmap()
     if module is None:
-        return {"available": False, "version": "", "cuda": False}
+        return {"available": False, "version": "", "cuda": False, "device_name": "",
+                "sift_on_gpu": False, "mapping_on_gpu": False}
+    cuda = bool(getattr(module, "has_cuda", False))
     return {
         "available": True,
         "version": str(getattr(module, "__version__", "?")),
-        "cuda": bool(getattr(module, "has_cuda", False)),
+        "cuda": cuda,
+        "device_name": _cuda_device_name(module) if cuda else "",
+        "sift_on_gpu": cuda,
+        "mapping_on_gpu": bool(cuda and gpu_ba_requested()),
     }
+
+
+# ---------------------------------------------------------------------------
+# Dense geometry products: fusion + surface
+# ---------------------------------------------------------------------------
+
+
+def points_from_reconstruction(module, reconstruction, ply_path=None):
+    """``(points [N,3] float64, colors [N,3] float32 in [0,1])`` from a fusion result.
+
+    ``stereo_fusion`` returns a :class:`pycolmap.Reconstruction` whose ``points3D`` carry
+    ``xyz`` and an 8-bit ``color``.  If a build ever hands one back without points, the
+    PLY the call wrote is read again through ``Reconstruction.import_PLY`` - verified to
+    work on COLMAP's fused PLY.
+    """
+    import numpy as np
+
+    entries = []
+    if reconstruction is not None and hasattr(reconstruction, "points3D"):
+        entries = list(reconstruction.points3D.values())
+    if not entries and ply_path is not None and Path(ply_path).is_file():
+        try:
+            loaded = module.Reconstruction()
+            loaded.import_PLY(str(ply_path))
+            entries = list(loaded.points3D.values())
+        except Exception as exc:  # noqa: BLE001
+            print(f"[pycolmap] dense: cannot read {Path(ply_path).name}: {exc}")
+            entries = []
+    if not entries:
+        return np.zeros((0, 3), np.float64), np.zeros((0, 3), np.float32)
+
+    points = np.array([np.asarray(entry.xyz, dtype=np.float64) for entry in entries])
+    colors = np.array([np.asarray(entry.color, dtype=np.float64) for entry in entries])
+    if colors.size and float(colors.max()) > 1.5:      # 8-bit colours
+        colors = colors / 255.0
+    return points, np.clip(colors, 0.0, 1.0).astype(np.float32)
+
+
+def stride_subset(count: int, cap: int):
+    """Indices keeping at most ``cap`` of ``count`` entries, evenly and deterministically."""
+    import numpy as np
+
+    if cap <= 0 or count <= cap:
+        return np.arange(count, dtype=np.int64)
+    keep = np.linspace(0, count - 1, int(cap)).round().astype(np.int64)
+    return np.unique(keep)
 
 
 class PyColmapWrapper(GLOMAPWrapper):
@@ -297,9 +408,16 @@ class PyColmapWrapper(GLOMAPWrapper):
         return module
 
     def _effective_gpu(self, module, use_gpu: bool) -> bool:
-        """True when this pycolmap build can really use the GPU."""
+        """True when this pycolmap build can really use the GPU.
+
+        Also the place where the one-time explanations fire: a build without CUDA gets
+        `_cpu_notice`, a CUDA build gets `_mapping_notice` (its mapping still runs on
+        the CPU - see `mapper`).
+        """
         has_cuda = bool(getattr(module, "has_cuda", False))
-        if use_gpu and not has_cuda:
+        if use_gpu and has_cuda:
+            _mapping_notice()
+        elif use_gpu and not has_cuda:
             _cpu_notice()
         return bool(use_gpu) and has_cuda
 
@@ -522,6 +640,29 @@ class PyColmapWrapper(GLOMAPWrapper):
                 converted.append((name1, name2))
         return converted or None
 
+    def _call_matcher(self, label: str, function, required: tuple, optional: dict) -> None:
+        """Call a pycolmap matcher, tolerating binding differences in the keyword form.
+
+        ``matching_options`` / ``pairing_options`` / ``device`` are passed as plain dicts,
+        which every 4.x build accepts - but not every *option class* is exposed at the top
+        level (pycolmap 4.2.1 has no ``SequentialMatchingOptions``, for example), and a
+        keyword this build does not know must not kill the run. A rejected keyword is
+        therefore retried once with the required arguments only. ``ENNDEE_COLMAP_VERBOSE=1``
+        says which form was used; if the bare form fails as well the exception propagates
+        to the caller's fallback.
+        """
+        try:
+            function(*required, **optional)
+        except Exception as exc:  # noqa: BLE001 - a binding difference, not a fatal error
+            print(f"[pycolmap] {label}: option keyword rejected ({exc}) - retrying with "
+                  f"the required arguments only")
+            function(*required)
+            if colmap_verbose():
+                print(f"[pycolmap] {label}: bare form accepted")
+            return
+        if colmap_verbose():
+            print(f"[pycolmap] {label}: full option form accepted")
+
     def _match(self, kind: str, use_gpu: bool, overlap: int = 10) -> bool:
         module = self._module()
         if module is None:
@@ -543,11 +684,12 @@ class PyColmapWrapper(GLOMAPWrapper):
                     listing = Path(self.workspace) / f"match_list_{kind}_{start:06d}.txt"
                     listing.write_text("\n".join(f"{a} {b}" for a, b in chunk),
                                        encoding="utf-8")
-                    module.match_image_pairs(
-                        self.database_path,
-                        matching_options=matching_options,
-                        pairing_options={"match_list_path": str(listing)},
-                        device=device,
+                    self._call_matcher(
+                        f"chunked {kind} matching", module.match_image_pairs,
+                        (self.database_path,),
+                        {"matching_options": matching_options,
+                         "pairing_options": {"match_list_path": str(listing)},
+                         "device": device},
                     )
                     done += len(chunk)
                     self._emit(done, total, f"{kind} matching {done}/{total} pairs")
@@ -559,17 +701,20 @@ class PyColmapWrapper(GLOMAPWrapper):
 
         try:
             if kind == "sequential":
-                module.match_sequential(
-                    self.database_path,
-                    matching_options=matching_options,
-                    pairing_options={"overlap": int(overlap),
-                                     "loop_detection": False},
-                    device=device,
+                self._call_matcher(
+                    "sequential matching", module.match_sequential,
+                    (self.database_path,),
+                    {"matching_options": matching_options,
+                     "pairing_options": {"overlap": int(overlap),
+                                         "loop_detection": False},
+                     "device": device},
                 )
             else:
-                module.match_exhaustive(self.database_path,
-                                        matching_options=matching_options,
-                                        device=device)
+                self._call_matcher(
+                    "exhaustive matching", module.match_exhaustive,
+                    (self.database_path,),
+                    {"matching_options": matching_options, "device": device},
+                )
         except Exception as exc:  # noqa: BLE001
             print(f"[pycolmap] {kind} matching failed: {exc}")
             return False
@@ -596,12 +741,36 @@ class PyColmapWrapper(GLOMAPWrapper):
         new ones (``global``, ``global_mapper``); ``incremental`` runs COLMAP's
         classic incremental mapper instead.
 
-        Without CUDA in the build the global pipeline is told not to ask for the GPU
-        solvers: ``global_positioning.use_gpu`` and ``bundle_adjustment.ceres.use_gpu``
-        default to *true*, and every run then logs two "Requested to use GPU for bundle
-        adjustment, but COLMAP was compiled without CUDA support - falling back to the
-        CPU" warnings that look like errors but only repeat what ``has_cuda`` already
-        says. Nothing is lost: there is no GPU to fall back *from*.
+        The global pipeline always gets explicit solver flags, and both stages default
+        to *false* regardless of ``has_cuda``. Both default to *true* inside COLMAP, but
+        COLMAP's global mapper pins ``linear_solver_type = SPARSE_SCHUR`` together with
+        ``auto_select_solver_type = false`` (``src/colmap/sfm/global_mapper.h``), so its
+        GPU solver is never selected - a CUDA/Ceres build only reaches it with
+        cuDSS/Caspar, which the standard builds do not have. Leaving the defaults on
+        therefore buys nothing and logs two misleading "Requested to use GPU for bundle
+        adjustment ... Falling back to CPU" warnings per run.
+
+        Measured on the same 81-image set (mapping = global positioning + bundle
+        adjustment; two runs per wheel):
+
+        ==================  ==============  ================
+        stage               CPU wheel       CUDA wheel
+        ==================  ==============  ================
+        mapping total       87.6 / 70.2 s   115.7 / 67.0 s
+        ==================  ==============  ================
+
+        The two runs of *one* build differ by more than the builds differ from each
+        other (the positioning stage alone varied 21.7 s <-> 44.2 s for a single config),
+        so the mapping is CPU-bound either way - the only lever is the problem size
+        (``frame_step``, ``max_features``, ``max_image_size``, ``matcher``,
+        ``sequential_overlap``). The GPU's win is the SIFT work: on the same set
+        extraction went 8.85 s -> 1.65 s and sequential matching 47.42 s -> 0.89 s.
+
+        Set ``ENNDEE_PYCOLMAP_GPU_BA=1`` to restore ``use_gpu = True`` for both stages -
+        only meaningful for a COLMAP built with cuDSS/Caspar. ``auto_select_solver_type``
+        is deliberately never touched (it changes the solver and does not help the
+        default global-SfM BA). The ``incremental`` backend takes no ``mapper`` sub-tree
+        and is left untouched.
         """
         module = self._module()
         if module is None:
@@ -610,13 +779,20 @@ class PyColmapWrapper(GLOMAPWrapper):
         options = {"min_num_matches": int(min_num_matches)}
         if num_threads:
             options["num_threads"] = int(num_threads)
-        if backend in GLOBAL_BACKENDS and not getattr(module, "has_cuda", False):
+        if backend in GLOBAL_BACKENDS:
             # the sub-tree is ``GlobalPipelineOptions.mapper.<stage>`` - see
             # ``mapper.global_positioning`` / ``mapper.bundle_adjustment.ceres``.
+            gpu_ba = gpu_ba_requested()
             options["mapper"] = {
-                "global_positioning": {"use_gpu": False},
-                "bundle_adjustment": {"ceres": {"use_gpu": False}},
+                "global_positioning": {"use_gpu": gpu_ba},
+                "bundle_adjustment": {"ceres": {"use_gpu": gpu_ba}},
             }
+            if gpu_ba:
+                print(f"[pycolmap] mapping solver: GPU requested via {GPU_BA_ENV}=1 - "
+                      f"the GPU sparse solver needs a cuDSS-enabled COLMAP build")
+            else:
+                print("[pycolmap] mapping solver: CPU (SPARSE_SCHUR) - the GPU bundle "
+                      "adjustment needs a cuDSS-enabled COLMAP build")
         self._emit(0, 1, f"{backend} mapping")
         try:
             if backend == INCREMENTAL_BACKEND:
@@ -645,4 +821,359 @@ class PyColmapWrapper(GLOMAPWrapper):
                 model.write(self.sparse_dir / str(index))
             model_path = self.get_sparse_model_path()
         return model_path is not None
+
+
+    # ==================================================================
+    # Dense MVS: depth the sparse model itself is consistent with
+    # ==================================================================
+
+    def dense_depth_maps(self, sparse_path, dense_dir=None, *,
+                         max_image_size: int = 1600,
+                         geom_consistency: bool = True,
+                         window_radius: int = 5,
+                         num_samples: int = 15,
+                         cache_size: int = 32,
+                         log: Callable[[str], None] = print) -> dict:
+        """Run COLMAP's dense MVS and read the depth maps back.
+
+        This is the ``colmap image_undistorter`` -> ``colmap patch_match_stereo``
+        pair, run in-process: the sparse model is undistorted into
+        ``<workspace>/dense``, PatchMatch stereo fills that workspace with
+        ``stereo/depth_maps/*.bin``, and every map is read through
+        :class:`pycolmap.DepthMap`.
+
+        Why this is worth the CUDA pass: unlike a feed-forward model, this depth
+        is *photometrically fitted to the very poses the sparse model produced*.
+        It therefore cannot disagree with them, which is what Lichtfeld's depth
+        loss needs - a depth prior in another gauge fights the reconstruction, a
+        prior in the same gauge can only reinforce it.  ``geom_consistency`` is
+        the cross-view consistency filter: on it also writes the filtered
+        ``.geometric`` maps (used when both exist), off only the raw
+        ``.photometric`` ones.
+
+        Returns ``{image_name: float32[H, W]}`` for every view PatchMatch wrote a
+        map for, or ``{}`` when the stage could not run at all (no CUDA pycolmap,
+        no undistorter, no sparse model).
+        """
+        module = self._module()
+        if module is None:
+            return {}
+        if not self.workspace or not self.image_dir:
+            print("[pycolmap] dense: no workspace - run the SfM stages first")
+            return {}
+
+        import shutil
+
+        workspace = Path(self.workspace)
+        dense = Path(dense_dir) if dense_dir else workspace / "dense"
+        # a stale dense/ folder from an earlier run would be mixed into this one
+        if dense.exists():
+            shutil.rmtree(dense, ignore_errors=True)
+        dense.mkdir(parents=True, exist_ok=True)
+
+        sparse = Path(sparse_path)
+        if not sparse.exists():
+            print(f"[pycolmap] dense: sparse model not found: {sparse}")
+            return {}
+
+        self._emit(0, 3, "dense: undistort")
+        log(f"Dense MVS: undistorting {sparse.name} -> {dense}")
+        try:
+            undistort = module.UndistortCameraOptions()
+            if int(max_image_size) > 0:
+                undistort.max_image_size = int(max_image_size)
+            module.undistort_images(str(dense), str(sparse), str(self.image_dir),
+                                    undistort_options=undistort)
+        except Exception as exc:  # noqa: BLE001 - dense is optional, never fatal
+            print(f"[pycolmap] dense: undistortion failed: {exc}")
+            return {}
+
+        options = module.PatchMatchOptions()
+        try:
+            options.max_image_size = int(max_image_size) if int(max_image_size) > 0 else -1
+            options.geom_consistency = bool(geom_consistency)
+            options.window_radius = int(window_radius)
+            options.num_samples = int(num_samples)
+            options.cache_size = int(cache_size)
+        except Exception:  # noqa: BLE001 - binding differences must not kill the run
+            print("[pycolmap] dense: some PatchMatch options were rejected - "
+                  "using COLMAP's defaults for those")
+
+        self._emit(1, 3, "dense: patch match")
+        log("Dense MVS: PatchMatch stereo on the GPU - this is the slow stage")
+        try:
+            module.patch_match_stereo(str(dense), options=options)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[pycolmap] dense: patch_match_stereo failed: {exc}")
+            return {}
+
+        self._emit(2, 3, "dense: reading depth maps")
+        return self.read_dense_depth_maps(dense, sparse, log=log)
+
+    @staticmethod
+    def _warp_to_original(depth, undistorted_camera, original_camera, target_hw):
+        """Resample an undistorted depth map onto the original (distorted) grid.
+
+        PatchMatch only runs on the undistorted workspace, so its maps live on a
+        different pixel grid *and* in a different projection than the frames the
+        dataset exports.  A plain resize would be wrong: for the SIMPLE_RADIAL
+        model of a 3456x2304 orbit the radial term moves a corner pixel by more
+        than a dozen pixels, which is exactly the kind of misalignment a
+        per-pixel depth loss notices.
+
+        The warp is therefore inverted exactly.  Every target pixel becomes a ray
+        through the **original** camera, that ray is projected with the
+        **undistorted** camera, and the depth is sampled there.  Depth is the
+        z-coordinate along the camera axis, which undistortion does not change, so
+        the value transfers unchanged.  Target pixels whose ray falls outside the
+        undistorted image get ``0`` - Lichtfeld's "no depth".
+        """
+        import numpy as np
+        import torch
+
+        target_h, target_w = int(target_hw[0]), int(target_hw[1])
+        grid_y, grid_x = np.meshgrid(np.arange(target_h, dtype=np.float64),
+                                     np.arange(target_w, dtype=np.float64),
+                                     indexing="ij")
+        pixels = np.stack([grid_x.ravel(), grid_y.ravel()], axis=1)
+
+        # original pixel -> ray, ray -> undistorted pixel (both vectorised)
+        rays = np.asarray(original_camera.cam_from_img(pixels), dtype=np.float64)
+        rays = np.concatenate([rays, np.ones((rays.shape[0], 1))], axis=1)
+        projected = np.asarray(undistorted_camera.img_from_cam(rays),
+                               dtype=np.float64)
+
+        width = max(int(undistorted_camera.width) - 1, 1)
+        height = max(int(undistorted_camera.height) - 1, 1)
+        sample_x = (projected[:, 0] / width) * 2.0 - 1.0
+        sample_y = (projected[:, 1] / height) * 2.0 - 1.0
+
+        source = torch.from_numpy(np.ascontiguousarray(depth, dtype=np.float32))
+        # grid_sample wants [N, H_out, W_out, 2] - a flat [N, 2] grid would be read
+        # as a 1xN output image
+        grid = np.stack([sample_x, sample_y], axis=1).reshape(target_h, target_w, 2)
+        warped = torch.nn.functional.grid_sample(
+            source[None, None], torch.from_numpy(grid.astype(np.float32))[None],
+            mode="bilinear", padding_mode="zeros", align_corners=True)
+        return warped[0, 0].numpy().astype(np.float32)
+
+    @staticmethod
+    def read_dense_depth_maps(dense_dir, sparse_path=None,
+                              log: Callable[[str], None] = print) -> dict:
+        """Read ``<dense>/stereo/depth_maps/*.bin`` into ``{image_name: [H, W]}``.
+
+        COLMAP names each file after the image and appends the map kind, so one
+        view can be ``0001.png.photometric.bin`` *and* ``0001.png.geometric.bin``.
+        The filtered geometric map wins when both are present.
+
+        With ``sparse_path`` (the distorted model the SfM stage produced) the maps
+        are warped back onto the original image grid - see
+        :meth:`_warp_to_original`.  Without it they stay in the undistorted frame,
+        where they do **not** line up with the exported images.
+        """
+        import numpy as np
+
+        depth_maps_dir = Path(dense_dir) / "stereo" / "depth_maps"
+        index = {}
+        if depth_maps_dir.is_dir():
+            for path in sorted(depth_maps_dir.iterdir()):
+                if not path.is_file() or path.suffix.lower() != ".bin":
+                    continue
+                name = path.name[: -len(".bin")]
+                for kind in (".geometric", ".photometric"):
+                    if name.endswith(kind):
+                        name = name[: -len(kind)]
+                        break
+                index.setdefault(name, path)
+
+        if not index:
+            print(f"[pycolmap] dense: no depth maps in {depth_maps_dir}")
+            return {}
+
+        module = import_pycolmap()
+        original_cameras, undistorted_cameras = {}, {}
+        if sparse_path is not None:
+            try:
+                original_model = module.Reconstruction()
+                original_model.read(str(sparse_path))
+                original_cameras = {image.name: image.camera
+                                    for image in original_model.images.values()}
+                dense_model = module.Reconstruction()
+                dense_model.read(str(Path(dense_dir) / "sparse"))
+                undistorted_cameras = {image.name: image.camera
+                                       for image in dense_model.images.values()}
+            except Exception as exc:  # noqa: BLE001 - fall back to the raw maps
+                print(f"[pycolmap] dense: cannot read the camera models ({exc}) - "
+                      "depth maps stay in the undistorted frame")
+
+        results, warped = {}, 0
+        for name, path in index.items():
+            depth_map = module.DepthMap()
+            try:
+                depth_map.read(str(path))
+                depth = depth_map.to_array().astype(np.float32)
+            except Exception as exc:  # noqa: BLE001 - skip the odd broken map
+                print(f"[pycolmap] dense: cannot read {path.name}: {exc}")
+                continue
+
+            original_camera = original_cameras.get(name)
+            undistorted_camera = undistorted_cameras.get(name)
+            if (original_camera is not None and undistorted_camera is not None
+                    and not original_camera.is_undistorted()):
+                depth = PyColmapWrapper._warp_to_original(
+                    depth, undistorted_camera, original_camera,
+                    (original_camera.height, original_camera.width))
+                warped += 1
+            results[name] = depth
+
+        detail = f", {warped} warped back onto the original camera model" if warped else ""
+        log(f"Dense MVS: {len(results)} depth maps read from {depth_maps_dir}{detail}")
+        return results
+
+    # ------------------------------------------------------------------ A: fusion
+    def dense_fused_cloud(self, dense_dir=None, max_points: int = 400000, *,
+                          log: Callable[[str], None] = print) -> dict:
+        """``colmap stereo_fusion`` -> one multi-view consistent point cloud.
+
+        Every PatchMatch depth map is fused into a single cloud **in the sparse model's
+        world frame**, with the per-view outliers rejected. Unlike a mesh this constrains
+        nothing downstream - it only seeds the Gaussians - so it cannot freeze an error
+        in, which makes it the safer of the two dense products.
+
+        ``output_type="ply"`` is load-bearing: the default ``"bin"`` writes a COLMAP
+        model *folder* at ``output_path`` and fails outright when handed a file path
+        (``Check failed: ExistsDir(path_val)``).
+
+        Returns ``{"points": [N,3], "colors": [N,3] in [0,1], "total": int, "ply": Path}``
+        or ``{}`` when the fusion could not run.
+        """
+        module = self._module()
+        if module is None:
+            return {}
+        if not self.workspace:
+            print("[pycolmap] dense: no workspace - run the SfM stages first")
+            return {}
+
+        dense = Path(dense_dir) if dense_dir else Path(self.workspace) / "dense"
+        if not dense.is_dir():
+            print(f"[pycolmap] dense: no dense workspace at {dense}")
+            return {}
+        ply = dense / "fused.ply"
+
+        self._emit(0, 1, "dense: fusing")
+        log("Dense MVS: fusing the depth maps into one point cloud")
+        try:
+            fused = module.stereo_fusion(str(ply), str(dense), input_type="geometric",
+                                         output_type="ply",
+                                         options=module.StereoFusionOptions())
+        except Exception as exc:  # noqa: BLE001 - fusion is optional, never fatal
+            print(f"[pycolmap] dense: stereo_fusion failed: {exc}")
+            return {}
+
+        points, colors = points_from_reconstruction(module, fused, ply)
+        if len(points) == 0:
+            print("[pycolmap] dense: stereo_fusion produced no points")
+            return {}
+
+        total = int(len(points))
+        keep = stride_subset(total, int(max_points))
+        if len(keep) != total:
+            points, colors = points[keep], colors[keep]
+        self._emit(1, 1, "dense: fused")
+        log(f"Dense MVS: fused {total} points -> {len(keep)} kept "
+            f"(cap {int(max_points)}) -> {ply.name}")
+        return {"points": points, "colors": colors, "total": total, "ply": ply}
+
+    # ------------------------------------------------------------- B: surface
+    def _colmap_executable(self):
+        """A ``colmap.exe`` for the CLI-only stages, taken from the GPU bridge.
+
+        The bridge path is often the ``COLMAP.bat`` launcher, whose real binary sits in
+        the sibling ``bin/`` folder, so both shapes are resolved.
+        """
+        raw = str(getattr(self, "colmap_path", "") or "").strip()
+        if not raw:
+            return None
+        path = Path(raw)
+        if path.suffix.lower() == ".exe" and path.is_file():
+            return path
+        for candidate in (path.parent / "colmap.exe", path.parent / "bin" / "colmap.exe"):
+            if candidate.is_file():
+                return candidate
+        return None
+
+    def dense_mesh(self, dense_dir=None, method: str = "poisson",
+                   fused_ply=None, *, log: Callable[[str], None] = print):
+        """A triangle surface for the dense geometry, or ``None``.
+
+        ``poisson`` runs in-process from the fused cloud. ``trim`` MUST be overridden:
+        this COLMAP build defaults it to 10, which crops the result to **12 vertices /
+        20 faces** on a real scene - measured. At ``trim=0`` the same input yields
+        ~167k vertices / ~334k faces. ``depth`` keeps COLMAP's default 13.
+
+        ``delaunay`` shells out to the bundled COLMAP because pycolmap 4.2.1 exposes
+        ``DelaunayMeshingOptions`` but **no** ``delaunay_meshing`` function (verified:
+        ``AttributeError``). Its input is the *dense workspace*, not the fused PLY.
+        """
+        module = self._module()
+        if module is None:
+            return None
+        dense = Path(dense_dir) if dense_dir else (
+            Path(self.workspace) / "dense" if self.workspace else None)
+        if dense is None or not dense.is_dir():
+            print(f"[pycolmap] dense: no dense workspace at {dense}")
+            return None
+
+        if str(method).lower() == "delaunay":
+            return self._delaunay_mesh(dense, log=log)
+
+        source = Path(fused_ply) if fused_ply else dense / "fused.ply"
+        if not source.is_file():
+            print(f"[pycolmap] dense: no fused cloud at {source} - run the fusion first")
+            return None
+        target = dense / "mesh_poisson.ply"
+
+        self._emit(0, 1, "dense: meshing")
+        log("Dense MVS: Poisson surface reconstruction from the fused cloud")
+        try:
+            options = module.PoissonMeshingOptions()
+            options.trim = 0.0          # see the docstring - the default kills the mesh
+            module.poisson_meshing(str(source), str(target), options=options)
+        except Exception as exc:  # noqa: BLE001 - meshing is optional, never fatal
+            print(f"[pycolmap] dense: poisson_meshing failed: {exc}")
+            return None
+        self._emit(1, 1, "dense: meshed")
+        if not target.is_file():
+            print("[pycolmap] dense: poisson_meshing wrote no file")
+            return None
+        log(f"Dense MVS: Poisson surface -> {target.name}")
+        return target
+
+    def _delaunay_mesh(self, dense: Path, *, log: Callable[[str], None] = print):
+        """``colmap delaunay_mesher --input_path <dense> --input_type dense``."""
+        import subprocess
+
+        executable = self._colmap_executable()
+        if executable is None:
+            print("[pycolmap] dense: delaunay needs the bundled COLMAP binary "
+                  "(none resolved) - use mesh_method='poisson'")
+            return None
+        target = dense / "mesh_delaunay.ply"
+        log(f"Dense MVS: Delaunay surface reconstruction via {executable.name}")
+        try:
+            proc = subprocess.run(
+                [str(executable), "delaunay_mesher",
+                 "--input_path", str(dense), "--input_type", "dense",
+                 "--output_path", str(target)],
+                capture_output=True, text=True, timeout=1800)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[pycolmap] dense: delaunay_mesher failed to start: {exc}")
+            return None
+        if not target.is_file():
+            tail = ((proc.stdout or "") + (proc.stderr or "")).strip().splitlines()[-4:]
+            print(f"[pycolmap] dense: delaunay_mesher produced no mesh "
+                  f"(rc={proc.returncode}): {' | '.join(tail)}")
+            return None
+        log(f"Dense MVS: Delaunay surface -> {target.name}")
+        return target
 

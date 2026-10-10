@@ -29,16 +29,26 @@ overrides the backend hooks.
 
 .. note::
    The official pycolmap wheels for Windows are built **without CUDA** (CUDA wheels
-   are Linux only), so SIFT extraction/matching and the bundle adjustment run on the
-   CPU here. ``use_gpu`` switches to the GPU automatically if a CUDA-enabled
-   pycolmap is installed (``pycolmap.has_cuda``).
+   are Linux only), so SIFT extraction/matching fall back to the **downloaded CUDA
+   COLMAP build**; a CUDA-enabled pycolmap (``pycolmap.has_cuda``, self-built or set
+   via ``ENNDEE_PYCOLMAP_CUDA_WHEEL``) is used in-process instead. The **mapping**
+   (global positioning + bundle adjustment) runs on the **CPU on every build** - it is
+   not a misconfiguration: COLMAP's global mapper pins ``SPARSE_SCHUR`` with
+   ``auto_select_solver_type = false``, so only a COLMAP built with cuDSS/Caspar would
+   use a GPU solver (see :meth:`~enndee_colmap.pycolmap_wrapper.PyColmapWrapper.mapper`).
 """
 
 from typing import List, Optional
 
 from enndee_accelerators import ensure_accelerators
 from enndee_colmap.pycolmap_wrapper import PyColmapWrapper, pycolmap_info, resolve_gpu_bridge
-from glomap_lichtfeld_node import GLOMAPLichtfeldTracker, log, log_warn, tooltip
+from glomap_lichtfeld_node import (  # noqa: E402
+    RMBG_DEFAULT_MODE,
+    GLOMAPLichtfeldTracker,
+    log,
+    log_warn,
+    tooltip,
+)
 
 #: ``mapper_backend`` names of the binary node, mapped to the native options.
 LEGACY_MAPPER_BACKENDS = {"glomap": "global", "colmap_global": "global"}
@@ -156,17 +166,108 @@ class ColmapLichtfeldTracker(GLOMAPLichtfeldTracker):
         })
         # Hidden: the node id routes the live status events to this node.
         spec.setdefault("hidden", {})["unique_id"] = "UNIQUE_ID"
+
+        # --- dense MVS depth export ---------------------------------------
+        # Appended LAST (after jpeg_quality) so every existing workflow keeps its
+        # widget_values positions.
+        optional["export_depth_maps"] = ("BOOLEAN", {
+            "default": False,
+            **tooltip(
+                "Also run COLMAP's dense MVS (image undistorter + PatchMatch "
+                "stereo) and write depth/<image stem>.depth.png (16-bit), the "
+                "exact layout the VGGT node writes. This depth is fitted "
+                "photometrically to the sparse model's own poses, so it cannot "
+                "disagree with them - which is what makes it safe for "
+                "Lichtfeld's use_depth_loss and for the Meridian Geometry node's "
+                "external_depth socket (one geometry shared by several shots). "
+                "Costs a CUDA pass over the whole frame set."
+            ),
+        })
+        optional["dense_max_image_size"] = ("INT", {
+            "default": 1024, "min": 320, "max": 4096, "step": 128,
+            **tooltip(
+                "Longest edge the dense MVS stage runs at; the maps are "
+                "upsampled to the image resolution afterwards. Lichtfeld's "
+                "depth loss only needs the relative ordering inside one image, "
+                "so 1024 is usually plenty. This is the main runtime lever - "
+                "cost grows with its square (measured: ~9 s per frame at 640 px "
+                "and ~22 s at 1024 px for 3456x2304 frames on a 5090)."
+            ),
+        })
+        optional["dense_geom_consistency"] = ("BOOLEAN", {
+            "default": True,
+            **tooltip(
+                "COLMAP's cross-view consistency filter for PatchMatch. ON "
+                "(recommended) also writes the filtered .geometric maps, and "
+                "that is what gets exported: fewer valid pixels, no outliers. "
+                "OFF exports the raw .photometric maps, which fill every pixel "
+                "but contain wild values."
+            ),
+        })
+        # --- dense geometry products (appended LAST, same rule as above) -----
+        optional["fuse_dense_cloud"] = ("BOOLEAN", {
+            "default": False,
+            **tooltip(
+                "Fuse the dense MVS depth maps into ONE multi-view consistent "
+                "point cloud (colmap stereo_fusion) and write it into the "
+                "dataset's sparse/0/points3D.txt as the training "
+                "initialisation, instead of the sparse SIFT points. 3DGS is "
+                "initialisation-sensitive and a dense, globally consistent "
+                "cloud places far more primitives in the right places than SIFT "
+                "ever can - and unlike a mesh it constrains nothing, so it "
+                "cannot freeze an error in. Needs export_depth_maps (fusion "
+                "runs on those maps). The cloud is subsampled to "
+                "dense_cloud_max_points."
+            ),
+        })
+        optional["dense_cloud_max_points"] = ("INT", {
+            "default": 400000, "min": 10000, "max": 5000000, "step": 10000,
+            **tooltip(
+                "Upper bound on the fused cloud written to points3D.txt. The "
+                "trainer's max_gaussians default is 1,000,000 and it is the "
+                "rasterizer's 32-bit (primitive x tile) counter that actually "
+                "overflows, so 400k is a safe initialisation budget. Raise it "
+                "only together with max_gaussians."
+            ),
+        })
+        optional["mesh_dense_surface"] = ("BOOLEAN", {
+            "default": False,
+            **tooltip(
+                "Also reconstruct a SURFACE (triangle mesh) from the dense "
+                "geometry and write mesh/dense_mesh.ply into the dataset. This "
+                "is the anchor geometry: the Lichtfeld Headless Trainer can "
+                "rasterise it into surface-aligned Gaussians (mesh2splat) and "
+                "freeze them as scaffolding. It is a HARD constraint, unlike "
+                "the depth loss - a wrong surface stays wrong. Needs "
+                "export_depth_maps."
+            ),
+        })
+        optional["mesh_method"] = (["poisson", "delaunay"], {
+            "default": "poisson",
+            **tooltip(
+                "poisson = in-process Poisson surface reconstruction from the "
+                "fused cloud: smooth and watertight, but it rounds off thin "
+                "structures (hair, wires, leaves). delaunay = the bundled "
+                "COLMAP 'delaunay_mesher' (visibility based, runs as a "
+                "subprocess): keeps depth discontinuities and finer detail, "
+                "noisier and less forgiving of outliers. Poisson needs no "
+                "binary; delaunay needs the COLMAP build under <pack>/bin."
+            ),
+        })
         return spec
 
     DESCRIPTION = (
         "Global SfM camera tracking through COLMAP's native Python API (pycolmap) - "
         "GLOMAP is part of COLMAP >= 3.12, so nothing is downloaded. Same widgets, "
         "same Lichtfeld Studio dataset export as the binary tracker; installs/repairs "
-        "pycolmap and the CUDA ONNX runtime on demand. GPU: a pycolmap CUDA build is "
-        "used in-process when present (Linux/macOS or self-built); on Windows - where "
-        "the pycolmap wheels have no CUDA - the node downloads the CUDA COLMAP build "
-        "and runs feature extraction + matching on the GPU through it, while the "
-        "global mapper stays in-process."
+        "pycolmap and the CUDA ONNX runtime on demand. GPU: SIFT extraction + matching "
+        "run on the GPU - a pycolmap CUDA build in-process when present (Linux/macOS or "
+        "self-built), otherwise the downloaded CUDA COLMAP build (the pycolmap wheels "
+        "have no CUDA on Windows). The mapping (global positioning + bundle adjustment) "
+        "stays on the CPU on every build: COLMAP's global mapper uses a CPU sparse "
+        "solver (SPARSE_SCHUR) unless COLMAP is built with cuDSS. That is expected and "
+        "not a misconfiguration - the mapping is the stage to shrink with frame_step, "
+        "max_features, max_image_size, matcher and sequential_overlap."
     )
 
     # =======================================================================
@@ -271,13 +372,16 @@ class ColmapLichtfeldTracker(GLOMAPLichtfeldTracker):
     def track(self, camera_model, matcher, max_features, images_path="",
               masks_path="", lichtfeld_export_path="", images=None,
               masks_glomap=None, masks_lichtfeld=None, use_rmbg=True,
-              rmbg_mode="base", rmbg_threshold=0.5, rmbg_resize="static",
+              rmbg_mode=RMBG_DEFAULT_MODE, rmbg_threshold=0.5, rmbg_resize="static",
               use_gpu=True, keep_workspace=False, auto_align=True,
               sequential_overlap=15, max_image_size=5120, frame_step=2,
               downscale_factor=1.0, offset_glomap=4, offset_splat=12,
               mapper_backend="global", auto_install_binaries=True,
               embed_alpha_in_images=False, image_format="PNG", jpeg_quality=90,
-              unique_id=None):
+              export_depth_maps=False, dense_max_image_size=1024,
+              dense_geom_consistency=True, fuse_dense_cloud=False,
+              dense_cloud_max_points=400000, mesh_dense_surface=False,
+              mesh_method="poisson", unique_id=None):
         """Run the shared pipeline with the native backend (plus live status)."""
         backend = LEGACY_MAPPER_BACKENDS.get(str(mapper_backend).lower(),
                                              str(mapper_backend).lower())
@@ -317,6 +421,13 @@ class ColmapLichtfeldTracker(GLOMAPLichtfeldTracker):
             embed_alpha_in_images=embed_alpha_in_images,
             image_format=image_format,
             jpeg_quality=jpeg_quality,
+            export_depth_maps=export_depth_maps,
+            dense_max_image_size=dense_max_image_size,
+            dense_geom_consistency=dense_geom_consistency,
+            fuse_dense_cloud=fuse_dense_cloud,
+            dense_cloud_max_points=dense_cloud_max_points,
+            mesh_dense_surface=mesh_dense_surface,
+            mesh_method=mesh_method,
         )
         self._status.finish(self._summary(result))
         # ``ui.text`` is ComfyUI's built-in text preview (see PreviewAny); the live
