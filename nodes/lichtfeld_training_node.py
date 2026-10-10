@@ -1056,7 +1056,6 @@ def build_training_command(
         "--strategy", strategy,
         "--sh-degree", str(int(sh_degree)),
         "--max-cap", str(int(max_cap)),
-        "--steps-scaler", str(float(steps_scaler)),
         "--mask-mode", mask_mode,
         "--bg-mode", bg_mode,
         "--log-level", log_level,
@@ -1068,6 +1067,15 @@ def build_training_command(
     ]
     if bg_mode == "solidcolor":
         command.extend(["--bg-color", color])
+    # Lichtfeld 0.5.4 made --iter and --steps-scaler MUTUALLY EXCLUSIVE:
+    #   "Error: --iter and --steps-scaler are mutually exclusive: --iter sets the iteration
+    #    count exactly, --steps-scaler ..."
+    # 1.0 is a no-op, so the scaler is only sent when it actually scales - and then --iter
+    # has to go, because the build refuses both.
+    if float(steps_scaler) != 1.0:
+        index = command.index("--iter")
+        del command[index:index + 2]
+        command.extend(["--steps-scaler", str(float(steps_scaler))])
     if output_name:
         command.extend(["--output-name", output_name])
     if config_file:

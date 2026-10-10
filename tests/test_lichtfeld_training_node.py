@@ -323,12 +323,15 @@ class LichtfeldCommandTests(unittest.TestCase):
         self.assertEqual(command[0], str(Path(sys.executable)))
         for flag in (
             "--headless", "--train", "--data-path", "--output-path", "--iter",
-            "--strategy", "--sh-degree", "--max-cap", "--steps-scaler",
+            "--strategy", "--sh-degree", "--max-cap",
             "--mask-mode", "--bg-mode", "--bg-color", "--log-file",
             "--output-name", "--config",
             "--centralize=off", "--resize_factor=auto", "--max-width=3840",
         ):
             self.assertIn(flag, command)
+        # 0.5.4 made --iter and --steps-scaler mutually exclusive, so the 1.0 no-op scaler
+        # is never sent (see test_iter_and_steps_scaler_are_never_sent_together).
+        self.assertNotIn("--steps-scaler", command)
         self.assertEqual(command[command.index("--bg-color") + 1], "#FFFFFF")
         self.assertEqual(command[command.index("--mask-mode") + 1], "segment")
         self.assertEqual(command[command.index("--data-path") + 1], "dataset with spaces")
@@ -1046,6 +1049,21 @@ class LichtfeldCommandTests(unittest.TestCase):
             "--enable-sparsity",
         ):
             self.assertIn(flag, command)
+
+    def test_iter_and_steps_scaler_are_never_sent_together(self):
+        # Lichtfeld 0.5.4 rejects both at once:
+        # "Error: --iter and --steps-scaler are mutually exclusive: --iter sets the
+        #  iteration count exactly, --steps-scaler ..."
+        # which made EVERY run fail instantly until the node stopped sending both.
+        plain = build_training_command(**default_command_options())
+        self.assertIn("--iter", plain)
+        self.assertNotIn("--steps-scaler", plain)
+
+        options = default_command_options()
+        options["steps_scaler"] = 2.0
+        scaled = build_training_command(**options)
+        self.assertNotIn("--iter", scaled)
+        self.assertEqual(scaled[scaled.index("--steps-scaler") + 1], "2.0")
 
     def test_rejects_invalid_strategy_and_iterations(self):
         options = default_command_options()
