@@ -35,6 +35,8 @@ _LFS_VALUE_FLAGS = frozenset({
     "--depth-loss-mode", "--depth-loss-weight", "--normal-loss-weight",
     "--normal-consistency-weight", "--normal-flatten-weight", "--normal-loss-space",
     "--normal-start-fraction", "--normal-end-fraction", "--freeze-lr-scale",
+    # 0.5.4: exporting the trained splat needs an explicit --export=<formats>
+    "--export",
 })
 _STUDIO_PROBE_CACHE = {}
 _TAIL_LINES = 80
@@ -1004,6 +1006,7 @@ def build_training_command(
     freeze_lr_scale=None,
     depth_loss_mode="",
     depth_loss_weight=0.0,
+    export_formats="ply",
 ):
     """Build an argument vector for the documented LichtFeld Studio CLI."""
     if int(iterations) < 1:
@@ -1076,6 +1079,13 @@ def build_training_command(
         index = command.index("--iter")
         del command[index:index + 2]
         command.extend(["--steps-scaler", str(float(steps_scaler))])
+    # Lichtfeld 0.5.4 no longer writes splat_<iter>.ply on its own - exporting needs an
+    # explicit --export=<formats> ("Also export the final trained splat next to
+    # project.licht"). Without it a run finishes successfully and leaves NO splat at all,
+    # only the .licht project. 0.5.3 does not know the flag and drops it, still writing its
+    # own PLY, so sending it unconditionally is correct for both builds.
+    if str(export_formats or "").strip():
+        command.extend(["--export", str(export_formats).strip()])
     if output_name:
         command.extend(["--output-name", output_name])
     if config_file:

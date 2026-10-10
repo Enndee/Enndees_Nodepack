@@ -1050,6 +1050,18 @@ class LichtfeldCommandTests(unittest.TestCase):
         ):
             self.assertIn(flag, command)
 
+    def test_export_flag_requests_the_trained_splat(self):
+        # 0.5.4 does NOT write splat_<iter>.ply on its own any more. Without --export a run
+        # finishes "successfully" and leaves no splat at all - only the .licht project -
+        # which is exactly how the whole benchmark came back with 0 splats at first.
+        command = build_training_command(**default_command_options())
+        self.assertIn("--export", command)
+        self.assertEqual(command[command.index("--export") + 1], "ply")
+        self.assertIn("--export", _LFS_VALUE_FLAGS)
+
+        silent = build_training_command(**default_command_options(), export_formats="")
+        self.assertNotIn("--export", silent)
+
     def test_iter_and_steps_scaler_are_never_sent_together(self):
         # Lichtfeld 0.5.4 rejects both at once:
         # "Error: --iter and --steps-scaler are mutually exclusive: --iter sets the
