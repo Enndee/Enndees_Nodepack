@@ -258,10 +258,14 @@ class ColmapLichtfeldTracker(GLOMAPLichtfeldTracker):
         })
         # The face-detail widgets the base class appends: they arrive here BEFORE the
         # dense-MVS block above, which would shift every saved workflow's positional
-        # widget_values. Move them to the very end, in their original order.
+        # widget_values. Move them (and the 2026-10-14 additions) to the very end,
+        # in their original order.
         for name in GLOMAPLichtfeldTracker._face_widgets():
             optional.pop(name, None)
+        for name in GLOMAPLichtfeldTracker._new_widgets():
+            optional.pop(name, None)
         optional.update(GLOMAPLichtfeldTracker._face_widgets())
+        optional.update(GLOMAPLichtfeldTracker._new_widgets())
         return spec
 
     DESCRIPTION = (
@@ -393,6 +397,8 @@ class ColmapLichtfeldTracker(GLOMAPLichtfeldTracker):
               face_frames="", prepare_masks_for_face_detail=False,
               face_mask_mode=FACE_MASK_CUT, face_prompt="face",
               face_threshold=0.75, face_mask_dilate=FACE_MASK_DILATE_DEFAULT,
+              subject_focus="full frame", sharp_selection=False,
+              sharp_method="batched_topn", sharp_batch=4, sharp_num_frames=3,
               unique_id=None):
         """Run the shared pipeline with the native backend (plus live status)."""
         backend = LEGACY_MAPPER_BACKENDS.get(str(mapper_backend).lower(),
@@ -446,6 +452,11 @@ class ColmapLichtfeldTracker(GLOMAPLichtfeldTracker):
             face_prompt=face_prompt,
             face_threshold=face_threshold,
             face_mask_dilate=face_mask_dilate,
+            subject_focus=subject_focus,
+            sharp_selection=sharp_selection,
+            sharp_method=sharp_method,
+            sharp_batch=sharp_batch,
+            sharp_num_frames=sharp_num_frames,
         )
         self._status.finish(self._summary(result))
         # ``ui.text`` is ComfyUI's built-in text preview (see PreviewAny); the live

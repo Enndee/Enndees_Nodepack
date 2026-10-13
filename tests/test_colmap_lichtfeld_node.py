@@ -648,14 +648,17 @@ class NativeNodeTests(unittest.TestCase):
             self.assertEqual(native_types["required"][name],
                              binary_types["required"][name], name)
 
+        added_new = list(binary.GLOMAPLichtfeldTracker._new_widgets())
         expected_optional = [name for name in binary_types["optional"]
                              if name not in self.REMOVED_OPTIONAL
-                             and name not in self.ADDED_FACE_OPTIONAL]
-        # ... plus the depth-export widgets, and then the face-detail block, both
-        # appended last so existing workflows keep their widget_values positions
+                             and name not in self.ADDED_FACE_OPTIONAL
+                             and name not in added_new]
+        # ... plus the depth-export widgets, then the face-detail block, then the
+        # 2026-10-14 additions - all appended last so existing workflows keep their
+        # widget_values positions
         self.assertEqual(list(native_types["optional"]),
                          expected_optional + list(self.ADDED_OPTIONAL)
-                         + list(self.ADDED_FACE_OPTIONAL))
+                         + list(self.ADDED_FACE_OPTIONAL) + added_new)
         for name in expected_optional:
             if name in self.OVERRIDDEN:
                 continue

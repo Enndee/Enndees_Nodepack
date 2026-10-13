@@ -48,21 +48,8 @@ class Enndee_SharpnessAnalyzer:
                    "Selector node.")
 
     def analyze_sharpness(self, images):
-        try:
-            import cv2
-        except Exception as exc:  # cv2 ships with ComfyUI
-            raise RuntimeError("Sharpness Analyzer (Enndee) needs OpenCV "
-                               "(cv2): {}".format(exc))
-
         _log("Scoring {} frames...".format(len(images)))
-        scores = []
-        for index in range(len(images)):
-            frame = images[index].cpu().numpy()
-            if frame.dtype != np.uint8:
-                frame = (np.clip(frame, 0.0, 1.0) * 255.0).astype(np.uint8)
-            gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-            scores.append(float(cv2.Laplacian(gray, cv2.CV_64F).var()))
-        return (scores,)
+        return (laplacian_scores(images),)
 
 
 class Enndee_SharpFrameSelector:
@@ -198,6 +185,43 @@ class Enndee_SharpFrameSelector:
         empty = torch.zeros((1, height, width, channels),
                             dtype=images.dtype, device=images.device)
         return (empty, 0)
+
+
+def laplacian_scores(images):
+    """Laplacian-variance score per frame of an IMAGE batch (higher = sharper).
+
+    Shared by the Sharpness Analyzer node and the COLMAP/GLOMAP trackers'
+    in-tracker sharp selection.
+    """
+    try:
+        import cv2
+    except Exception as exc:  # cv2 ships with ComfyUI
+        raise RuntimeError("Sharp frame selection needs OpenCV (cv2): {}".format(exc))
+
+    scores = []
+    for index in range(len(images)):
+        frame = images[index].cpu().numpy()
+        if frame.dtype != np.uint8:
+            frame = (np.clip(frame, 0.0, 1.0) * 255.0).astype(np.uint8)
+        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+        scores.append(float(cv2.Laplacian(gray, cv2.CV_64F).var()))
+    return scores
+
+
+def select_frames(scores, selection_method="batched_topn", batch_size=4,
+                  num_frames=3, batch_buffer=0, min_sharpness=0.0):
+    """Original batch indices to keep (ascending) - the single source of truth.
+
+    Shared by the Sharp Frame Selector node and the trackers' in-tracker selection,
+    so both pick exactly the same frames for the same scores and parameters.
+    """
+    if selection_method == "batched_topn":
+        return Enndee_SharpFrameSelector._select_batched_topn(
+            scores, batch_size, batch_buffer, num_frames, min_sharpness)
+    if selection_method == "batched":
+        return Enndee_SharpFrameSelector._select_batched(
+            scores, batch_size, batch_buffer, min_sharpness)
+    return Enndee_SharpFrameSelector._select_best_n(scores, num_frames, min_sharpness)
 
 
 NODE_CLASS_MAPPINGS = {

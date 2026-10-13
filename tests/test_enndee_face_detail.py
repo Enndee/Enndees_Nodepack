@@ -263,13 +263,15 @@ class FaceMaskTests(unittest.TestCase):
 class WidgetContractTests(unittest.TestCase):
     """The pack's rule: new widgets go LAST, or saved workflows shift."""
 
-    def test_both_tracker_nodes_offer_the_same_face_widgets_last(self):
+    def test_both_tracker_nodes_offer_the_same_trailing_widgets(self):
         import colmap_lichtfeld_node as colmap_mod
 
-        expected = list(glomap_mod.GLOMAPLichtfeldTracker._face_widgets())
+        face = list(glomap_mod.GLOMAPLichtfeldTracker._face_widgets())
+        added = list(glomap_mod.GLOMAPLichtfeldTracker._new_widgets())
         for cls in (glomap_mod.GLOMAPLichtfeldTracker, colmap_mod.ColmapLichtfeldTracker):
             optional = list(cls.INPUT_TYPES()["optional"])
-            self.assertEqual(optional[-len(expected):], expected, cls.__name__)
+            self.assertEqual(optional[-len(face) - len(added):], face + added,
+                             cls.__name__)
 
     def test_the_dense_mvs_widgets_keep_their_positions(self):
         """The pycolmap subclass must re-append the face widgets after its own."""

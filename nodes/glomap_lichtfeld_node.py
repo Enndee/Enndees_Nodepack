@@ -288,9 +288,11 @@ class GLOMAPLichtfeldTracker:
                 "use_rmbg": ("BOOLEAN", {
                     "default": True,
                     **tooltip(
-                        "Run the built in RMBG background removal (RMBG-2.0 "
-                        "by default, see rmbg_mode). The alpha channel is "
-                        "reused as the Lichtfeld splat mask. Disable when "
+                        "Use RMBG for COLMAP: run the built in RMBG background "
+                        "removal (RMBG-2.0 by default, see rmbg_mode). The alpha "
+                        "channel is reused as the Lichtfeld splat mask AND - with "
+                        "Subject Focus 'subject only' - as the feature mask that "
+                        "focuses the camera alignment on the subject. Disable when "
                         "masks come from other nodes."
                     ),
                 }),
@@ -437,6 +439,9 @@ class GLOMAPLichtfeldTracker:
                 # The face-detail mask pass - appended LAST, so no saved workflow's
                 # positional widget_values move. See `_face_widgets`.
                 **cls._face_widgets(),
+                # 2026-10-14 additions, appended AFTER the face widgets on BOTH
+                # tracker nodes (same widget-order rule). See `_new_widgets`.
+                **cls._new_widgets(),
             },
         }
 
@@ -525,6 +530,65 @@ class GLOMAPLichtfeldTracker:
             }),
         }
 
+    @staticmethod
+    def _new_widgets():
+        """Widgets added 2026-10-14 - appended AFTER the face widgets on both nodes.
+
+        `subject_focus` mirrors the VGGT node's control of the same name: 'subject only'
+        restricts the ALIGNMENT to the subject - for COLMAP that means the SIFT feature
+        masks are derived from the subject mask (RMBG / RGBA alpha / masks_lichtfeld)
+        with the background excluded. `sharp_selection` folds the standalone Sharp Frame
+        Selector Top-N into the tracker, which is the only way `face_frames` survives
+        the deletion: the tracker remaps the indices onto the kept frames and writes
+        `sharp_selection.json` next to the dataset for the record.
+        """
+        return {
+            "subject_focus": (["full frame", "subject only"], {
+                "default": "full frame",
+                **tooltip(
+                    "Subject-focused camera alignment (the VGGT node's control of "
+                    "the same name). 'full frame' extracts SIFT features everywhere. "
+                    "'subject only' derives the GLOMAP feature masks from the "
+                    "subject mask ('Use RMBG for COLMAP', the RGBA alpha channel or "
+                    "masks_lichtfeld) with the BACKGROUND excluded, so the camera "
+                    "alignment locks onto the subject instead of on hallucinated or "
+                    "drifting background detail. Explicit masks_glomap / masks_path "
+                    "always win when connected."
+                ),
+            }),
+            "sharp_selection": ("BOOLEAN", {
+                "default": False,
+                **tooltip(
+                    "Sharp Frame Selection (the Sharp Frame Selector Top-N logic, "
+                    "folded into the tracker). ON: only the sharpest frames are "
+                    "tracked AND exported - and because the selection happens HERE, "
+                    "the face_frames indices are remapped onto the kept frames "
+                    "instead of silently pointing at the wrong images. Kept and "
+                    "dropped ORIGINAL frame numbers are written to "
+                    "sharp_selection.json in the dataset folder. OFF: every frame "
+                    "is used (frame_step still applies)."
+                ),
+            }),
+            "sharp_method": (["batched_topn", "batched", "best_n"], {
+                "default": "batched_topn",
+                **tooltip(
+                    "batched_topn: keep the top 'Sharp Num Frames' of every 'Sharp "
+                    "Batch' chunk (e.g. the 3 sharpest of every 4 - even coverage). "
+                    "batched: keep only the single sharpest frame of every chunk. "
+                    "best_n: the globally sharpest 'Sharp Num Frames' frames."
+                ),
+            }),
+            "sharp_batch": ("INT", {
+                "default": 4, "min": 2, "max": 64, "step": 1,
+                **tooltip("Chunk size for the batched_topn / batched methods."),
+            }),
+            "sharp_num_frames": ("INT", {
+                "default": 3, "min": 1, "max": 64, "step": 1,
+                **tooltip("Frames to keep per chunk (batched_topn) or in total "
+                          "(best_n)."),
+            }),
+        }
+
     # The native pycolmap node ("COLMAP for Lichtfeld (Enndee)") overrides these
     # two hooks; everything below the backend setup is shared verbatim.
     BACKEND_READY_MESSAGE = "Binary setup complete"
@@ -550,7 +614,9 @@ class GLOMAPLichtfeldTracker:
                mesh_method="poisson",
                face_frames="", prepare_masks_for_face_detail=False,
                face_mask_mode=FACE_MASK_CUT, face_prompt="face",
-               face_threshold=0.75, face_mask_dilate=FACE_MASK_DILATE_DEFAULT):
+               face_threshold=0.75, face_mask_dilate=FACE_MASK_DILATE_DEFAULT,
+               subject_focus="full frame", sharp_selection=False,
+               sharp_method="batched_topn", sharp_batch=4, sharp_num_frames=3):
         """Run the complete tracking + export pipeline for one frame batch."""
 
         # ---------- 1. Make sure COLMAP / GLOMAP are available ------------
@@ -578,6 +644,39 @@ class GLOMAPLichtfeldTracker:
             f"({export_images.shape[2]}x{export_images.shape[1]}), "
             f"source={'folder' if images_from_path else 'IMAGE input'}")
 
+        # ---------- 2.5 Sharp-frame selection (optional) ------------------
+        # Runs HERE - before the face-detail pass - because `face_frames` numbers are
+        # indices into THIS batch; deleting frames upstream of the tracker is exactly
+        # what used to make the face masks land on the wrong images. The ORIGINAL
+        # frame numbers are kept in `sharp_record` and written to sharp_selection.json.
+        kept_indices = None
+        sharp_record = None
+        if sharp_selection:
+            kept_indices = self._select_sharp_indices(
+                export_images, sharp_method, sharp_batch, sharp_num_frames)
+            kept_set = set(kept_indices)
+            dropped = [index for index in range(frame_total) if index not in kept_set]
+            sharp_record = {
+                "selection_method": str(sharp_method),
+                "batch_size": int(sharp_batch),
+                "num_frames": int(sharp_num_frames),
+                "input_frames": frame_total,
+                "kept_input_indices": list(kept_indices),
+                "dropped_input_indices": dropped,
+                "face_frames_input": str(face_frames or ""),
+            }
+            if not dropped:
+                log(f"sharp selection ({sharp_method}): kept all {frame_total} frames")
+                kept_indices = None
+            else:
+                export_images = export_images[kept_indices]
+                sf_images = sf_images[kept_indices]
+                face_frames = self._remap_face_frames(face_frames, kept_indices)
+                sharp_record["face_frames_selected"] = str(face_frames or "")
+                log(f"sharp selection ({sharp_method}): kept {len(kept_indices)} of "
+                    f"{frame_total} frames (dropped {len(dropped)}); face_frames "
+                    f"remapped onto the kept frames")
+
         # ---------- 3. Background removal (optional) ---------------------
         alpha_images = None  # RGBA batch used for alpha based splat masks
         if isinstance(export_images, torch.Tensor) and export_images.shape[-1] == 4:
@@ -597,6 +696,31 @@ class GLOMAPLichtfeldTracker:
             masks_glomap, masks_path, downscale_factor, offset_glomap, "GLOMAP")
         masks_lichtfeld = self._prepare_masks(
             masks_lichtfeld, "", 1.0, offset_splat, "Lichtfeld")
+
+        # Subject-focused alignment: derive the GLOMAP feature masks from the
+        # subject mask (background = excluded) when nothing explicit connected.
+        # Explicit masks_glomap / masks_path always win.
+        if masks_glomap is None and str(subject_focus) == "subject only":
+            subject = masks_lichtfeld if masks_lichtfeld is not None else \
+                self._alpha_subject(alpha_images)
+            if subject is not None:
+                masks_glomap = self._prepare_masks(
+                    1.0 - subject, "", downscale_factor, offset_glomap, "GLOMAP")
+                log("subject_focus='subject only': GLOMAP feature masks derived "
+                    "from the subject mask (background excluded from feature "
+                    "extraction)")
+            else:
+                log_warn("subject_focus='subject only' but no subject mask is "
+                         "available (enable 'Use RMBG for COLMAP', connect "
+                         "masks_lichtfeld or RGBA images) - tracking the full frame")
+
+        # The sharp selection ran on the full input batch above; mask tensors are
+        # aligned with THAT batch, so they follow the same selection here.
+        if kept_indices is not None:
+            masks_glomap = self._subset_prepared_masks(
+                masks_glomap, kept_indices, frame_total, "GLOMAP")
+            masks_lichtfeld = self._subset_prepared_masks(
+                masks_lichtfeld, kept_indices, frame_total, "Lichtfeld")
 
         # ---------- 4.5 Face-detail masks (optional) --------------------
         # Runs BEFORE the frame stepping, so the frame numbers the camera node reports
@@ -643,6 +767,7 @@ class GLOMAPLichtfeldTracker:
         has_alpha = bool(alpha_images is not None and alpha_images.shape[-1] == 4)
 
         if export_dir is not None:
+            self._write_sharp_selection_sidecar(export_dir, sharp_record)
             self._export_dataset_images(
                 export_dir, export_images, alpha_images,
                 embed_alpha=bool(embed_alpha_in_images),
@@ -996,6 +1121,82 @@ class GLOMAPLichtfeldTracker:
 
         log(f"{label} masks ready: {tuple(masks.shape)}")
         return masks
+
+    # =======================================================================
+    # Helpers: sharp-frame selection + subject focus (2026-10-14)
+    # =======================================================================
+
+    @staticmethod
+    def _select_sharp_indices(images, selection_method, batch_size, num_frames):
+        """Original batch indices to keep, ascending (never empty)."""
+        from enndee_sharp_selector import laplacian_scores, select_frames
+
+        scores = laplacian_scores(images)
+        kept = select_frames(scores, str(selection_method), int(batch_size),
+                             int(num_frames))
+        if not kept:
+            log_warn("sharp selection removed every frame - keeping the full batch")
+            return list(range(int(images.shape[0])))
+        return sorted(kept)
+
+    @staticmethod
+    def _remap_face_frames(face_frames, kept_indices):
+        """Map face_frames (input-batch space) onto the sharp-selected batch."""
+        text = str(face_frames or "").strip()
+        if not text:
+            return ""
+        positions = {original: position
+                     for position, original in enumerate(kept_indices)}
+        kept_tokens, dropped_tokens = [], []
+        for token in text.replace(";", ",").split(","):
+            token = token.strip()
+            if not token:
+                continue
+            try:
+                value = int(float(token))
+            except ValueError:
+                dropped_tokens.append(token)
+                continue
+            if value in positions:
+                kept_tokens.append(str(positions[value]))
+            else:
+                dropped_tokens.append(token)
+        if dropped_tokens:
+            log_warn(f"sharp selection removed face frame(s) {dropped_tokens} - "
+                     f"only the kept frames can carry the face detail")
+        return ",".join(kept_tokens)
+
+    @staticmethod
+    def _subset_prepared_masks(masks, kept_indices, original_count, label):
+        """Slice prepared masks that still span the full input batch."""
+        if masks is None:
+            return None
+        if int(masks.shape[0]) != int(original_count):
+            return masks          # already selection-sized (e.g. derived from alpha)
+        subset = masks[kept_indices]
+        log(f"{label} masks follow the sharp selection: {tuple(subset.shape)}")
+        return subset
+
+    @staticmethod
+    def _alpha_subject(alpha_images):
+        """[N,1,H,W] 'white = keep = subject' from an RGBA batch's alpha channel."""
+        if alpha_images is None or alpha_images.shape[-1] != 4:
+            return None
+        return alpha_images[..., 3].unsqueeze(1).contiguous()
+
+    @staticmethod
+    def _write_sharp_selection_sidecar(export_dir, record):
+        """sharp_selection.json: which ORIGINAL frames the selection kept/dropped."""
+        if not record or export_dir is None:
+            return
+        import json
+
+        path = export_dir / "sharp_selection.json"
+        try:
+            path.write_text(json.dumps(record, indent=2), encoding="utf-8")
+            log(f"sharp selection record: {path}")
+        except Exception as exc:  # noqa: BLE001
+            log_warn(f"could not write sharp_selection.json: {exc}")
 
     # =======================================================================
     # Helpers: face-detail masks

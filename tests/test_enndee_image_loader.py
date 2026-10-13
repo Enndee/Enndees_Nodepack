@@ -75,21 +75,29 @@ class ImageLoaderResizeEnndeeTests(unittest.TestCase):
         self.assertEqual(
             loader.ImageLoaderResizeEnndee.RETURN_NAMES,
             ("image", "original_image", "mask", "width", "height", "image_path",
-             "megapixels"),
+             "megapixels", "file_name"),
         )
+        self.assertEqual(len(loader.ImageLoaderResizeEnndee.RETURN_TYPES), 8)
 
     def test_resize_off_keeps_original_and_reports_source_size(self):
         name = self.gradient("photo.png", 8, 4)
-        image, original, mask, width, height, image_path, _mp = self.load(image=name)
+        image, original, mask, width, height, image_path, _mp, _name = self.load(image=name)
         self.assertTrue(torch.equal(image, original))
         self.assertEqual(tuple(image.shape), (1, 4, 8, 3))
         self.assertEqual((width, height), (8, 4))
         self.assertEqual(Path(image_path), self.input_dir / name)
         self.assertTrue(torch.equal(mask, torch.zeros_like(mask)))
 
+    def test_the_eighth_output_is_the_file_name_stem(self):
+        self.gradient("holiday_photo.png", 8, 4)
+        image, original, mask, width, height, path, _mp, file_name = self.load(
+            image="holiday_photo.png")
+        self.assertEqual(file_name, "holiday_photo")
+        self.assertEqual(tuple(image.shape), (1, 4, 8, 3))
+
     def test_scale_dimensions_stretches_without_keep_proportion(self):
         name = self.gradient("photo.png", 8, 4)
-        image, _original, mask, width, height, _path, _mp = self.load(
+        image, _original, mask, width, height, _path, _mp, _name = self.load(
             image=name, resize=True, width=16, height=16, keep_proportion=False)
         self.assertEqual((width, height), (16, 16))
         self.assertEqual(tuple(image.shape), (1, 16, 16, 3))
@@ -98,7 +106,7 @@ class ImageLoaderResizeEnndeeTests(unittest.TestCase):
 
     def test_keep_proportion_pads_with_background_color(self):
         name = self.gradient("photo.png", 16, 8)
-        image, _original, mask, width, height, _path, _mp = self.load(
+        image, _original, mask, width, height, _path, _mp, _name = self.load(
             image=name, resize=True, width=16, height=16, keep_proportion=True,
             background_color="#ff0000")
         self.assertEqual((width, height), (16, 16))
@@ -109,7 +117,7 @@ class ImageLoaderResizeEnndeeTests(unittest.TestCase):
 
     def test_divisible_by_snaps_the_target_size(self):
         name = self.gradient("photo.png", 16, 8)
-        image, _original, _mask, width, height, _path, _mp = self.load(
+        image, _original, _mask, width, height, _path, _mp, _name = self.load(
             image=name, resize=True, width=20, height=10, keep_proportion=False,
             divisible_by=8)
         self.assertEqual((width, height), (16, 8))
@@ -118,22 +126,22 @@ class ImageLoaderResizeEnndeeTests(unittest.TestCase):
 
     def test_no_upscale_keeps_the_source_size(self):
         name = self.gradient("photo.png", 16, 8)
-        source, _original, _mask, _w, _h, _path, _mp = self.load(image=name)
+        source, _original, _mask, _w, _h, _path, _mp, _name = self.load(image=name)
 
-        image, _original, _mask, width, height, _path, _mp = self.load(
+        image, _original, _mask, width, height, _path, _mp, _name = self.load(
             image=name, resize=True, width=64, height=64, keep_proportion=False,
             no_upscale=True)
         self.assertEqual((width, height), (16, 8))
         self.assertTrue(torch.equal(image, source))
 
-        image, _original, _mask, width, height, _path, _mp = self.load(
+        image, _original, _mask, width, height, _path, _mp, _name = self.load(
             image=name, resize=True, resize_type="scale by multiplier", multiplier=2.0,
             no_upscale=True)
         self.assertEqual((width, height), (16, 8))
         self.assertTrue(torch.equal(image, source))
 
         # keep_proportion still fills the requested canvas with the background.
-        image, _original, mask, width, height, _path, _mp = self.load(
+        image, _original, mask, width, height, _path, _mp, _name = self.load(
             image=name, resize=True, width=64, height=64, keep_proportion=True,
             background_color="#ff0000", no_upscale=True)
         self.assertEqual((width, height), (64, 64))
@@ -143,7 +151,7 @@ class ImageLoaderResizeEnndeeTests(unittest.TestCase):
         self.assertEqual(tuple(mask.shape), (1, 64, 64))
 
         # Downscaling still works with no_upscale enabled.
-        image, _original, _mask, width, height, _path, _mp = self.load(
+        image, _original, _mask, width, height, _path, _mp, _name = self.load(
             image=name, resize=True, width=8, height=4, keep_proportion=False,
             no_upscale=True)
         self.assertEqual((width, height), (8, 4))
@@ -151,46 +159,46 @@ class ImageLoaderResizeEnndeeTests(unittest.TestCase):
 
     def test_multiplier_longer_and_shorter_modes(self):
         name = self.gradient("photo.png", 16, 8)
-        image, _original, _mask, width, height, _path, _mp = self.load(
+        image, _original, _mask, width, height, _path, _mp, _name = self.load(
             image=name, resize=True, resize_type="scale by multiplier", multiplier=1.5,
             divisible_by=1)
         self.assertEqual((width, height), (24, 12))
-        _image, _original, _mask, width, height, _path, _mp = self.load(
+        _image, _original, _mask, width, height, _path, _mp, _name = self.load(
             image=name, resize=True, resize_type="scale longer dimension", longer_size=512)
         self.assertEqual((width, height), (512, 256))
-        _image, _original, _mask, width, height, _path, _mp = self.load(
+        _image, _original, _mask, width, height, _path, _mp, _name = self.load(
             image=name, resize=True, resize_type="scale shorter dimension", shorter_size=512)
         self.assertEqual((width, height), (1024, 512))
 
     def test_width_and_height_modes_follow_the_source_aspect(self):
         name = self.gradient("photo.png", 16, 8)
-        _image, _original, _mask, width, height, _path, _mp = self.load(
+        _image, _original, _mask, width, height, _path, _mp, _name = self.load(
             image=name, resize=True, resize_type="scale width", width=100, divisible_by=1)
         self.assertEqual((width, height), (100, 50))
-        _image, _original, _mask, width, height, _path, _mp = self.load(
+        _image, _original, _mask, width, height, _path, _mp, _name = self.load(
             image=name, resize=True, resize_type="scale height", height=100, divisible_by=1)
         self.assertEqual((width, height), (200, 100))
 
     def test_total_pixels_match_size_and_multiple_modes(self):
         name = self.gradient("photo.png", 16, 8)
-        _image, _original, _mask, width, height, _path, _mp = self.load(
+        _image, _original, _mask, width, height, _path, _mp, _name = self.load(
             image=name, resize=True, resize_type="scale total pixels", megapixels=0.125,
             divisible_by=1)
         self.assertEqual((width, height), (512, 256))
 
         match = torch.zeros((1, 30, 40, 3), dtype=torch.float32)
-        image, _original, mask, width, height, _path, _mp = self.load(
+        image, _original, mask, width, height, _path, _mp, _name = self.load(
             image=name, resize=True, resize_type="match size", match=match)
         self.assertEqual((width, height), (40, 30))
         self.assertEqual(tuple(image.shape), (1, 30, 40, 3))
         self.assertEqual(tuple(mask.shape), (1, 30, 40))
 
-        _image, _original, _mask, width, height, _path, _mp = self.load(
+        _image, _original, _mask, width, height, _path, _mp, _name = self.load(
             image=name, resize=True, resize_type="match size")
         self.assertEqual((width, height), (512, 512))
 
         wide = self.gradient("wide.png", 22, 10)
-        image, _original, mask, width, height, _path, _mp = self.load(
+        image, _original, mask, width, height, _path, _mp, _name = self.load(
             image=wide, resize=True, resize_type="scale to multiple", multiple=8,
             scale_method="area")
         self.assertEqual((width, height), (16, 8))
@@ -207,19 +215,19 @@ class ImageLoaderResizeEnndeeTests(unittest.TestCase):
         rgba[..., 1] = 128
         rgba[..., 3] = alpha_values[None, :]
         name = self.write_png("ramp.png", rgba, mode="RGBA")
-        _image, _original, mask, _w, _h, _path, _mp = self.load(image=name, mask_channel="alpha")
+        _image, _original, mask, _w, _h, _path, _mp, _name = self.load(image=name, mask_channel="alpha")
         expected_alpha = torch.from_numpy(alpha_values / 255.0).to(torch.float32)[None, None, :].expand(1, 4, 8)
         self.assertTrue(torch.allclose(mask, 1.0 - expected_alpha, atol=1e-6))
-        _image, _original, mask, _w, _h, _path, _mp = self.load(image=name, mask_channel="green")
+        _image, _original, mask, _w, _h, _path, _mp, _name = self.load(image=name, mask_channel="green")
         self.assertTrue(torch.allclose(mask, torch.full((1, 4, 8), 128 / 255.0), atol=1e-6))
 
         plain = self.gradient("plain.png", 8, 4)
-        _image, _original, mask, _w, _h, _path, _mp = self.load(image=plain, mask_channel="alpha")
+        _image, _original, mask, _w, _h, _path, _mp, _name = self.load(image=plain, mask_channel="alpha")
         self.assertTrue(torch.equal(mask, torch.zeros((1, 4, 8))))
 
     def test_repeat_expands_the_batch(self):
         name = self.gradient("photo.png", 8, 4)
-        image, original, mask, _w, _h, _path, _mp = self.load(image=name, repeat=3)
+        image, original, mask, _w, _h, _path, _mp, _name = self.load(image=name, repeat=3)
         self.assertEqual(tuple(image.shape), (3, 4, 8, 3))
         self.assertEqual(tuple(original.shape), (3, 4, 8, 3))
         self.assertEqual(tuple(mask.shape), (3, 4, 8))
@@ -237,7 +245,7 @@ class ImageLoaderResizeEnndeeTests(unittest.TestCase):
                            lossless=True)
         except (OSError, ValueError) as error:
             self.skipTest(f"WebP encoding unavailable: {error}")
-        image, original, _mask, _w, _h, _path, _mp = self.load(image="anim.webp")
+        image, original, _mask, _w, _h, _path, _mp, _name = self.load(image="anim.webp")
         self.assertEqual(tuple(image.shape), (3, 4, 8, 3))
         self.assertEqual(tuple(original.shape), (3, 4, 8, 3))
         self.assertGreater(float(image[0][0, 0, 0]), 0.9)
@@ -288,7 +296,7 @@ class ImageLoaderResizeEnndeeTests(unittest.TestCase):
             multiplier=1.0, longer_size=512, shorter_size=512,
             multiple=8, scale_method="lanczos",
         )
-        _image, _original, _mask, width, height, _path, _mp = node.load(**kwargs)
+        _image, _original, _mask, width, height, _path, _mp, _name = node.load(**kwargs)
         self.assertEqual((width, height), (1448, 724))  # spec default 1.0 MP
 
     def test_legacy_megapixels_in_kwarg_is_still_honoured(self):
