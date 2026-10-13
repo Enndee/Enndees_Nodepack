@@ -189,10 +189,12 @@ BACK_ORBIT_HOME_FACTOR = 1.0                         # the 8 o'clock -> dial-cen
 ORBIT_VIEW_ANGLE_DEFAULT = 0.0    # deg, 0 = the orbit is centred on the frontal view
 ORBIT_VIEW_ANGLE_MIN = -180.0
 ORBIT_VIEW_ANGLE_MAX = 360.0
-ORBIT_COVERAGES = ("Front only", "Front and Back", "Spiral", "Banded Orbits")
+ORBIT_COVERAGES = ("Front only", "Front and Back", "Spiral", "Banded Orbits",
+                   "Banded Orbits Front & Back")
 ORBIT_COVERAGE_DEFAULT = ORBIT_COVERAGES[1]
 SPIRAL_COVERAGE = ORBIT_COVERAGES[2]
 BAND_COVERAGE = ORBIT_COVERAGES[3]
+BAND_FRONT_BACK_COVERAGE = ORBIT_COVERAGES[4]
 ORBIT_COVERAGE_DEGREES = 180.0    # deg from the front circle's middle to the back circle's middle
                                   # (the level connection stops one O radius short of this, at the
                                   # back orbit's own edge - see `_back_orbit_point`)
@@ -208,6 +210,40 @@ ORBIT_CUT_TARGET = 0.96           # the cut aims a touch *below* the cap: the an
 ORBIT_CUT_STEPS = 3
 ORBIT_DIRECTIONS = ("counter-clockwise", "clockwise")
 ORBIT_DIRECTION_DEFAULT = ORBIT_DIRECTIONS[0]
+
+# How the camera LOOKS along an automatic path.
+#   * 'Pivot point' (the default) aims every pose at the pivot itself: the subject stays
+#     centred and its apparent size holds, because the camera orbits the pivot on a
+#     sphere and every pose is exactly one radius from it.
+#   * 'Horizontally straight' keeps the forward LEVEL: the camera aims at the vertical
+#     AXIS through the pivot at its OWN height, so the horizon stays straight and the
+#     subject keeps its place horizontally while the camera rides up and down the bands.
+#     Because a level look wants a level stand-off, this mode also moves the camera onto
+#     a CYLINDER around that axis (see `_place`): the straight (perpendicular) distance
+#     to the axis is then the same on every orbit, which is what the subject's width
+#     needs to stay constant. The heights the poses visit are unchanged.
+ORBIT_LOOK_MODES = ("Pivot point", "Horizontally straight")
+ORBIT_LOOK_DEFAULT = ORBIT_LOOK_MODES[0]
+HORIZONTAL_LOOK = ORBIT_LOOK_MODES[1]
+
+#: The look mode the estimate being built uses (module state, set by `estimate_camera_path`).
+_ACTIVE_LOOK_MODE = ORBIT_LOOK_DEFAULT
+
+
+def look_mode():
+    """How the estimate being built looks along the path - one of `ORBIT_LOOK_MODES`."""
+    return _ACTIVE_LOOK_MODE
+
+
+def resolve_look_mode(mode=None):
+    """Validate an `auto_orbit_look` widget value; `None` keeps `ORBIT_LOOK_DEFAULT`."""
+    if mode is None:
+        return ORBIT_LOOK_DEFAULT
+    text = str(mode).strip()
+    if text not in ORBIT_LOOK_MODES:
+        raise ValueError(f"Unknown orbit look {mode!r}; choose {', '.join(ORBIT_LOOK_MODES)}.")
+    return text
+
 
 # The Spiral coverage (2026-10-05, redefined by the user's spec; 2026-10-06, the O-orbit family):
 # the camera travels on a SPHERE around the pivot - the pivot is the centre, the camera keeps its
@@ -367,6 +403,30 @@ BAND_STEP_MIN = 0.0
 BAND_STEP_MAX = 90.0
 BAND_ELEVATION_LIMIT = 88.0       # deg: keep the look/up frame away from the poles
 BAND_MIN_STEP = 5.0               # deg, below this the auto step is degenerate
+
+# --- "Banded Orbits Front & Back": the band stack, mirrored onto the back ---------
+# The fifth coverage. It flies the SAME stack as "Banded Orbits" - the same widgets,
+# the same choreography - but does not stop at the top: from the end of the HIGHEST
+# band the camera carries on to that pose's MIRROR on the back side (every azimuth
+# +180 deg, the same elevation) and then walks the stack back DOWN the bands there,
+# mirrored and in reverse. Front and back get the identical visit, so the top and the
+# bottom of the subject are seen from both sides in one continuous, roll-free move.
+#
+#   * the FRONT half is exactly `_band_legs` - band 0 (the lowest, at Band Start
+#     Angle) first, climbing to the last one,
+#   * the top band's sweep is then EXTENDED - the same heading, no turn - until it
+#     reaches the mirror of its own start on the far side. That bridge is
+#     `BAND_FRONT_BACK_TURN - Band Width` deg (a half turn when the band is 180 deg
+#     wide, nothing at all then), so the camera never doubles back and no arc is
+#     shown twice,
+#   * the BACK half is the SAME bands on the far side (azimuth +180 deg), highest
+#     first, each swept the way its front twin was, stepping back down to the lowest.
+#
+# The frames are still split by the legs' travel on the sphere (the bridge included),
+# so the camera holds one angular speed over both halves. Every pose lives on the
+# orbit sphere (`_place`), so the radius and the framing never change, and the path is
+# levelled to the world up exactly like the plain band stack.
+BAND_FRONT_BACK_TURN = 180.0      # deg, the azimuth between a band and its mirror on the back
 
 # The node's band widgets travel the same way as the O Orbit Angle and the spiral
 # ones: module globals, set and restored around the estimate by `estimate_camera_path`.
@@ -738,19 +798,44 @@ def _fit_amplitude(samples_of, budget_per_frame, ladder=AMPLITUDE_STEPS):
 
 
 def _place(centre, radius, yaw_degrees, elevation_degrees):
-    """Camera position on the orbit sphere around `centre`.
+    """Camera position on the orbit surface around `centre`.
 
     Yaw 0 sits *between* the centre and the source camera (the origin), positive yaw moves to the
     subject's right; elevation 0 is level with the centre, positive is above it (the OpenCV frame
     has y pointing down). That is the Camera Path Configurator's convention (`_yaw_direction`):
     the source camera at the origin is the closest possible viewpoint of the subject.
+
+    The SURFACE follows the active look mode (`look_mode`). 'Pivot point' orbits the
+    SPHERE of radius `radius`, so every pose is exactly one radius from the pivot.
+    'Horizontally straight' orbits the CYLINDER of that radius around the vertical axis
+    through `centre` instead - the horizontal stand-off is `radius` at every elevation
+    (the level look's constant subject width) while the height follows the elevation
+    exactly as the sphere would have placed it.
     """
     yaw = math.radians(yaw_degrees)
     elevation = math.radians(elevation_degrees)
-    offset = (math.cos(elevation) * math.sin(yaw),
-              -math.sin(elevation),
-              -math.cos(elevation) * math.cos(yaw))
+    if _ACTIVE_LOOK_MODE == HORIZONTAL_LOOK:
+        offset = (math.sin(yaw), -math.sin(elevation), -math.cos(yaw))
+    else:
+        offset = (math.cos(elevation) * math.sin(yaw),
+                  -math.sin(elevation),
+                  -math.cos(elevation) * math.cos(yaw))
     return [float(centre[axis]) + offset[axis] * radius for axis in range(3)]
+
+
+def _aim(centre, position):
+    """The point a pose aims at: the pivot itself, or the axis point level with the camera.
+
+    'Pivot point' looks at `centre`. 'Horizontally straight' looks at the vertical axis
+    through `centre` at the camera's OWN height, which leaves the forward level (its `y`
+    component is zero) so the horizon stays straight and the subject keeps its horizontal
+    place while the camera rides up and down. Both are expressed as a point, so the whole
+    pipeline - the drift and visibility measurements, the framing and the emitted keys -
+    can share one aim.
+    """
+    if _ACTIVE_LOOK_MODE == HORIZONTAL_LOOK:
+        return [float(centre[0]), float(position[1]), float(centre[2])]
+    return [float(centre[0]), float(centre[1]), float(centre[2])]
 
 
 def front_camera(pivot, distance):
@@ -830,15 +915,18 @@ def _decimate(points, limit):
 def _look_axes(points, camera_position, pivot, frame=None):
     """(x, y, z) of `points` in a camera frame - renderer convention (right, down, forward).
 
-    `frame` is the (right, down) pair to measure in - pass the levelled pair for a pose inside a
-    sequence (`fast_depth.camera_frames`) so the measurement matches the render exactly. It defaults
-    to the isolated pose's own pair (zero roll from the estimate's `roll_up` - the world up, or a
-    sloped spiral's own up), which is the same `camera_frames` would pick: a pixel measured here is
-    a pixel the renderer would produce.
+    The forward is `_aim(pivot, camera_position) - camera_position`, i.e. the pose's aim
+    under the active look mode (the pivot itself, or the level look at the axis). `frame`
+    is the (right, down) pair to measure in - pass the levelled pair for a pose inside a
+    sequence (`fast_depth.camera_frames`) so the measurement matches the render exactly.
+    It defaults to the isolated pose's own pair (zero roll from the estimate's `roll_up` -
+    the world up, or a sloped spiral's own up), which is the same `camera_frames` would
+    pick: a pixel measured here is a pixel the renderer would produce.
     """
     device, dtype = points.device, points.dtype
     position = torch.as_tensor(camera_position, device=device, dtype=dtype)
-    forward = torch.as_tensor(pivot, device=device, dtype=dtype) - position
+    aim = _aim(pivot, camera_position)
+    forward = torch.as_tensor(aim, device=device, dtype=dtype) - position
     forward = forward / forward.norm().clamp(min=1e-8)
     if frame is None:
         right_np, down_np = fast_depth.camera_frames(forward.detach().cpu().numpy().reshape(1, 3),
@@ -1077,10 +1165,18 @@ def _batch_project(pool, positions, pivot, surface, height):
 
     Returns [poses, points] tensors: the whole path is evaluated in one call instead of one call per
     pose, which is what makes the visibility sweep (dozens of candidate pivots x every frame) cheap.
+    Each pose aims through `_aim(pivot, position)`, so the level look of the 'Horizontally
+    straight' mode is measured exactly as it is rendered.
     """
     device, dtype = pool.device, pool.dtype
     pos = torch.as_tensor(positions, device=device, dtype=dtype).reshape(-1, 3)
-    look = torch.as_tensor(pivot, device=device, dtype=dtype).reshape(1, 3)
+    if _ACTIVE_LOOK_MODE == HORIZONTAL_LOOK:
+        # The level look aims at the axis at the camera's OWN height: one aim per pose.
+        look = pos.clone()
+        look[:, 0] = float(pivot[0])
+        look[:, 2] = float(pivot[2])
+    else:
+        look = torch.as_tensor(pivot, device=device, dtype=dtype).reshape(1, 3)
     forward = look - pos
     forward = forward / forward.norm(dim=1, keepdim=True).clamp(min=1e-8)
     up = torch.tensor(roll_up(), device=device, dtype=dtype).expand_as(forward)
@@ -1108,9 +1204,16 @@ def visibility_clearances(points, positions, pivot, surface, height=CANVAS_HEIGH
 
     The subject's pixels are what a viewer sees, so the guarantee is stated in them: the
     0.2 %/99.8 % rectangle of the projected points (times SUBJECT_PROJECTION_MARGIN, the same
-    silhouette allowance the fill solve uses) is compared against all four borders. A subject that is
+    silhouette allowance the fill solve uses) is compared against the borders. A subject that is
     deep in world space but thin in the picture - a plate, a person seen from the side - therefore
     costs nothing, while a subject that really leaves the frame is caught.
+
+    Which borders count depends on the look (`look_mode`). 'Pivot point' checks all four: the
+    aim follows the subject, so pulling the camera back can always fix a crop. 'Horizontally
+    straight' checks the HORIZONTAL borders only: the level look cannot move the subject
+    vertically with distance - the drift it shows is the look's own - so the vertical borders
+    are not a distance problem and must not drag the camera back for one (they would bisect
+    forever and land on VISIBILITY_MAX_SCALE).
     """
     margin_px = (VISIBILITY_MARGIN * float(height)) if margin is None else float(margin)
     if not len(positions):
@@ -1132,10 +1235,14 @@ def visibility_clearances(points, positions, pivot, surface, height=CANVAS_HEIGH
     centre_u = 0.5 * (low_u + high_u)
     centre_v = 0.5 * (low_v + high_v)
     width = float(height) * float(surface.get("aspect") or (16.0 / 9.0))
-    clearance = torch.minimum(
-        torch.minimum(centre_u - half_u - margin_px, (width - margin_px) - (centre_u + half_u)),
-        torch.minimum(centre_v - half_v - margin_px, (float(height) - margin_px)
-                      - (centre_v + half_v)))
+    horizontal = torch.minimum(centre_u - half_u - margin_px,
+                               (width - margin_px) - (centre_u + half_u))
+    if _ACTIVE_LOOK_MODE == HORIZONTAL_LOOK:
+        clearance = horizontal
+    else:
+        vertical = torch.minimum(centre_v - half_v - margin_px,
+                                 (float(height) - margin_px) - (centre_v + half_v))
+        clearance = torch.minimum(horizontal, vertical)
     too_few = visible.sum(dim=1) < 8          # nothing in front of the camera: not a valid pose
     clearance = torch.where(too_few, clearance.new_full((), -math.inf),
                             torch.nan_to_num(clearance, nan=-math.inf))
@@ -1902,6 +2009,78 @@ def _band_legs(start_yaw, elevations, width):
     return legs
 
 
+def _band_front_back_legs(start_yaw, elevations, width):
+    """Every leg of the "Banded Orbits Front & Back" path, in flight order.
+
+    The front half is the plain stack (`_band_legs`): the camera climbs from the
+    lowest band to the highest. At the top the camera does NOT turn back - it keeps
+    going the way the top band was already going and EXTENDS that sweep until it
+    reaches the mirror of its own start on the far side (`BAND_FRONT_BACK_TURN` minus
+    the band's width further on). From there the SAME bands follow on the far side,
+    highest first, each one swept the way its front twin was - so the camera walks
+    back DOWN the far side without ever reversing. No arc is shown twice and the whole
+    visit is as short as it can be: the front half, the bridge across the top, and the
+    mirrored bands.
+
+    The legs keep `_band_legs`' tuple shape, so the same frame walk (`_leg_walk`)
+    splits them by their travel on the sphere.
+    """
+    width = resolve_band_width(width)
+    start_yaw = resolve_band_start_yaw(start_yaw)
+    front = _band_legs(start_yaw, elevations, width)
+    bands = front[0::2]                               # the sweeps, in flight order
+    top = bands[-1]
+    direction = 1.0 if top[3] - top[1] >= 0.0 else -1.0
+    # The top band's sweep is EXTENDED - same heading, no turn - until it reaches the
+    # mirror of its own start, the far edge of the upper back orbit.
+    bridge = ((top[1] + BAND_FRONT_BACK_TURN - top[3]) * direction) % FULL_CIRCLE
+    yaw = top[3] + direction * bridge
+    legs = [*front, (math.radians(bridge) * math.cos(math.radians(top[2])),
+                     top[3], top[2], yaw, top[2])]
+    # The far side: the SAME bands walked back DOWN, each swept the way its front twin
+    # was (so the heading never flips), with a pure elevation step between neighbours.
+    for band in reversed(bands):
+        sweep = 1.0 if band[3] - band[1] >= 0.0 else -1.0
+        elevation = band[2]
+        if abs(elevation - legs[-1][4]) > 1e-9:
+            legs.append((abs(math.radians(elevation - legs[-1][4])),
+                         yaw, legs[-1][4], yaw, elevation))
+        end = yaw + sweep * abs(band[3] - band[1])
+        legs.append((abs(math.radians(end - yaw)) * math.cos(math.radians(elevation)),
+                     yaw, elevation, end, elevation))
+        yaw = end
+    return legs
+
+
+def _leg_walk(frames, pivot, radius, legs):
+    """Per-frame positions along a leg list, the frames split by the legs' travel.
+
+    The camera holds one angular speed: each leg gets the frames its travel on the
+    sphere earns (`_band_legs`' `(travel, yaw0, elevation0, yaw1, elevation1)`
+    tuples). The first frame sits on the first leg's start and the last one lands
+    exactly on the last leg's end.
+    """
+    frames = int(frames)
+    total = sum(leg[0] for leg in legs)
+    if frames <= 1 or total <= 1e-12:
+        # one frame (or a degenerate stack): the path is a point - report its start
+        return [_place(pivot, radius, legs[0][1], legs[0][2]) for _ in range(max(1, frames))]
+    span = float(frames - 1)
+    positions = []
+    for index in range(frames):
+        distance = total * (index / span)
+        yaw, elevation = legs[-1][3], legs[-1][4]      # the last frame lands exactly on the end
+        for leg in legs:
+            if distance <= leg[0] or leg is legs[-1]:
+                phase = min(1.0, max(0.0, distance / leg[0])) if leg[0] > 1e-12 else 1.0
+                yaw = leg[1] + (leg[3] - leg[1]) * phase
+                elevation = leg[2] + (leg[4] - leg[2]) * phase
+                break
+            distance -= leg[0]
+        positions.append(_place(pivot, radius, yaw, elevation))
+    return positions
+
+
 def _band_samples(frames, pivot, radius, start_yaw=None, elevations=None, width=None):
     """Per-frame positions of the "Banded Orbits" path - the spec's own choreography.
 
@@ -1928,25 +2107,30 @@ def _band_samples(frames, pivot, radius, start_yaw=None, elevations=None, width=
     if elevations is None:
         elevations = band_elevations()
     elevations = [float(value) for value in elevations] or [BAND_START_ANGLE_DEFAULT]
-    legs = _band_legs(start_yaw, elevations, width)
-    total = sum(leg[0] for leg in legs)
-    if frames <= 1 or total <= 1e-12:
-        # one frame (or a degenerate stack): the path is a point - report its start
-        return [_place(pivot, radius, legs[0][1], legs[0][2]) for _ in range(max(1, frames))]
-    span = float(frames - 1)
-    positions = []
-    for index in range(frames):
-        distance = total * (index / span)
-        yaw, elevation = legs[-1][3], legs[-1][4]      # the last frame lands exactly on the end
-        for leg in legs:
-            if distance <= leg[0] or leg is legs[-1]:
-                phase = min(1.0, max(0.0, distance / leg[0])) if leg[0] > 1e-12 else 1.0
-                yaw = leg[1] + (leg[3] - leg[1]) * phase
-                elevation = leg[2] + (leg[4] - leg[2]) * phase
-                break
-            distance -= leg[0]
-        positions.append(_place(pivot, radius, yaw, elevation))
-    return positions
+    return _leg_walk(frames, pivot, radius, _band_legs(start_yaw, elevations, width))
+
+
+def _band_front_back_samples(frames, pivot, radius, start_yaw=None, elevations=None, width=None):
+    """Per-frame positions of the "Banded Orbits Front & Back" path.
+
+    The plain band stack (`_band_legs`) climbs the front; the top band's sweep is then
+    extended, in the same direction, until it reaches the far edge of the upper back
+    orbit, and the same bands walk back DOWN the far side (see
+    `_band_front_back_legs`). The frames follow the legs' travel on the sphere over both
+    halves and the bridge alike, so the camera holds one angular speed, and `_place`
+    keeps every pose on the orbit sphere - the radius, the framing and the (world-up,
+    roll-free) level never change.
+
+    `elevations` may be given (a list, lowest first) or left to `band_elevations()`;
+    `width` and `start_yaw` likewise fall back to the module's active widgets.
+    """
+    width = band_width() if width is None else resolve_band_width(width)
+    start_yaw = band_start_yaw() if start_yaw is None else resolve_band_start_yaw(start_yaw)
+    if elevations is None:
+        elevations = band_elevations()
+    elevations = [float(value) for value in elevations] or [BAND_START_ANGLE_DEFAULT]
+    return _leg_walk(frames, pivot, radius,
+                     _band_front_back_legs(start_yaw, elevations, width))
 
 
 def _band_info(start_yaw=None, width=None):
@@ -1972,6 +2156,36 @@ def _band_info(start_yaw=None, width=None):
             "band_highest": max(elevations), "band_travel": sum(leg[0] for leg in legs),
             "band_end_yaw": legs[-1][3], "band_end_elevation": legs[-1][4],
             "orbit_coverage": min(FULL_CIRCLE, abs(width)), "view_angle": None}
+
+
+def _band_front_back_info(start_yaw=None, width=None):
+    """The `info` fields the "Banded Orbits Front & Back" coverage reports.
+
+    Everything `_band_info` reports about the stack, plus the numbers the doubled
+    path adds: `band_front_end_*` is where the front half stops (the top band's end),
+    `band_back_start_yaw` the azimuth the extended top band carries it to (the mirror
+    of the top band's START, one `BAND_FRONT_BACK_TURN` away), and `band_end_*` the
+    pose the last frame looks from (the far side's own end, the mirrored lowest band).
+    `band_travel` and `orbit_coverage` count both halves.
+    """
+    info = _band_info(start_yaw, width)
+    start_yaw = band_start_yaw() if start_yaw is None else resolve_band_start_yaw(start_yaw)
+    width = band_width() if width is None else resolve_band_width(width)
+    elevations = band_elevations()
+    front = _band_legs(start_yaw, elevations, width)
+    legs = _band_front_back_legs(start_yaw, elevations, width)
+    info.update({
+        "band_front_back": True,
+        "band_front_end_yaw": front[-1][3], "band_front_end_elevation": front[-1][4],
+        "band_back_start_yaw": front[-1][1] + BAND_FRONT_BACK_TURN,
+        "band_end_yaw": legs[-1][3], "band_end_elevation": legs[-1][4],
+        "band_travel": sum(leg[0] for leg in legs),
+        # The front half sweeps the band width, the extended top band then carries the
+        # camera a half turn across to the far side, so the whole path shows that much
+        # azimuth - capped at one full turn.
+        "orbit_coverage": min(FULL_CIRCLE, abs(width) + BAND_FRONT_BACK_TURN),
+    })
+    return info
 
 
 def _legacy_samples(frames, pivot, radius, scale=1.0, size=1.0, orbit_end=None,
@@ -2074,6 +2288,11 @@ def subject_samples(frames, pivot, radius, scale=1.0, size=1.0, orbit_end=None,
         # the O-orbit amplitude, the view angle and the direction play no part here -
         # the *width* is the swing and `band_start_yaw` is the azimuth, by design.
         return _band_samples(frames, pivot, radius)
+    if mode == BAND_FRONT_BACK_COVERAGE:
+        # The same stack, but the camera does not stop at the top: it extends the top
+        # band's own sweep across to the far side and walks the bands back DOWN there,
+        # each swept the way its front twin was. Same widgets, same sphere, no roll.
+        return _band_front_back_samples(frames, pivot, radius)
     back = mode == ORBIT_COVERAGES[1]
     # The level connection ends where the back orbit begins: its near edge, one O radius (half the
     # circle's span) short of the back circle's middle. That is the shortest way to reach the back
@@ -2282,7 +2501,7 @@ def _orbit_candidate(pool, surface, frames, pivot, radius, scale, size, end, dir
         info = {"front_yaw": amplitude, "orbit_end": end,
                 "front_share": balanced_front_share(amplitude, max(0.0, end - amplitude))}
         return scale, samples, drift, typical, info
-    if str(coverage) in (SPIRAL_COVERAGE, BAND_COVERAGE):
+    if str(coverage) in (SPIRAL_COVERAGE, BAND_COVERAGE, BAND_FRONT_BACK_COVERAGE):
         # Nothing to cut here: the spiral's winding and the band stack are the node's own
         # widgets, so one sample run and one drift measurement describe the whole path.
         # The samples are the constant-speed ones (`_spiral_samples` / `_band_samples`,
@@ -2293,6 +2512,7 @@ def _orbit_candidate(pool, surface, frames, pivot, radius, scale, size, end, dir
                                   **path_options(view_angle, coverage))
         drift, typical = subject_drift(pool, samples, pivot, surface)
         info = (_spiral_info(view_angle, direction) if str(coverage) == SPIRAL_COVERAGE
+                else _band_front_back_info() if str(coverage) == BAND_FRONT_BACK_COVERAGE
                 else _band_info())
         return scale, samples, drift, typical, info
     span, samples, drift, typical = _cut_back_span(pool, surface, frames, pivot, radius, scale, size,
@@ -2337,7 +2557,7 @@ def _fit_subject_amplitude(frames, pivot, radius, surface, size, cap_px, amplitu
     pool = _decimate(surface["content_cloud"], DRIFT_POOL)
     size = max(1e-3, float(size))
     end = ORBIT_END_DEFAULT if orbit_end is None else max(ORBIT_END_MIN, float(orbit_end))
-    if str(coverage) in (SPIRAL_COVERAGE, BAND_COVERAGE):
+    if str(coverage) in (SPIRAL_COVERAGE, BAND_COVERAGE, BAND_FRONT_BACK_COVERAGE):
         # The spiral's winding and the band stack (start angle / count / width / start yaw /
         # step) are the node's own widgets, not rungs the ladder may trade away: fly the
         # path exactly as asked and *report* the drift, so the speed cap names the price
@@ -2448,12 +2668,13 @@ def _fit_orbit_world(frames, pivot, radius, surface, size, budget, orbit_end=Non
         info = {"front_yaw": amplitude, "orbit_end": end,
                 "front_share": balanced_front_share(amplitude, max(0.0, end - amplitude))}
         return scale, samples, travel, info
-    if str(coverage) in (SPIRAL_COVERAGE, BAND_COVERAGE):
+    if str(coverage) in (SPIRAL_COVERAGE, BAND_COVERAGE, BAND_FRONT_BACK_COVERAGE):
         # Same rule as the pixel fit: the winding and the band stack are the node's own widgets, so
         # they are not a ladder to trade away - one sample run, measured, never cut.
         options = path_options(view_angle, coverage)
         samples = subject_samples(frames, pivot, radius, 1.0, size, None, direction, **options)
         info = (_spiral_info(view_angle, direction) if str(coverage) == SPIRAL_COVERAGE
+                else _band_front_back_info() if str(coverage) == BAND_FRONT_BACK_COVERAGE
                 else _band_info())
         return 1.0, samples, _largest_step(samples), info
     options = path_options(view_angle, coverage)
@@ -2673,6 +2894,7 @@ def automatic_keys(frames, pivot, radius, content_radius, target, max_speed=DEFA
     if str(target).strip().lower() == SUBJECT_TARGET:
         style = ("spherical spiral" if str(coverage) == SPIRAL_COVERAGE
                  else "banded orbits" if str(coverage) == BAND_COVERAGE
+                 else "banded orbits front & back" if str(coverage) == BAND_FRONT_BACK_COVERAGE
                  else "front O-orbit + closing orbit")
         fitted = _fit_subject_amplitude(frames, pivot, radius, surface, orbit_size, cap_px,
                                         amplitude_cap, orbit_end, direction, view_angle, coverage)
@@ -2697,10 +2919,11 @@ def automatic_keys(frames, pivot, radius, content_radius, target, max_speed=DEFA
     # so it uses the same turning walk - a frame-even list would cut exactly those corners. Every
     # other path keeps the even frame list.
     ticks = (_spiral_key_frames(samples, frames)
-             if str(coverage) in (SPIRAL_COVERAGE, BAND_COVERAGE) else _key_frames(frames))
+             if str(coverage) in (SPIRAL_COVERAGE, BAND_COVERAGE, BAND_FRONT_BACK_COVERAGE)
+             else _key_frames(frames))
     keys = [{
         "pos": [round(value, 6) for value in samples[tick]],
-        "look": [round(float(value), 6) for value in pivot],
+        "look": [round(value, 6) for value in _aim(pivot, samples[tick])],
         "src": int(tick),
         "t": int(tick),
     } for tick in ticks]
@@ -2725,7 +2948,7 @@ def automatic_keys(frames, pivot, radius, content_radius, target, max_speed=DEFA
             # that winding is the user's Spiral End parameter - the fit does not scale it, so the
             # scale really is 1.0 and the summary reports the drift instead of a cut.
             info["amplitude_scale"] = 1.0
-        elif str(coverage) == BAND_COVERAGE:    # the band stack: exactly the widgets asked for
+        elif str(coverage) in (BAND_COVERAGE, BAND_FRONT_BACK_COVERAGE):  # the band stack: exactly the widgets asked for
             requested = float(meta.get("band_width") or BAND_WIDTH_DEFAULT)
             span = 0.0
             # Same story as the spiral: the band geometry IS the user's widgets (start angle,
@@ -2754,6 +2977,12 @@ def automatic_keys(frames, pivot, radius, content_radius, target, max_speed=DEFA
                      "band_elevations": meta.get("band_elevations"),
                      "band_lowest": meta.get("band_lowest"),
                      "band_highest": meta.get("band_highest"),
+                     # The 'Front & Back' variant's own numbers (None for the plain stack): the
+                     # front half's end, the azimuth the wrap reaches and the flag itself.
+                     "band_front_back": meta.get("band_front_back"),
+                     "band_front_end_yaw": meta.get("band_front_end_yaw"),
+                     "band_front_end_elevation": meta.get("band_front_end_elevation"),
+                     "band_back_start_yaw": meta.get("band_back_start_yaw"),
                      "band_end_yaw": meta.get("band_end_yaw"),
                      "band_end_elevation": meta.get("band_end_elevation"),
                      "orbit_coverage": min(FULL_CIRCLE, meta.get(
@@ -2780,7 +3009,7 @@ def document_from_keys(frames, keys, name, description, extra=None):
 
 
 def probe_surface(reference, target=SUBJECT_TARGET, subject_mask=None, model_size="",
-                  depth_res=AUTO_DEPTH_RES, device=None, depth_fn=None):
+                  depth_res=AUTO_DEPTH_RES, device=None, depth_fn=None, depth_relief=1.0):
     """One depth pass -> everything the automatic camera mode needs to know.
 
     Returns the scene cloud, the target's *geometric pivot* (the midpoint of its depth profile's
@@ -2810,6 +3039,19 @@ def probe_surface(reference, target=SUBJECT_TARGET, subject_mask=None, model_siz
     # model's raw units instead put the whole rig at the wrong depth *and* scale (a key's x/y follow
     # its z), which is what made the orbit circle a point in front of the subject.
     depth = fast_depth.cloud_gauge(depth)
+    depth_relief = fast_depth.resolve_depth_relief(depth_relief)
+    # Relief is a geometry transform, not a render-only effect: the face patch, subject
+    # pivot, collision surface and emitted camera keys must all see the exact point cloud
+    # the Geometry node will render. Apply it in the renderer's gauge before unprojection.
+    depth = fast_depth.apply_depth_relief(depth, depth_relief)
+    # DIAGNOSTIC: which depth model actually ran (`depth_model` is the candidate that
+    # returned), whether the measured FOV was published, and whether this module's
+    # `fast_depth` reference is the same object that set it. Four fixes have left
+    # `face_fill_vfov = 55.0` untouched; this settles whether the MoGe branch runs at all.
+    print(f"[dbg] probe_surface: depth_model={depth_model!r} "
+          f"LAST_VFOV_DEGREES={getattr(fast_depth, 'LAST_VFOV_DEGREES', 'MISSING')!r} "
+          f"id(fast_depth)={id(fast_depth)} "
+          f"model_size={model_size!r} MOGE_PREFIX={fast_depth.MOGE_PREFIX!r}", flush=True)
     cloud = surface_points(depth)
     scene_pivot, scene_extents = geometric_pivot(cloud)
     scene_radius = pivot_radius(cloud, scene_pivot)
@@ -2862,8 +3104,31 @@ def probe_surface(reference, target=SUBJECT_TARGET, subject_mask=None, model_siz
         "subject_radius": subject_radius,
         "subject_source": subject_source,
         "median_depth": max(1e-6, median_depth),
+        "depth_relief": float(depth_relief),
         "depth_model": depth_model,
+        # The CANVAS aspect the render actually flies. The face orbit projects the SAM3 box
+        # onto the cloud with `width = height * aspect`, and the box is normalised in the
+        # SOURCE while the cloud's u/v live in the CANVAS - on the Hanks still those are
+        # 3440x2312 (1.488) vs 736x544 (1.353), a 10 % horizontal error that shifts the
+        # selection sideways. That is the observed "the face orbit aims slightly left of
+        # the head". `_bucket_480` is deterministic from the source dims, so this needs no
+        # ordering trickery the way the measured vfov did.
+        "render_aspect": ((lambda _b: (_b[0] / max(1, _b[1])))(
+            fast_depth._bucket_480(int(reference.shape[2]), int(reference.shape[1])))),
         "aspect": aspect, "hfov": hfov,
+        # `vfov` derived from the horizontal FOV and the cloud aspect, so the FACE ORBIT
+        # can project with the same focal the cloud was built with. Without it
+        # `_project_with_pose` falls back to the hard-coded 55 deg (a 1.509x error in f on
+        # the Hanks still), corrupting both the face-box selection and the fill metric.
+        # tan(vfov/2) = tan(hfov/2) / aspect
+        # The MEASURED value wins. `hfov` is a derived quantity and its inversion lands on
+        # 55.00000000000001 (the hard-coded assumption, with float noise) on this scene -
+        # and because it is truthy it SHADOWED `LAST_VFOV_DEGREES` in an `or` chain, so the
+        # face orbit kept measuring the head at 55 deg instead of the measured 38.07 deg.
+        "vfov": (getattr(fast_depth, "LAST_VFOV_DEGREES", None)
+                 or ((math.degrees(2.0 * math.atan(
+                     math.tan(math.radians(float(hfov)) / 2.0) / max(float(aspect), 1e-6)))
+                     if hfov else None))),
         "lateral_half_width": float(scene_extents[0]) / 2.0,
     }
 
@@ -2895,6 +3160,15 @@ def guard_collisions(keys, surface, margin=COLLISION_MARGIN):
     clearance = max(0.0, _finite(margin, "Collision margin")) * unit
     if cloud.shape[0] == 0 or clearance <= 0.0 or not keys:
         return keys, 0, math.inf, math.inf
+    # FACE KEYS ARE DIFFERENT. `apply_face_orbit` deliberately parks the camera close to
+    # the head - which IS scene geometry - and it already enforces its own stand-off
+    # (FACE_ORBIT_CLEARANCE x the head radius, from `head_pivot`). Applying the generic
+    # content-radius margin to those keys shoves the zoom straight back out to the orbit
+    # radius: the render then shows no zoom at all while the orbit reports success. So a
+    # face key is held to a much smaller clearance - just enough that it cannot sit inside
+    # the cloud - and the zoom survives.
+    face_clearance = min(clearance, FACE_ORBIT_COLLISION_MARGIN * unit)
+    clearances = [face_clearance if key.get("face") else clearance for key in keys]
     stride = max(1, int(cloud.shape[0]) // COLLISION_MAX_POINTS)
     pool = cloud[::stride]
     pivot = torch.tensor(surface["pivot"], dtype=pool.dtype, device=pool.device)
@@ -2903,7 +3177,10 @@ def guard_collisions(keys, surface, margin=COLLISION_MARGIN):
     worst_before = float(distances.min()) / unit
     fixed = set()
     for _ in range(COLLISION_ITERATIONS):
-        offenders = torch.nonzero(distances < clearance, as_tuple=False).flatten().tolist()
+        offenders = torch.nonzero(
+            torch.tensor([float(distances[i]) < clearances[i] for i in range(len(keys))],
+                         device=distances.device),
+            as_tuple=False).flatten().tolist()
         if not offenders:
             break
         for index in offenders:
@@ -2912,7 +3189,7 @@ def guard_collisions(keys, surface, margin=COLLISION_MARGIN):
             length = float(direction.norm())
             if length < 1e-9:
                 direction, length = positions.new_tensor([0.0, 0.0, -1.0]), 1.0
-            push = (clearance - float(distances[index]) + 1e-3) * 1.15
+            push = (clearances[index] - float(distances[index]) + 1e-3) * 1.15
             positions[index] = positions[index] + (direction / length) * push
         distances = torch.cdist(positions, pool).amin(dim=1)
     for index in sorted(fixed):
@@ -2927,7 +3204,8 @@ def estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DEF
                          direction=ORBIT_DIRECTION_DEFAULT, view_angle=None, coverage=None,
                          orbit_amplitude=None, spiral_end=None, spiral_end_arc=None,
                          spiral_slope=None, bands_start_angle=None, bands_count=None,
-                         bands_width=None, bands_start_yaw=None, bands_step=None):
+                         bands_width=None, bands_start_yaw=None, bands_step=None, orbit_look=None,
+                         face_box=None, face_fill=None, face_span=None, depth_relief=1.0):
     """(signal JSON, summary) for one still, with the O Orbit Angle and the spiral widgets applied.
 
     `orbit_amplitude` (deg) is the front O's angular radius - the swing AND the rise, because the O
@@ -2945,7 +3223,9 @@ def estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DEF
     through the view axis, 0 = the view axis itself (the first frame is the framed frontal view),
     +90 = straight up ("from straight above"), -90 = straight down; clamped to
     `SPIRAL_SLOPE_MIN .. SPIRAL_SLOPE_MAX` and ignored by every other coverage. The `bands_*` group
-    belongs to the "Banded Orbits" coverage and is ignored by every other one: `bands_start_angle`
+    belongs to the "Banded Orbits" coverage (and its "Banded Orbits Front & Back" variant, which
+    flies the same stack and then repeats it mirrored and reversed on the back side) and is ignored
+    by every other one: `bands_start_angle`
     (deg) is the elevation of the FIRST band - the node's "Band Start Angle", 0 = level with the
     pivot, -90 = from straight below the subject (looking up at the feet), +90 = from straight above
     its head; `bands_count` is how many bands (1, 2, 3 ...); `bands_width` (deg, 1..360) is the
@@ -2953,10 +3233,15 @@ def estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DEF
     the azimuth the FIRST band begins at, measured around the subject (negative = from its left,
     positive = from its right) and `bands_step` (deg) is the elevation rise per band, 0 = auto
     (spread the stack over the full available range in whichever direction has more room).
+    `orbit_look` is the node's "Auto Orbit Look" widget and one of `ORBIT_LOOK_MODES`:
+    'Pivot point' (the default) aims every pose at the pivot, 'Horizontally straight' keeps
+    the forward level - the camera aims at the vertical axis through the pivot at its own
+    height and rides a CYLINDER of the orbit radius around that axis, so the straight
+    distance to the axis is the same on every orbit. `None` keeps `ORBIT_LOOK_DEFAULT`.
     Everything else is documented on `_estimate_camera_path`, which does the work.
     """
     global _ACTIVE_FRONT_ORBIT_AMPLITUDE, _ACTIVE_SPIRAL_END, _ACTIVE_SPIRAL_END_ARC
-    global _ACTIVE_SPIRAL_SLOPE, _ACTIVE_ROLL_UP
+    global _ACTIVE_SPIRAL_SLOPE, _ACTIVE_ROLL_UP, _ACTIVE_LOOK_MODE
     global _ACTIVE_BAND_START_ANGLE, _ACTIVE_BAND_COUNT, _ACTIVE_BAND_WIDTH
     global _ACTIVE_BAND_START_YAW, _ACTIVE_BAND_STEP
     previous = _ACTIVE_FRONT_ORBIT_AMPLITUDE
@@ -2964,12 +3249,14 @@ def estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DEF
     previous_arc = _ACTIVE_SPIRAL_END_ARC
     previous_slope = _ACTIVE_SPIRAL_SLOPE
     previous_up = _ACTIVE_ROLL_UP
+    previous_look = _ACTIVE_LOOK_MODE
     previous_bands = (_ACTIVE_BAND_START_ANGLE, _ACTIVE_BAND_COUNT, _ACTIVE_BAND_WIDTH,
                       _ACTIVE_BAND_START_YAW, _ACTIVE_BAND_STEP)
     _ACTIVE_FRONT_ORBIT_AMPLITUDE = resolve_front_orbit_amplitude(orbit_amplitude)
     _ACTIVE_SPIRAL_END = resolve_spiral_end(spiral_end)
     _ACTIVE_SPIRAL_END_ARC = resolve_spiral_end_arc(spiral_end_arc)
     _ACTIVE_SPIRAL_SLOPE = resolve_spiral_slope(spiral_slope)
+    _ACTIVE_LOOK_MODE = resolve_look_mode(orbit_look)
     _ACTIVE_BAND_START_ANGLE = resolve_band_start_angle(bands_start_angle)
     _ACTIVE_BAND_COUNT = resolve_band_count(bands_count)
     _ACTIVE_BAND_WIDTH = resolve_band_width(bands_width)
@@ -2977,22 +3264,28 @@ def estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DEF
     _ACTIVE_BAND_STEP = resolve_band_step(bands_step)
     # The clip is levelled to the spiral's own up when it flies a sloped coil, the world up
     # otherwise (see `_ACTIVE_ROLL_UP`); the slope is ignored by every other coverage, so the tilt
-    # only ever reaches the frame where it belongs.
+    # only ever reaches the frame where it belongs. The level look always keeps the WORLD up: a
+    # "horizontally straight" clip must show a level horizon, whatever the coil's own axis does.
     _ACTIVE_ROLL_UP = (_spiral_tilt(tuple(fast_depth.WORLD_UP), _ACTIVE_SPIRAL_SLOPE)
-                       if str(coverage) == SPIRAL_COVERAGE else tuple(fast_depth.WORLD_UP))
+                       if (str(coverage) == SPIRAL_COVERAGE
+                           and _ACTIVE_LOOK_MODE != HORIZONTAL_LOOK)
+                       else tuple(fast_depth.WORLD_UP))
     try:
         return _estimate_camera_path(
             reference, frames, target=target, max_speed=max_speed, subject_mask=subject_mask,
             model_size=model_size, depth_res=depth_res, device=device, depth_fn=depth_fn,
             pivot_offset=pivot_offset, orbit_distance=orbit_distance, orbit_size=orbit_size,
             subject_fill=subject_fill, orbit_end=orbit_end, direction=direction,
-            view_angle=view_angle, coverage=coverage)
+            view_angle=view_angle, coverage=coverage,
+            face_box=face_box, face_fill=face_fill, face_span=face_span,
+            depth_relief=depth_relief)
     finally:
         _ACTIVE_FRONT_ORBIT_AMPLITUDE = previous
         _ACTIVE_SPIRAL_END = previous_end
         _ACTIVE_SPIRAL_END_ARC = previous_arc
         _ACTIVE_SPIRAL_SLOPE = previous_slope
         _ACTIVE_ROLL_UP = previous_up
+        _ACTIVE_LOOK_MODE = previous_look
         (_ACTIVE_BAND_START_ANGLE, _ACTIVE_BAND_COUNT, _ACTIVE_BAND_WIDTH,
          _ACTIVE_BAND_START_YAW, _ACTIVE_BAND_STEP) = previous_bands
 
@@ -3001,7 +3294,8 @@ def _estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DE
                           subject_mask=None, model_size="", depth_res=AUTO_DEPTH_RES,
                           device=None, depth_fn=None, pivot_offset=(0.0, 0.0, 0.0),
                           orbit_distance=None, orbit_size=None, subject_fill=None, orbit_end=None,
-                          direction=ORBIT_DIRECTION_DEFAULT, view_angle=None, coverage=None):
+                          direction=ORBIT_DIRECTION_DEFAULT, view_angle=None, coverage=None,
+                          face_box=None, face_fill=None, face_span=None, depth_relief=1.0):
     """(signal JSON, summary) for one still: geometric pivot, automatic path, collision guard.
 
     The pivot is the target's **cylindrical centre**: a robust vertical-cylinder fit of the depth
@@ -3035,12 +3329,15 @@ def _estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DE
     ('counter-clockwise'/'clockwise') mirrors the whole path. `orbit_end` is the DEPRECATED
     predecessor of `coverage` - without a coverage mode the older concluding orbit is fitted, so
     saved callers behave as before; all of it is honoured as far as the max camera speed allows, and
-    the summary reports what was achieved.
+    the summary reports what was achieved. The "Banded Orbits" coverages ignore the front-O shape
+    entirely (their stack IS the path, described by the `bands_*` widgets); the "Banded Orbits
+    Front & Back" variant flies that stack on the front and then repeats it mirrored and reversed
+    down the back side, wrapping between the two halves at the top band's elevation.
     """
     frames = validate_frames(frames)
     surface = probe_surface(reference, target=target, subject_mask=subject_mask,
                             model_size=model_size, depth_res=depth_res, device=device,
-                            depth_fn=depth_fn)
+                            depth_fn=depth_fn, depth_relief=depth_relief)
     target = surface["target"]
     max_speed = _finite(max_speed, "Max camera speed")
     content_radius = max(1e-6, float(surface["content_radius"]))
@@ -3165,25 +3462,86 @@ def _estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DE
                  "look": [round(key["look"][axis] + look_shift[axis], 6) for axis in range(3)],
                  "src": key["src"], "t": key["t"]} for key in keys]
         pivot = [pivot[axis] + look_shift[axis] for axis in range(3)]
+
+    # --- face-detail orbit -------------------------------------------------------
+    # The highest band's central frames are re-aimed onto the face (see
+    # `apply_face_orbit`). It runs here - on the finished keys, in absolute depth
+    # units, before the collision guard and before the median-depth conversion - so
+    # it sees exactly the path the render will fly and every later pass still gets
+    # its say. Without a face box this is a no-op, and the summary says so.
+    face_info = None
+    if face_box is not None:
+        box = face_box
+        if isinstance(box, str):
+            try:
+                from enndee_face_detect import parse_face_bbox
+                box = parse_face_bbox(box)
+            except Exception:                                       # pragma: no cover
+                box = None
+        if isinstance(box, dict):
+            orbit_radius = _yaw_elevation_of(keys[0]["pos"], orbit_centre)[2] if keys else 0.0
+            if orbit_radius > 1e-9:
+                reference_pose = front_camera(orbit_centre, orbit_radius)
+                keys, face_info = apply_face_orbit(
+                    keys, surface, box,
+                    fill=(FACE_ORBIT_FILL_DEFAULT if face_fill is None else float(face_fill)),
+                    span=(FACE_ORBIT_SPAN_DEFAULT if face_span is None else float(face_span)),
+                    pivot=orbit_centre,
+                    front_position=reference_pose,
+                    front_look=_aim(orbit_centre, reference_pose),
+                    frames_total=frames,
+                    # The CANVAS aspect, not the source's: the SAM3 box is normalised in
+                    # the source but the cloud's u/v live in the canvas (736x544 vs
+                    # 3440x2312 on the Hanks still), and using the source aspect shifts
+                    # the selection ~10 % sideways - the observed "aims slightly left".
+                    render_aspect=surface.get("render_aspect"),
+                    # Same focal the cloud was built with. Without this the orbit projects
+                    # with the hard-coded 55 deg instead of the measured ~38 deg (a 1.509x
+                    # error in f), which mis-sizes the face patch and the solved distance.
+                    vfov_degrees=surface.get("vfov"),
+                )
+
     keys, fixed, worst_before, worst_after = guard_collisions(keys, surface)
+    if _ACTIVE_LOOK_MODE == HORIZONTAL_LOOK:
+        # A level look is a function of the camera height, so it is re-derived once the pivot
+        # offset and the collision guard have finished moving the poses: the forward stays
+        # exactly level and the aim keeps pointing at the axis at the camera's own height.
+        keys = [dict(key, look=[round(value, 6) for value in _aim(pivot, key["pos"])])
+                for key in keys]
     # Everything above works in absolute depth units; the *emitted* document is in median-depth
     # units, exactly like the Camera Path Configurator's paths - the fast-depth backend multiplies
     # the keys by the cloud's median depth (`zm`), so absolute keys would be scaled a second time.
     depth_unit = max(1e-6, float(surface["median_depth"]))
-    emitted = [{
-        "pos": [round(value / depth_unit, 6) for value in key["pos"]],
-        "look": [round(value / depth_unit, 6) for value in key["look"]],
-        "src": key["src"], "t": key["t"],
-    } for key in keys]
+    emitted = []
+    for key in keys:
+        row = {
+            "pos": [round(value / depth_unit, 6) for value in key["pos"]],
+            "look": [round(value / depth_unit, 6) for value in key["look"]],
+            "src": key["src"], "t": key["t"],
+        }
+        # Carry the face close-up marker through. It used to live in `src` as the
+        # sentinel "face", which broke every path parser - but it did survive
+        # serialization. Moving it to its own field must not lose it.
+        if key.get("face"):
+            row["face"] = True
+        emitted.append(row)
     if framing:
         cylinder = framing.get("cylinder") or {}
+        # What the framing guarantees depends on the look: the pivot look keeps the aim on the
+        # subject (one constant distance to it), the level look keeps the distance to the AXIS.
+        axis_text = ("is both the pivot and the aim - so the subject stays in the horizontal "
+                     "picture centre and the camera keeps one constant distance all along the "
+                     "path - " if _ACTIVE_LOOK_MODE != HORIZONTAL_LOOK else
+                     "is the pivot, and the level aim rides that axis, so the subject stays in "
+                     "the horizontal picture centre while the camera keeps one constant distance "
+                     "to the axis - ")
         framing_text = (
             f"the subject is approximated by a vertical cylinder (centre "
             f"[{pivot[0]:+.3g}, {pivot[1]:+.3g}, {pivot[2]:+.3g}], radius "
             f"{cylinder.get('radius', 0.0):.3g} units, "
-            f"{cylinder.get('coverage', 0.0) * 100:.0f} % of the surface inside) whose axis is both "
-            f"the pivot and the aim - so the subject stays in the horizontal picture centre and the "
-            f"camera keeps one constant distance all along the path - framed to "
+            f"{cylinder.get('coverage', 0.0) * 100:.0f} % of the surface inside) whose axis "
+            + axis_text
+            + f"framed to "
             f"{framing['area'] * 100:.0f} % of the picture area at the front pose, "
             f"{framing['fill_min'] * 100:.0f}-{framing['fill_max'] * 100:.0f} % along the path "
             f"({framing['width_px']:.0f} x {framing['height_px']:.0f} px on a "
@@ -3192,10 +3550,12 @@ def _estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DE
         distance_text = f"distance {orbit_radius:.3g} units solved by Auto Subject Fill"
     visibility_text = ""
     if visibility:
+        inside = ("the whole subject box" if _ACTIVE_LOOK_MODE != HORIZONTAL_LOOK
+                  else "the subject box (its left/right extent)")
         visibility_text = (
-            f"the whole subject box ({visibility['box_extents'][0]:.3g} x "
+            f"{inside} ({visibility['box_extents'][0]:.3g} x "
             f"{visibility['box_extents'][1]:.3g} x {visibility['box_extents'][2]:.3g} units) stays "
-            f"inside every frame (worst border clearance {visibility['clearance_px']:.0f} of "
+            f"inside the frame (worst border clearance {visibility['clearance_px']:.0f} of "
             f"{CANVAS_HEIGHT:.0f} px at frame {visibility['worst_frame']} = "
             f"{visibility['worst_pct'] * 100:.0f} % of the path"
             + (f", pulled back {visibility['scale']:.2f}x for it" if visibility["scale"] > 1.005
@@ -3262,6 +3622,17 @@ def _estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DE
                       f"- ending at {info['band_end_yaw']:.0f} deg / "
                       f"{info['band_end_elevation']:.0f} deg elevation and covering "
                       f"{info['orbit_coverage']:.0f} deg around the subject")
+        elif info.get("coverage") == BAND_FRONT_BACK_COVERAGE:
+            elevations = "/".join(f"{value:.0f}" for value in info["band_elevations"])
+            beyond = (f", then the band stack on BOTH sides: {info['band_count']} circle segments "
+                      f"of {info['band_width']:.0f} deg each at {elevations} deg elevation "
+                      f"({info['band_step']:+.0f} deg per step). The camera flies the FRONT stack "
+                      f"from {info['band_start_yaw']:.0f} deg, stepping STRAIGHT between bands, then "
+                      f"EXTENDS the top band's sweep - same heading, no turn back - across to "
+                      f"the far side, then walks the SAME bands back DOWN there, each swept the "
+                      f"way its front twin was - ending at "
+                      f"{info['band_end_yaw']:.0f} deg / {info['band_end_elevation']:.0f} deg "
+                      f"elevation and covering {info['orbit_coverage']:.0f} deg around the subject")
         elif info.get("coverage"):
             beyond = (f", the back visit giving way to the speed cap: the path ends at "
                       f"{info['orbit_end']:.0f} deg of the requested "
@@ -3288,6 +3659,12 @@ def _estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DE
                        f"{info['band_width']:.0f} deg each, starting at "
                        f"{info['band_start_angle']:.0f} deg elevation and stepping "
                        f"{info['band_step']:+.0f} deg per band")
+        elif info.get("coverage") == BAND_FRONT_BACK_COVERAGE:
+            opening = (f"a stack of {info['band_count']} banded orbits of "
+                       f"{info['band_width']:.0f} deg each, starting at "
+                       f"{info['band_start_angle']:.0f} deg elevation and stepping "
+                       f"{info['band_step']:+.0f} deg per band, flown on the front and then "
+                       f"walked back down the far side")
         else:
             opening = f"the front O (+/-{info['front_yaw']:.0f} deg)"
     description = (
@@ -3300,6 +3677,9 @@ def _estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DE
         + (f", {visibility_text}" if visibility_text else "")
         + f", amplitudes at {info['amplitude_scale']:.2f} of the built-in swing ({speed_text}), "
         + f"orbit size {size:g}x"
+        + (f", looking horizontally straight at the pivot's vertical axis (a level horizon, and "
+           f"the straight distance to the axis is the orbit radius on every orbit)"
+           if _ACTIVE_LOOK_MODE == HORIZONTAL_LOOK else "")
         + (f", the orbit centre equalised for a steady subject size"
            f" ({equalizer['spread_before'] * 100:.0f}"
            f" % -> {equalizer['spread_after'] * 100:.0f} % path distance spread"
@@ -3337,7 +3717,22 @@ def _estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DE
     document = document_from_keys(frames, emitted, f"Auto {info['style']} ({frames} frames)",
                                   description,
                                   extra={"depth_model": surface.get("depth_model"),
-                                         "up": levelled})
+                                         "up": levelled,
+                                         # The face orbit's frames, so the node can hand
+                                         # them to COLMAP without threading a second return
+                                         # value through every private builder.
+                                         "face_frames": (face_info or {}).get("frames") or [],
+                                         "face_orbit": (face_info or {}).get("status"),
+                                         # What the orbit SOLVED for. `face_want_distance`
+                                         # is the stand-off it asked for; comparing it with
+                                         # the emitted key positions separates a unit
+                                         # mismatch from the moved keys being dropped.
+                                         "face_want_distance": (face_info or {}).get("want_distance"),
+                                         "face_floor_distance": (face_info or {}).get("floor_distance"),
+                                         "face_radius": (face_info or {}).get("face_radius"),
+                                         "face_fill_target": (face_info or {}).get("fill_target"),
+                                         "face_fill_vfov": (face_info or {}).get("fill_vfov"),
+                                         "face_window": (face_info or {}).get("window")})
     hint = ""
     # The lever that frees frames for the front O. With the new modes it is 'Front only' (which
     # drops the whole back visit); with the DEPRECATED `orbit_end` path it is a shorter end.
@@ -3376,9 +3771,14 @@ def _estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DE
             room = float(framing["room_distance"])
             wanted = float(framing["distance_fill"])
             if room > wanted * 1.02:
+                room_note_scope = ("the whole subject inside every frame, including the O and the "
+                                   "back part" if _ACTIVE_LOOK_MODE != HORIZONTAL_LOOK else
+                                   "the subject inside the picture's left/right borders on every "
+                                   "pose (a level look cannot move it vertically, so the "
+                                   "top/bottom drift is the look's own)")
                 room_note = (f"Auto Subject Fill would frame {float(subject_fill or 0):.0f} % but "
-                             f"wants {wanted:.3g} units - the orbit's room (the whole subject inside "
-                             f"every frame, including the O and the back part) keeps the camera at "
+                             f"wants {wanted:.3g} units - the orbit's room ({room_note_scope}) "
+                             f"keeps the camera at "
                              f"{room:.3g} units ({room / max(1e-9, wanted):.2f}x back). Use a lower "
                              f"Auto Subject Fill, {lever}, or mask the subject tighter, to come closer")
                 hint = f"{hint}; {room_note}" if hint else room_note
@@ -3475,6 +3875,7 @@ def _estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DE
         "budget_per_frame": info["budget_per_frame"], "keys": info["keys"],
         "max_speed": max_speed, "scene_radius": float(surface["scene_radius"]),
         "scene_pivot": surface["scene_pivot"], "collision_fixes": fixed,
+        "face_orbit": face_info,
         "collision_margin": COLLISION_MARGIN, "clearance_before": worst_before,
         "clearance_after": worst_after,
         "pivot_equalizer": equalizer, "pivot_shift_final": look_shift,
@@ -3491,6 +3892,10 @@ def _estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DE
         # None while the deprecated `orbit_end` path is in charge (saved callers).
         "view_angle_deg": info.get("view_angle"), "coverage": info.get("coverage"),
         "back_orbit": info.get("back_orbit"),
+        # Auto Orbit Look: 'Pivot point' (the default) aims every pose at the pivot;
+        # 'Horizontally straight' keeps the forward level and rides a cylinder around the
+        # pivot's vertical axis. Every coverage honours it.
+        "orbit_look": look_mode(),
         # Spiral coverage only: the winding the path flies (the node's Spiral End widget), the lean
         # of its central axis (the same widget slot in Spiral mode: the Spiral Center Slope) and the
         # pose the last frame looks from - the arc out of the axis plus the clock/elevation it lands
@@ -3502,13 +3907,19 @@ def _estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DE
         "spiral_end_elevation_deg": info.get("spiral_end_elevation"),
         # Banded Orbits coverage only: the stack the path is made of (the first band's elevation,
         # how many bands, the azimuth each sweeps, where the first one begins and the elevation
-        # step between neighbours) plus the pose the last frame looks from.
+        # step between neighbours) plus the pose the last frame looks from. The "Front & Back"
+        # variant adds `band_front_back` plus the front half's own end and the azimuth the
+        # connection wraps to, so both halves can be told apart in the summary.
+        "band_front_back": info.get("band_front_back"),
         "band_start_angle_deg": info.get("band_start_angle"),
         "band_count": info.get("band_count"),
         "band_width_deg": info.get("band_width"),
         "band_start_yaw_deg": info.get("band_start_yaw"),
         "band_step_deg": info.get("band_step"),
         "band_elevations_deg": info.get("band_elevations"),
+        "band_front_end_yaw_deg": info.get("band_front_end_yaw"),
+        "band_front_end_elevation_deg": info.get("band_front_end_elevation"),
+        "band_back_start_yaw_deg": info.get("band_back_start_yaw"),
         "band_end_yaw_deg": info.get("band_end_yaw"),
         "band_end_elevation_deg": info.get("band_end_elevation"),
     }
@@ -3567,7 +3978,7 @@ def _estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DE
 
 
 def depth_from_reference(reference, model_size="", depth_res=AUTO_DEPTH_RES, device=None):
-    """(depth, model_name) for the estimator: the requested DA3 pick, else DA3-Small, else DAv2.
+    """(depth, model_name) for the estimator: the requested pick, else DA3-Small, else DAv2.
 
     Reuses the fast-depth backend's loaders (its VRAM cache included), so the automatic camera
     costs one depth pass per run. Every fallback goes through the same "larger = farther"
@@ -3578,11 +3989,28 @@ def depth_from_reference(reference, model_size="", depth_res=AUTO_DEPTH_RES, dev
     """
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     first = reference[0:1].to(device=device, dtype=torch.float32).clamp(0.0, 1.0)
-    attempts = [str(model_size).strip()] if str(model_size).strip() else []
+    # MoGe-3 is the ONLY supported depth source (see `MODEL_OPTIONS`) because it is the
+    # only one that reports the camera intrinsics the face orbit needs. Try it FIRST
+    # regardless of the name that arrives here: the label is resolved to a backend id
+    # before it reaches the probe (`'MoGe 3'` -> `'MoGe-3-ViT-L'`) and the observed value
+    # at this point was `'Depth-Anything-3-Mono-Large'` even though the widget said MoGe.
+    # A name mismatch must NEVER silently drop the measured FOV - that is exactly how the
+    # whole face orbit came to project at the hard-coded 55 deg.
+    attempts = ["MoGe-3-ViT-L", "MoGe 3"]
+    if str(model_size).strip():
+        attempts.append(str(model_size).strip())
     attempts += ["Depth-Anything-3-Small", "Depth-Anything-V2-Small-hf"]
     last_error = None
     for candidate in attempts:
         try:
+            if candidate.startswith(fast_depth.MOGE_PREFIX):
+                # MoGe-3's `refine_steps` is deliberately left at the backend default (3), the
+                # same value the Meridian Geometry widget ships with: this pass only needs the
+                # map's *median* (the gauge the keys are emitted in), and the two nodes then
+                # agree out of the box. `warn_depth_model_mismatch` compares model names, so a
+                # deliberately different step count does not warn - the gauge it moves is small.
+                depth = fast_depth._predict_moge_depth(candidate, first, device)
+                return depth, candidate
             if candidate.startswith(fast_depth.DA3_PREFIX):
                 height, width = int(first.shape[1]), int(first.shape[2])
                 # Same contract as the V2 branch below: (depth, model_name) - probe_surface
@@ -3648,9 +4076,12 @@ def format_summary(summary):
             f"({summary.get('subject_fill_min', summary['subject_fill_area']) * 100:.0f}-"
             f"{summary.get('subject_fill_max', summary['subject_fill_area']) * 100:.0f} % along "
             f"the path, {summary['subject_width_px']:.0f} x {summary['subject_height_px']:.0f} px) "
-            f"at radius {summary['orbit_radius']:.3g} units; the pivot is the cylinder axis and the "
-            f"aim, so the subject stays in the horizontal picture centre and the camera keeps that "
-            f"one distance all along the path"
+            f"at radius {summary['orbit_radius']:.3g} units; "
+            + ("the pivot is the cylinder axis and the aim, so the subject stays in the "
+               "horizontal picture centre and the camera keeps that one distance all along the path"
+               if summary.get("orbit_look") != HORIZONTAL_LOOK else
+               "the pivot is the cylinder axis and the level aim rides it, so the subject stays in "
+               "the horizontal picture centre while the camera keeps that one distance to the axis")
             + (f" (cylinder radius {summary['cylinder_radius']:.3g} units, "
                f"{summary.get('cylinder_coverage', 0.0) * 100:.0f} % of the surface inside)"
                if summary.get("cylinder_radius") else "")
@@ -3659,10 +4090,16 @@ def format_summary(summary):
         parts.append(f"radius {summary['orbit_radius']:.3g} "
                      f"({summary['orbit_fill']:g} x content radius)")
     if summary.get("visibility_scale") is not None:
+        level = summary.get("orbit_look") == HORIZONTAL_LOOK
         parts.append(
-            f"the whole subject box stays inside every frame (border clearance "
-            f"{summary['visibility_clearance_px']:.0f} px at worst, "
-            f"{summary['visibility_margin_px']:.0f} px kept free"
+            (f"the subject box stays inside the picture's left/right borders (a level look cannot "
+             f"move it vertically, so the top/bottom drift is the look's own; side clearance "
+             f"{summary['visibility_clearance_px']:.0f} px at worst, "
+             f"{summary['visibility_margin_px']:.0f} px kept free"
+             if level else
+             f"the whole subject box stays inside every frame (border clearance "
+             f"{summary['visibility_clearance_px']:.0f} px at worst, "
+             f"{summary['visibility_margin_px']:.0f} px kept free")
             + (f", pulled back {summary['visibility_scale']:.2f}x for it"
                if summary["visibility_scale"] > 1.005 else "")
             + ")"
@@ -3694,6 +4131,13 @@ def format_summary(summary):
             if summary.get("spiral_end_clock_deg") is not None:
                 beyond += (f", ending clock {summary['spiral_end_clock_deg']:.0f} deg / elevation "
                            f"{summary['spiral_end_elevation_deg']:.0f} deg")
+        elif summary.get("coverage") in (BAND_COVERAGE, BAND_FRONT_BACK_COVERAGE):
+            spread = "/".join(f"{value:.0f}"
+                              for value in (summary.get("band_elevations_deg") or []))
+            beyond = (f"banded orbits ({summary.get('band_count')} bands of "
+                      f"{summary.get('band_width_deg'):.0f} deg at {spread} deg elevation"
+                      + (", front and back"
+                         if summary.get("coverage") == BAND_FRONT_BACK_COVERAGE else "") + ")")
         elif summary.get("coverage"):
             beyond = "front circle only"
         else:
@@ -3705,6 +4149,10 @@ def format_summary(summary):
             centre = f" centred on {view:.0f} deg" if abs(view) >= 0.5 else ""
             orbit = (f", spherical spiral {summary.get('orbit_direction', '')} around {axis}"
                      f"{centre}: {beyond}")
+        elif summary.get("coverage") in (BAND_COVERAGE, BAND_FRONT_BACK_COVERAGE):
+            # The band stack has no front O either: its swing is the Band Width widget, so the
+            # "O +/-..." phrasing below would name a swing the path never flies.
+            orbit = f", {beyond} = {summary['orbit_coverage_deg']:.0f} deg around"
         else:
             orbit = (f", O +/-{summary['front_yaw_deg']:.0f} deg "
                      f"{summary.get('orbit_direction', '')} "
@@ -3746,4 +4194,587 @@ def format_summary(summary):
         line += (f" - {summary['collision_fixes']} key(s) pushed out of the scene "
                  f"(closest approach {summary['clearance_before'] * 100:.1f} % -> "
                  f"{summary['clearance_after'] * 100:.1f} % of the content radius)")
+    # Face-detail orbit: the one number that matters is what the zoom achieved, so
+    # the line names the frame count and the face's share of the picture before and
+    # after - a "20 %" fill that landed at 6 % is the difference between a useful
+    # head orbit and a wasted one.
+    face = summary.get("face_orbit") or {}
+    status = face.get("status")
+    if status == "applied":
+        before = face.get("fill_before")
+        after = face.get("fill_after")
+        line += (f" - face orbit on {len(face.get('frames') or [])} frame(s) of the highest "
+                 f"band ({face.get('span', 0):.0f} deg window)")
+        if before is not None and after is not None:
+            line += f", face {before * 100:.2f} % -> {after * 100:.2f} % of the picture"
+    elif status and status not in ("off", "no face box"):
+        line += f" - no face orbit ({status})"
     return line
+
+
+# ---------------------------------------------------------------------------
+# Face-detail orbit
+# ---------------------------------------------------------------------------
+#
+# A full-body turntable shows the face at ~0.4-0.8 % of the frame, so the splat has
+# almost nothing to learn it from. The fix that costs no extra frames is to spend the
+# *centre of the highest band* on a short zoom onto the face: the top band is already
+# passing in front of the head, so those frames can look at the face instead of the
+# pivot, and the path is back on the normal orbit by the time the band sweeps on.
+#
+# Why re-aiming costs nothing: the per-frame weight of a training frame is
+# `iterations / n_frames` (both 2DGS and PGSR draw a shuffled epoch), so ADDING head
+# frames dilutes the body frames. Re-purposing existing ones does not - the frame
+# count, and with it every other frame's pass count, is untouched.
+#
+# The gate lives upstream of this file (`enndee_face_detect`, SAM3): a face box is
+# measured on the reference still, and without one this whole pass is a no-op.
+
+#: Defaults for the widgets on the camera node.
+FACE_ORBIT_FILL_DEFAULT = 20.0        # percent of the frame area the face should cover
+FACE_ORBIT_FILL_MIN = 1.0
+FACE_ORBIT_FILL_MAX = 80.0
+FACE_ORBIT_SPAN_DEFAULT = 60.0        # deg of yaw the zoom is spread over
+FACE_ORBIT_SPAN_MIN = 6.0
+FACE_ORBIT_SPAN_MAX = 360.0
+FACE_ORBIT_ELEVATION_TOLERANCE = 1.5  # deg - which frames still count as "the highest band"
+FACE_ORBIT_MIN_FRAMES = 3             # fewer frames than this is not worth re-aiming
+FACE_ORBIT_ITERATIONS = 5             # distance fixed-point steps (perspective is not exactly 1/d^2)
+#: Stand-off floor in face radii. `face_radius` is the face patch's MAX extent from its
+#: centre, so this is a bounding-sphere stand-off - the camera never enters the head.
+#: It is also what silently caps `face_fill`: at 1.35 the solve hit the floor long before
+#: a large fill was reached (measured: face_fill=70 stopped at 34.8 %). Keep it at or
+#: above 1.0 to stay outside the patch, and read `info["clearance_limited"]`.
+FACE_ORBIT_CLEARANCE = 1.0
+#: Collision margin for face keys only, in content radii. `guard_collisions` normally
+#: holds every key `COLLISION_MARGIN` content radii off the scene, but the face orbit
+#: DELIBERATELY parks the camera at the head - which is scene geometry - and enforces its
+#: own stand-off instead. Letting the generic margin push those keys back out cancelled
+#: the zoom entirely (rendered face area stayed at 0.15 % against a 20 % target while the
+#: orbit reported success). This keeps a safety floor without undoing the zoom.
+FACE_ORBIT_COLLISION_MARGIN = 0.05
+#: How far to shift the face orbit's AIM toward the reference camera, as a fraction of the
+#: face patch's own depth extent (p90 - p10). **0.0 = OFF, and that is deliberate.**
+#:
+#: This was a bandage for the box-registration bug: with the SAM3 box projected from the
+#: wrong camera the patch median sat mid-skull, so the aim was nudged forward to compensate.
+#: The registration is now exact (`_project_source`), and the user reports the opposite
+#: symptom - "the pivot point is still not right on the face but rather a bit in front left
+#: of it, that's why the face is drifting from left to right during the orbit". A shift
+#: TOWARD the camera moves the pivot in front of the face, and because the reference camera
+#: is off-axis it also slides it sideways - precisely "in front left".
+#:
+#: The pivot must be the MIDDLE of the face depth points (see `head_pivot`), with no
+#: correction on top. Raise this only if the aim is measurably BEHIND the face again.
+FACE_AIM_FORWARD_SHIFT = 0.0
+#: How many keys either side of the face window ease into the close-up. The face orbit used
+#: to move ONLY the window's keys, so the path jumped from the orbit radius to the face
+#: stand-off between two adjacent keys. That discontinuity makes camera extrinsics hard to
+#: solve downstream (the user's words: "it just jumps there"). With a taper the move ramps
+#: to full strength across `FACE_ORBIT_TAPER_KEYS` keys on each side.
+FACE_ORBIT_TAPER_KEYS = 2
+
+
+def _yaw_elevation_of(position, pivot):
+    """(yaw, elevation, radius) of a camera position around the pivot.
+
+    The inverse of `_place`: yaw 0 is between the pivot and the world origin ("front",
+    +yaw the subject's right), elevation 0 is level and + is above. Recovering the
+    angles from the positions is what lets this pass work on ANY coverage - the band
+    stack, the front O, the spiral - without touching their builders.
+    """
+    dx = float(position[0]) - float(pivot[0])
+    dy = float(position[1]) - float(pivot[1])
+    dz = float(position[2]) - float(pivot[2])
+    radius = math.sqrt(dx * dx + dy * dy + dz * dz)
+    if radius <= 1e-9:
+        return 0.0, 0.0, 0.0
+    yaw = math.degrees(math.atan2(dx, -dz))
+    elevation = math.degrees(math.asin(max(-1.0, min(1.0, -dy / radius))))
+    return yaw, elevation, radius
+
+
+#: Which keys of the top band the face orbit acts on. True = ALL of them, so the highest
+#: orbit is flown ENTIRELY around the face pivot; False = only those inside
+#: `face_yaw_span` around `centre_yaw`.
+#:
+#: Whole-band is the better behaviour and is the default. With a narrow window just 3 of
+#: 21 keys move while the rest of the top band still orbits the SUBJECT pivot, so the
+#: Catmull-Rom interpolation between the untouched neighbours drags the camera straight
+#: back out - the zoom reads as a momentary blip instead of a close-up pass. Orbiting the
+#: whole band around the face makes the close-up the band's own geometry, and the distance
+#: solve then simply sets how tight that band is.
+FACE_ORBIT_WHOLE_TOP_BAND = True
+
+
+def _angle_delta(angle, centre):
+    """Signed difference in degrees, wrapped into (-180, 180]."""
+    return (float(angle) - float(centre) + 180.0) % 360.0 - 180.0
+
+
+def face_orbit_window(keys, pivot, span=FACE_ORBIT_SPAN_DEFAULT, centre_yaw=0.0,
+                      tolerance=FACE_ORBIT_ELEVATION_TOLERANCE):
+    """Indices of the keys that sit on the highest orbit inside the yaw window.
+
+    "Highest orbit" is the elevation the most frames share at the top of the stack
+    (a tolerance band rather than an exact match, because the elevation step between
+    bands is a widget and may be small). Within that band only the frames whose yaw
+    is inside `centre_yaw +- span/2` are returned, in flight order - exactly the
+    "at -30 to 30 deg it zooms into the face" the face orbit is specified as.
+    """
+    if not keys:
+        return []
+    angles = [_yaw_elevation_of(key["pos"], pivot) for key in keys]
+    top = max(entry[1] for entry in angles)
+    window = []
+    for index, (yaw, elevation, _radius) in enumerate(angles):
+        if abs(elevation - top) > float(tolerance):
+            continue
+        # WHOLE TOP BAND: every key at the top elevation, ignoring the yaw window, so the
+        # highest orbit is flown around the FACE pivot end to end (see
+        # `FACE_ORBIT_WHOLE_TOP_BAND`). `span` only narrows the selection when that is off.
+        if FACE_ORBIT_WHOLE_TOP_BAND or abs(_angle_delta(yaw, centre_yaw)) <= float(span) / 2.0:
+            window.append(index)
+    return window
+
+
+def _resolve_fill_vfov(vfov_degrees):
+    """The vertical FOV to project with, in priority order.
+
+    ``vfov_degrees`` (what the caller measured) -> ``fast_depth.LAST_VFOV_DEGREES`` (what
+    the cloud was ACTUALLY built with - MoGe-3 reports it and the probe publishes it) ->
+    ``fast_depth.VFOV_DEGREES`` (the hard-coded 55 deg assumption). The middle step is the
+    important one: without it the face orbit measured the head at 55 deg instead of the
+    measured 38.07 deg (a 1.509x error in f), selected a patch ~4x too big, and solved for
+    2.63 units of stand-off where ~0.65 is right - so `face_fill` looked ignored.
+    """
+    if vfov_degrees:
+        return float(vfov_degrees)
+    measured = getattr(fast_depth, "LAST_VFOV_DEGREES", None)
+    if measured:
+        return float(measured)
+    return float(fast_depth.VFOV_DEGREES)
+
+
+def _project_with_pose(points, position, look, height, aspect, vfov_degrees=None):
+    """(u, v, z) normalised pixels of `points` seen from `position` looking at `look`.
+
+    `vfov_degrees` is the vertical field of view the CLOUD was built with. It must match
+    the renderer's, or every projection here is wrong: the cloud's x/y carry `z / f` with
+    `f` from the MEASURED vfov (38.04 deg on the Hanks still) while this function
+    defaulted to the hard-coded 55 deg, a 1.509x error in f. That corrupts BOTH uses of
+    this function - which cloud points land in the SAM3 face box (`_face_points`), and
+    the area the orbit solves for (`_projection_area`). Passing `None` keeps the old
+    constant so callers that do not know the measurement are unchanged.
+
+    The renderer's own pinhole (see `project_points`), re-expressed with an explicit
+    aim so it also covers the 'Horizontally straight' look, whose aim is NOT the
+    pivot. u/v come back in 0..1 so they can be compared with a face box directly.
+
+    Everything is built on the **points' device**: the surface cloud arrives on the GPU
+    in a real ComfyUI run, and mixing it with CPU constants raises
+    "Expected all tensors to be on the same device, cuda:0 and cpu".
+    """
+    pool = points.detach().to(torch.float64).reshape(-1, 3)
+    device = pool.device
+    forward = torch.tensor([float(look[axis]) - float(position[axis]) for axis in range(3)],
+                           dtype=torch.float64, device=device)
+    norm = float(forward.norm())
+    forward = (torch.tensor([0.0, 0.0, 1.0], dtype=torch.float64, device=device)
+               if norm <= 1e-9 else forward / norm)
+    up = torch.tensor([0.0, -1.0, 0.0], dtype=torch.float64, device=device)  # y-down world
+    right = torch.linalg.cross(forward, up, dim=0)
+    if float(right.norm()) < 1e-6:                                # looking straight down
+        right = torch.tensor([1.0, 0.0, 0.0], dtype=torch.float64, device=device)
+    right = right / right.norm()
+    down = torch.linalg.cross(forward, right, dim=0)
+
+    origin = torch.tensor([float(value) for value in position],
+                          dtype=torch.float64, device=device).reshape(1, 3)
+    relative = pool - origin
+    x = (relative * right.reshape(1, 3)).sum(-1)
+    y = (relative * down.reshape(1, 3)).sum(-1)
+    z = (relative * forward.reshape(1, 3)).sum(-1)
+    focal = 0.5 * float(height) / math.tan(
+        math.radians(vfov_degrees if vfov_degrees is not None
+                     else fast_depth.VFOV_DEGREES) / 2.0)
+    width = float(height) * float(aspect)
+    safe = z.clamp(min=1e-6)
+    return (0.5 + focal * x / safe / width,
+            0.5 + focal * y / safe / float(height), z)
+
+
+def _project_source(points, height, aspect, vfov_degrees=None):
+    """Exact inverse of :func:`surface_points` - the SOURCE camera, not the orbit's.
+
+    `surface_points` unprojects the depth map into frame-0 camera coordinates: origin at
+    the camera that captured the reference still, +z along the view axis,
+    `x = (xx - W/2)/f * z`, `y = (yy - H/2)/f * z`, `f = 0.5 * H / tan(vfov/2)`. So a cloud
+    point maps back to a pixel as
+
+        u = 0.5 + x * f / (z * W)        v = 0.5 + y * f / (z * H)
+
+    with no rotation basis to get wrong. A SAM3 box lives in the REFERENCE IMAGE, so this
+    - and only this - is the projection that registers it onto the cloud. Projecting with
+    the orbit's front pose instead mis-registers the box laterally AND in depth, which is
+    the observed "the face orbit aims slightly left of and behind his head", and at a tight
+    stand-off it points the camera into empty grey.
+    """
+    height = float(height)
+    width = height * float(aspect)
+    focal = 0.5 * height / math.tan(
+        math.radians(vfov_degrees if vfov_degrees is not None
+                     else fast_depth.VFOV_DEGREES) / 2.0)
+    p = points.detach().to(torch.float64).reshape(-1, 3)
+    z = p[:, 2]
+    safe = torch.where(z.abs() < 1e-6, torch.full_like(z, 1e-6), z)
+    u = 0.5 + p[:, 0] * focal / (safe * width)
+    v = 0.5 + p[:, 1] * focal / (safe * height)
+    return u, v, z
+
+
+def head_pivot(surface, front_position, front_look, face_box, height, aspect,
+               margin=1.15, radius_percentile=90.0, vfov_degrees=None):
+    """Robust ``(centre, radius, points, patch)`` for the head - the face path's pivot.
+
+    This replaces the old ``_face_points`` centre/radius for anything that has to place
+    a CAMERA, because that pair was wrong in two ways:
+
+    * ``radius = max ||p - median||`` over the selected cloud points. A MAX is one stray
+      point away from infinity - measured 0.9355 world units for a head that is really
+      ~0.15-0.20, i.e. ~5x too big. Every downstream number inherits that: the stand-off
+      floor, the distance solve, the fill.
+    * the centre was a plain median of whatever landed in the SAM3 box, which can sit off
+      the face when the box is tight or the cloud is sparse.
+
+    So: drop the upper-distance outliers first, take the median of what is left as the
+    centre, and use a PERCENTILE of the residual distances as the radius. Returns the
+    same 4-tuple shape as before so callers can adopt it without churn.
+    """
+    found = _face_points(surface, front_position, front_look, face_box,
+                         height, aspect, margin=margin, vfov_degrees=vfov_degrees)
+    if found is None:
+        return None
+    _old_centre, _old_radius, _count, patch = found
+    if patch is None or patch.numel() == 0:
+        return None
+    pts = patch.detach().to(torch.float64).reshape(-1, 3)
+    if pts.shape[0] < 8:
+        return None
+    # THE PIVOT IS THE MIDDLE OF THE FACE POINTS. Not a trimmed estimate of it: the user
+    # asked for the pivot "right into the middle of the face depth points", and a trim that
+    # re-derives the centre afterwards slides it off that middle. So compute the centre ONCE
+    # from every face point and never touch it again - the trimming below exists only to stop
+    # stray points inflating the RADIUS, and must not move the pivot.
+    centre = pts.median(dim=0).values
+    dist = (pts - centre.reshape(1, 3)).norm(dim=1)
+    # first pass: cut the far tail so the radius is not inflated by stray points
+    cut = torch.quantile(dist, 0.75)
+    if float(cut) > 1e-9:
+        keep = dist <= cut * 2.0
+        if int(keep.sum()) >= 8:
+            pts = pts[keep]
+            # `centre` is DELIBERATELY NOT recomputed here. It is the middle of ALL the face
+            # points (see above); only the radius uses the trimmed set, so stray points
+            # cannot inflate it without dragging the pivot off the face's centre.
+            dist = (pts - centre.reshape(1, 3)).norm(dim=1)
+    radius = float(torch.quantile(dist, float(radius_percentile) / 100.0))
+    if not math.isfinite(radius) or radius <= 1e-9:
+        return None
+    return centre, radius, int(pts.shape[0]), pts
+
+
+def head_distance_for_fill(radius: float, fill: float, aspect: float,
+                           vfov_degrees: float) -> float:
+    """Camera distance at which a sphere of `radius` covers `fill` of the frame.
+
+    Closed form, so there is no fixed-point loop to pin at a stand-off floor:
+
+        x = (u - cx) / f * z  ->  projected extent = 2r * f / d
+        area = (2r f / d)^2 / (width * height)
+             = r^2 / (d^2 * aspect * tan^2(vfov/2))
+        =>  d = r / (sqrt(fill) * sqrt(aspect) * tan(vfov/2))
+
+    `fill` is a fraction of the frame (0.20 = 20 %), `aspect` is the RENDER canvas'
+    width/height, `vfov_degrees` the vertical field of view the cloud was built with.
+    """
+    fill = max(1e-6, min(0.999, float(fill)))
+    aspect = max(1e-6, float(aspect))
+    half = math.tan(math.radians(float(vfov_degrees)) / 2.0)
+    if half <= 1e-9:
+        raise ValueError("vfov_degrees must be in (0, 180)")
+    return float(radius) / (math.sqrt(fill) * math.sqrt(aspect) * half)
+
+
+def _projection_area(points, position, look, height, aspect):
+    """Share of the frame the points' projected box covers (0.0 when invisible)."""
+    u, v, z = _project_with_pose(points, position, look, height, aspect)
+    visible = z > 1e-4
+    if int(visible.sum()) < 4:
+        return 0.0
+    uu, vv = u[visible], v[visible]
+    # A percentile box, like the framing metrics: one stray depth spike must not
+    # pretend the face is huge and send the camera into the floor.
+    low, high = FRAMING_PERCENTILE_LOW / 100.0, FRAMING_PERCENTILE_HIGH / 100.0
+    u0, u1 = float(torch.quantile(uu, low)), float(torch.quantile(uu, high))
+    v0, v1 = float(torch.quantile(vv, low)), float(torch.quantile(vv, high))
+    return max(0.0, u1 - u0) * max(0.0, v1 - v0)
+
+
+def _face_points(surface, front_position, front_look, face_box, height, aspect, margin=1.15,
+                 vfov_degrees=None):
+    """The subject-cloud points that fall inside the face box, in world space.
+
+    This is how the face's 3D position is found without a second depth pass: the
+    cloud is already in world units and the face box is in the reference image, so
+    "project the cloud through the reference pose and keep what lands in the box" is
+    exact. `margin` widens the box a little, so a few points survive the box being
+    tighter than the actual head.
+    """
+    cloud = surface.get("subject_cloud")
+    if cloud is None or cloud.numel() == 0:
+        cloud = surface.get("content_cloud")
+    if cloud is None or cloud.numel() == 0:
+        return None
+    # PROJECT WITH THE SOURCE CAMERA. The SAM3 box is a pixel rectangle in the reference
+    # still, and `surface_points` put the cloud in THAT camera's frame - so the exact
+    # inverse is all that is needed. `_project_with_pose` with the orbit's front pose was
+    # wrong here: it registers the box from a different viewpoint, sliding the selection
+    # sideways and behind the head.
+    u, v, z = _project_source(cloud, height, aspect, vfov_degrees=vfov_degrees)
+    cx = float(face_box["cx"])
+    cy = float(face_box["cy"])
+    half_w = float(face_box["width"]) * 0.5 * float(margin)
+    half_h = float(face_box["height"]) * 0.5 * float(margin)
+    inside = ((u - cx).abs() <= half_w) & ((v - cy).abs() <= half_h) & (z > 1e-4)
+    selected = cloud.detach().to(torch.float64).reshape(-1, 3)[inside]
+    if selected.shape[0] < 8:
+        return None
+    centre = selected.median(dim=0).values
+    radius = float((selected - centre.reshape(1, 3)).norm(dim=1).max())
+    if radius <= 1e-9:
+        return None
+    # The *patch* travels with the centre: the zoom solve has to project the face's
+    # real extent, not a single point (one point projects to one pixel and its
+    # "area" is zero, which would leave the camera at the orbit distance).
+    return centre, radius, int(selected.shape[0]), selected
+
+
+def apply_face_orbit(keys, surface, face_box, fill=FACE_ORBIT_FILL_DEFAULT,
+                     span=FACE_ORBIT_SPAN_DEFAULT, height=CANVAS_HEIGHT,
+                     centre_yaw=0.0, front_position=None, front_look=None,
+                     clearance=FACE_ORBIT_CLEARANCE, pivot=None, frames_total=None,
+                     vfov_degrees=None, render_aspect=None):
+    """(keys, info) - spend the highest band's central frames on the face.
+
+    `face_box` is the normalised ``cx, cy, width, height`` the SAM3 gate measured on
+    the reference still (see :mod:`enndee_face_detect`); ``None`` means "no face", and
+    the keys come back untouched. `front_position`/`front_look` describe the pose the
+    reference still was taken from - the framing's own front pose - and are only used
+    to find *which cloud points are the face*.
+
+    The frames that zoom are the ones already flying past the head (the highest band,
+    inside `centre_yaw +- span/2`). For each of them the camera moves along its own
+    line of sight onto the face until the face's projected box covers `fill` percent
+    of the frame, and the aim moves to the face; the frames before and after the
+    window keep the normal orbit, so the zoom grows and decays out of the band rather
+    than cutting. The frame COUNT never changes - that is the whole point, because the
+    training sampler weights every frame by ``iterations / n_frames``.
+    """
+    info = {"status": "off", "frames": [], "span": float(span), "fill": float(fill),
+            "face_area": None, "face_radius": None, "points": 0,
+            "fill_before": None, "fill_after": None}
+    if face_box is None or not keys:
+        info["status"] = "no face box"
+        return keys, info
+
+    pivot = surface["pivot"] if pivot is None else pivot
+    aspect = float(surface.get("aspect") or (16.0 / 9.0))
+    if front_position is None:
+        info["status"] = "no reference pose"
+        return keys, info
+    if front_look is None:
+        front_look = _aim(pivot, front_position)
+
+    window = face_orbit_window(keys, pivot, span, centre_yaw)
+    if len(window) < FACE_ORBIT_MIN_FRAMES:
+        info["status"] = (f"only {len(window)} frame(s) on the highest orbit inside "
+                          f"the {span:g} deg window")
+        return keys, info
+
+    # `fill_vfov`/`fill_aspect` must be known BEFORE the head is measured. `_face_points`
+    # projects the SAM3 box onto the cloud to decide which points ARE the head, and doing
+    # that with the hard-coded 55 deg instead of the measured ~38 deg selects a patch ~4x
+    # too big (measured `face_radius` 0.748 for a ~0.18 head). That inflated radius is what
+    # made the solved stand-off far too large: the orbit moved the camera 3.0 -> 2.63 and
+    # looked like `face_fill` was ignored. The box also lives in the RENDER canvas, so the
+    # canvas aspect is the right one here, not the cloud's.
+    # TWO different aspects, for two different jobs - conflating them moved the pivot.
+    #
+    # * BOX SELECTION (`head_pivot` / `_face_points`) must use the SOURCE aspect. The SAM3
+    #   box is normalised in the reference image (3440x2312 = 1.488), so projecting the
+    #   cloud into u/v with `width = height * aspect` only lines up with the box when
+    #   `aspect` is the source's. Handing it the CANVAS aspect (736x544 = 1.353) shifts the
+    #   mapped box ~10 % sideways and drags the pivot off the head - the observed "aims
+    #   slightly left of the head".
+    # * The DISTANCE SOLVE must use the CANVAS aspect, because `face_fill` is measured as a
+    #   share of the RENDERED frame and that frame is 736x544.
+    fill_aspect = float(render_aspect) if render_aspect else float(aspect)
+    fill_vfov = _resolve_fill_vfov(vfov_degrees)
+    found = head_pivot(surface, front_position, front_look, face_box, height, aspect,
+                       vfov_degrees=fill_vfov)
+    if found is None:
+        info["status"] = "the face box holds no surface points"
+        return keys, info
+    face_centre, face_radius, point_count, face_patch = found
+    # BOUNDED AIM NUDGE - the "the orbit aims behind his head" half. The face box selects
+    # the whole head VOLUME, so the patch's median sits mid-skull and the orbit looks at a
+    # point behind the face. This shifts the AIM toward the reference camera by a fraction
+    # of the patch's OWN depth extent. Unlike a near-surface trim it throws away no points,
+    # so `face_radius` and the distance solve are untouched - the trim variant dragged the
+    # camera into empty grey (see the note in `head_pivot`). The correction is bounded by
+    # construction: it can move the aim at most
+    # `FACE_AIM_FORWARD_SHIFT * (p90 - p10)` of the patch's depth.
+    if FACE_AIM_FORWARD_SHIFT > 0.0 and face_patch is not None and face_patch.numel() >= 24:
+        _pts = face_patch.detach().to(torch.float64).reshape(-1, 3)
+        _fp = torch.tensor([float(value) for value in front_position],
+                           dtype=torch.float64, device=face_centre.device)
+        _fl = torch.tensor([float(value) for value in front_look],
+                           dtype=torch.float64, device=face_centre.device)
+        _fwd = _fl - _fp
+        _n = float(_fwd.norm())
+        if _n > 1e-9:
+            _depth = (_pts - _fp.reshape(1, 3)) @ (_fwd / _n)
+            _extent = float(torch.quantile(_depth, 0.9) - torch.quantile(_depth, 0.1))
+            if _extent > 1e-9:
+                face_centre = face_centre - (_fwd / _n) * (FACE_AIM_FORWARD_SHIFT * _extent)
+    info["face_radius"] = float(face_radius)
+    info["points"] = point_count
+    info["face_area"] = _projection_area(face_patch, front_position,
+                                         front_look, height, aspect)
+
+    target = min(FACE_ORBIT_FILL_MAX, max(FACE_ORBIT_FILL_MIN, float(fill))) / 100.0
+    floor = max(1e-9, float(clearance) * float(face_radius))
+    # CLOSED FORM. `head_distance_for_fill` inverts the projection exactly, so there is
+    # no fixed-point loop to wander or to pin at the floor and then report success. The
+    # aspect and vfov MUST be the ones the renderer uses (the canvas aspect and the
+    # measured vfov), not the cloud's aspect and the hard-coded 55 deg - that mismatch is
+    # what made the old metric report 23.7 % on a frame with no face at all.
+    fill_aspect = float(render_aspect) if render_aspect else float(aspect)
+    fill_vfov = _resolve_fill_vfov(vfov_degrees)
+    # DIRECT SAM3 solve. The acceptance criterion is the SAM3 face AREA on the RENDERED
+    # frame, and SAM3 does NOT scale geometrically: it re-detects every frame and boxes
+    # facial FEATURES, so its area saturates instead of following 1/d^2. Measured on this
+    # scene, with `want = 0.339` (which the disc maths says is exactly 20.0 %):
+    #
+    #     disc model  ->  20.0 %   SAM3 scored  5.3 %   (SAM3/disc = 0.265)
+    #     box  model  ->  20.0 %   SAM3 scored  2.4 %   (SAM3/box  = 0.12)
+    #
+    # So the disc model is the closer predictor and is kept, with the detector's own ratio
+    # folded into the target. `SAM3_FACE_AREA_RATIO` is an empirical calibration, not a
+    # geometric identity - it is the measured response of this detector to this subject and
+    # it is exposed as a module constant so it can be re-measured per scene.
+    # NO detector calibration here - `face_fill` is a GEOOMETRIC frame share, and the
+    # closed form reaches it exactly. A `SAM3_FACE_AREA_RATIO` of 0.265 was tried (measured:
+    # where the disc maths says 20.0 %, SAM3 scores 5.3 %), driving the target up to 0.755
+    # so SAM3 would read 20 %. It overshot: the measured face area is NOT monotonic in
+    # stand-off - it peaks at ~5.3 % near `want = 0.34` and FALLS both sides of that -
+    # so pushing closer made the score worse (0.35 % at `want = 0.167`), not better. Solving
+    # the raw geometric target lands on the peak, which is the best SAM3 will ever report
+    # for this subject. If the caller genuinely wants SAM3 to read 20 %, that target is not
+    # attainable with this detector and should be lowered to <= 5 %.
+    fill_vfov = _resolve_fill_vfov(vfov_degrees)
+    want = head_distance_for_fill(face_radius, target, fill_aspect, fill_vfov)
+    # Diagnostic surface for the repro harness. The rendered campath shows the face
+    # orbit NEVER zooming, and these five numbers discriminate the two live causes:
+    # a unit mismatch (face_radius / want in median-depth units while the camera keys
+    # are absolute) versus the moved keys not surviving into the emitted document.
+    info["want_distance"] = float(want)
+    info["floor_distance"] = float(floor)
+    info["fill_target"] = float(target)
+    info["fill_aspect"] = float(fill_aspect)
+    info["fill_vfov"] = float(fill_vfov)
+    info["window"] = [int(i) for i in window]
+    moved = []
+    hit_floor = False
+    # SMOOTH APPROACH. The camera used to JUMP from the orbit radius to the face stand-off
+    # between two adjacent keys, which the user reports as "it just jumps there" - and a
+    # discontinuity in the path is exactly what makes camera extrinsics hard to solve
+    # afterwards. So the face-orbit move is now TAPERED: full strength across the face
+    # window, ramping smoothly to zero over `FACE_ORBIT_TAPER_KEYS` keys either side, so
+    # the path eases in and out of the close-up instead of snapping.
+    face_indices = set(window)
+    lo, hi = (min(window), max(window)) if window else (0, -1)
+    taper = max(1, int(FACE_ORBIT_TAPER_KEYS))
+    for index in range(len(keys)):
+        if index in face_indices:
+            weight = 1.0
+        elif index < lo:
+            weight = max(0.0, 1.0 - float(lo - index) / float(taper + 1))
+        elif index > hi:
+            weight = max(0.0, 1.0 - float(index - hi) / float(taper + 1))
+        else:
+            weight = 1.0
+        if weight <= 1e-6:
+            continue
+        position = keys[index]["pos"]
+        # On the face's own device: the surface cloud is on the GPU in a real run.
+        offset = face_centre - torch.tensor(
+            [float(value) for value in position],
+            dtype=torch.float64, device=face_centre.device)
+        distance = float(offset.norm())
+        if distance <= floor:
+            continue
+        direction = offset / distance
+        target_distance = min(distance, max(floor, float(want)))
+        if index in face_indices and target_distance <= floor * 1.001:
+            hit_floor = True
+        # ADAPT THE BODY ORBIT, DO NOT INVENT A NEW ONE. The body path works because it
+        # PLACES the camera on a sphere around its pivot with `_place(centre, radius, yaw,
+        # elevation)`. The old face move slid each key radially toward `face_centre`, which
+        # preserves its OLD bearing - measured from the orbit centre, not the face - so all
+        # the keys clustered into a narrow cone and the camera "just looks from right to
+        # left" instead of circling the head. Same yaw/elevation, same `_place`, only the
+        # CENTRE changes: `face_centre` instead of the subject pivot.
+        yaw, elevation, _radius = _yaw_elevation_of(position, pivot)
+        orbited = _place(face_centre, target_distance, yaw, elevation)
+        # Blend from where the key already is toward the face orbit - `weight` is 1.0
+        # inside the window and eases to 0.0 at the ends of the taper.
+        blended = [position[axis] + (float(orbited[axis]) - position[axis]) * weight
+                   for axis in range(3)]
+        keys[index]["pos"] = [round(value, 6) for value in blended]
+        keys[index]["look"] = [
+            round(keys[index]["look"][axis] + (float(face_centre[axis])
+                                              - keys[index]["look"][axis]) * weight, 6)
+            for axis in range(3)]
+        if index in face_indices:
+            keys[index]["face"] = True
+            moved.append(index)
+
+    if not moved:
+        info["status"] = "no frame could be moved onto the face"
+        return keys, info
+
+    after = [_projection_area(face_patch, keys[index]["pos"], keys[index]["look"],
+                              height, aspect) for index in moved]
+    # The document holds KEYS and the renderer interpolates `frames_total` poses from
+    # them, so COLMAP needs frame numbers, not key slots.
+    last = max(1, len(keys) - 1)
+    total = max(2, int(frames_total or (len(keys))))
+    frames = sorted({min(total - 1, int(round(index * (total - 1) / last))) for index in moved})
+    info.update({"status": "applied", "frames": frames, "keys": list(moved),
+                 "fill_before": info["face_area"], "fill_after": sum(after) / len(after),
+                 "fill_target": target,
+                 "clearance_limited": bool(hit_floor),
+                 "clearance": float(clearance), "floor_distance": float(floor)})
+    achieved = info["fill_after"]
+    if hit_floor and achieved < target - 0.02:
+        print(
+            f"[Enndee] face orbit: face_fill {target * 100:.0f} % requested but the "
+            f"stand-off floor ({float(clearance):g} x face radius = {floor:.2f} units) "
+            f"stops the camera at {achieved * 100:.0f} %. The camera is as close as the "
+            f"clearance allows - lower FACE_ORBIT_CLEARANCE (or the clearance argument) "
+            f"to zoom tighter; below ~0.95 x face radius the camera reaches the head.",
+            flush=True)
+    return keys, info
+

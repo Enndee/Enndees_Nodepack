@@ -90,6 +90,26 @@ except Exception:  # pragma: no cover - running outside ComfyUI
 IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
 MASK_GLOMAP_DIR = "masks_GLOMAP"
 MASK_LICHTFELD_DIR = "masks"
+
+#: How `prepare_masks_for_face_detail` shapes the Lichtfeld masks.
+#:
+#: Why the default is a CUT-OUT and not a plain union: a head orbit only half works
+#: on its own. The body frames and the close-ups supervise the SAME Gaussians at very
+#: different projected scales, and the equilibrium is "many Gaussians, each slightly
+#: too big" - a structured but soft face (the scale conflict Mip-Splatting exists to
+#: fix). Removing the head from the body frames keeps their pose/scale/geometry
+#: context while applying *zero* gradient to the face, so the face is learned from the
+#: close-ups alone, at close-up sharpness. The union mode is the literal reading of
+#: "united with the RMBG masks" and is kept for comparison: it only guarantees the face
+#: region is inside the mask, which helps when RMBG erodes a dark face.
+FACE_MASK_CUT = "Head cut-out (face learned from the close-ups only)"
+FACE_MASK_UNION = "Union with RMBG (only add the face region)"
+FACE_MASK_MODES = (FACE_MASK_CUT, FACE_MASK_UNION)
+
+#: Default head cut-out growth, in source pixels. The detector's box stops at the
+#: hair/skin boundary; the Gaussian splat does not, so a few pixels of margin keep the
+#: seam out of the face.
+FACE_MASK_DILATE_DEFAULT = 8
 #: sub folder Lichtfeld scans for depth maps; files are ``<image stem>.depth.png``
 #: (``depths/`` is accepted by Studio as well, but ``depth/`` is what we write).
 #: Shared with the VGGT node so both nodes produce a byte-identical layout.
@@ -414,6 +434,9 @@ class GLOMAPLichtfeldTracker:
                         "(best/largest). Used only when Image Format is JPEG."
                     ),
                 }),
+                # The face-detail mask pass - appended LAST, so no saved workflow's
+                # positional widget_values move. See `_face_widgets`.
+                **cls._face_widgets(),
             },
         }
 
@@ -427,6 +450,80 @@ class GLOMAPLichtfeldTracker:
     DESCRIPTION = ("Global SfM camera tracking (COLMAP + GLOMAP/global mapper) "
                    "with automatic binary setup and a complete Lichtfeld Studio "
                    "dataset export.")
+
+    @staticmethod
+    def _face_widgets():
+        """The face-detail mask widgets - appended LAST by both tracker nodes.
+
+        A shared dict so the binary node and the native pycolmap node offer exactly the
+        same six entries in exactly the same order, and so the pycolmap subclass can
+        pop-and-re-append them *after* its own dense-MVS widgets: inserting a widget
+        anywhere but the end would shift every saved workflow's positional
+        ``widgets_values`` array (the pack's own rule, see the base's widget comments).
+        """
+        return {
+            "face_frames": ("STRING", {
+                "default": "",
+                "force_input": True,
+                **tooltip(
+                    "Frame indices of the face orbit, comma separated (the Meridian "
+                    "camera node's face_frames output). When connected they are "
+                    "AUTHORITATIVE: the node does not have to guess which frames are "
+                    "the close-ups. Leave unconnected and the scan's own box sizes "
+                    "decide (the close-ups are the outlier group at the top)."
+                ),
+            }),
+            "prepare_masks_for_face_detail": ("BOOLEAN", {
+                "default": False,
+                **tooltip(
+                    "Face-detail masks. Looks for a face on every frame (SAM3, "
+                    "'face') and shapes the Lichtfeld masks around the result: the "
+                    "close-up frames keep the whole picture, and on the body frames "
+                    "the head is removed from the RMBG foreground - so the face is "
+                    "learned from the close-ups alone instead of being argued about "
+                    "by views that see it 30x smaller. Needs comfyui-rmbg's SAM3; "
+                    "without it the node logs why and exports the normal masks."
+                ),
+            }),
+            "face_mask_mode": (list(FACE_MASK_MODES), {
+                "default": FACE_MASK_CUT,
+                **tooltip(
+                    f"'{FACE_MASK_CUT}': body frames lose the head, close-ups keep "
+                    f"everything - the pass that actually buys face detail (it is the "
+                    f"scale conflict between body views and close-ups that keeps the "
+                    f"face soft). '{FACE_MASK_UNION}': the RMBG mask with the face "
+                    f"region OR-ed in and nothing removed - the literal 'united with "
+                    f"the RMBG masks' reading, useful when RMBG erodes a dark face."
+                ),
+            }),
+            "face_prompt": ("STRING", {
+                "default": "face",
+                **tooltip(
+                    "Text prompt the face scan looks for. Measured on the Lara "
+                    "figurine: 'face' (or 'the face') finds it at 0.90-0.92 confidence "
+                    "on every front-facing frame; 'head' returns a larger box that "
+                    "includes the hair; 'person' returns the whole figure."
+                ),
+            }),
+            "face_threshold": ("FLOAT", {
+                "default": 0.75, "min": 0.05, "max": 0.95, "step": 0.01,
+                **tooltip(
+                    "Confidence floor of the face scan. SAM3's own default (0.5) also "
+                    "accepts boxes invented on frames that turned away from the face "
+                    "(0.51-0.73); the real face scores 0.80-0.92, so 0.75 keeps it and "
+                    "drops the inventions."
+                ),
+            }),
+            "face_mask_dilate": ("INT", {
+                "default": FACE_MASK_DILATE_DEFAULT, "min": 0, "max": 128, "step": 1,
+                **tooltip(
+                    "Grow the head box by this many pixels before it is removed from "
+                    "the body frames. The detector stops at the hair/skin boundary but "
+                    "the splat does not, so a few pixels of margin keep the mask seam "
+                    "out of the face."
+                ),
+            }),
+        }
 
     # The native pycolmap node ("COLMAP for Lichtfeld (Enndee)") overrides these
     # two hooks; everything below the backend setup is shared verbatim.
@@ -450,7 +547,10 @@ class GLOMAPLichtfeldTracker:
                export_depth_maps=False, dense_max_image_size=1024,
                dense_geom_consistency=True, fuse_dense_cloud=False,
                dense_cloud_max_points=400000, mesh_dense_surface=False,
-               mesh_method="poisson"):
+               mesh_method="poisson",
+               face_frames="", prepare_masks_for_face_detail=False,
+               face_mask_mode=FACE_MASK_CUT, face_prompt="face",
+               face_threshold=0.75, face_mask_dilate=FACE_MASK_DILATE_DEFAULT):
         """Run the complete tracking + export pipeline for one frame batch."""
 
         # ---------- 1. Make sure COLMAP / GLOMAP are available ------------
@@ -497,6 +597,28 @@ class GLOMAPLichtfeldTracker:
             masks_glomap, masks_path, downscale_factor, offset_glomap, "GLOMAP")
         masks_lichtfeld = self._prepare_masks(
             masks_lichtfeld, "", 1.0, offset_splat, "Lichtfeld")
+
+        # ---------- 4.5 Face-detail masks (optional) --------------------
+        # Runs BEFORE the frame stepping, so the frame numbers the camera node reports
+        # (they are in the rendered video's frame space) still line up, and so the
+        # masks are stepped together with the images they belong to. It is a no-op
+        # unless the widget is on, and it never raises: a missing detector logs why and
+        # the pipeline continues with the masks it already had.
+        face_masks, face_report = self._prepare_face_masks(
+            export_images, alpha_images, face_frames,
+            bool(prepare_masks_for_face_detail), prompt=face_prompt,
+            threshold=float(face_threshold), dilate=int(face_mask_dilate),
+            mode=face_mask_mode,
+        )
+        if face_masks is not None:
+            if masks_lichtfeld is None:
+                masks_lichtfeld = face_masks
+            else:
+                masks_lichtfeld = torch.maximum(masks_lichtfeld, face_masks)
+            log(f"face-detail masks merged into the Lichtfeld masks "
+                f"({tuple(masks_lichtfeld.shape)})")
+        else:
+            log(f"face-detail masks: {face_report}")
 
         # ---------- 5. Frame stepping -----------------------------------
         step = max(1, int(frame_step))
@@ -874,6 +996,189 @@ class GLOMAPLichtfeldTracker:
 
         log(f"{label} masks ready: {tuple(masks.shape)}")
         return masks
+
+    # =======================================================================
+    # Helpers: face-detail masks
+    # =======================================================================
+
+    def _scan_faces(self, images, prompt, threshold):
+        """(areas, boxes, report) - SAM3's face reading for every frame.
+
+        One detection pass per frame, largest box kept. Costs about 0.2 s/frame on a
+        2464x3232 capture (measured on the Lara set: 175 frames, ~35 s after the ~10 s
+        model load), so the full scan is affordable - but when the camera node already
+        knows which frames are the face orbit's, that list is authoritative and this
+        scan is only used for the head *boxes*. Never raises: a missing detector
+        returns empty results plus the reason.
+        """
+        try:
+            from enndee_face_detect import detect_faces, largest_face
+        except Exception as exc:                                    # noqa: BLE001
+            return [], [], f"face scan unavailable ({type(exc).__name__}: {exc})"
+
+        import time
+
+        total = int(images.shape[0])
+        areas, boxes = [], []
+        started = time.time()
+        for index in range(total):
+            faces, _report = detect_faces(images[index:index + 1], prompt=prompt,
+                                          threshold=threshold, verbose=False)
+            best = largest_face(faces)
+            areas.append(float(best["area"]) if best else 0.0)
+            boxes.append(best)
+        elapsed = time.time() - started
+        found = sum(1 for area in areas if area > 0.0)
+        report = (f"face scan: {found}/{total} frames hold a face, "
+                  f"{elapsed:.1f} s ({elapsed / max(1, total):.2f} s/frame)")
+        for index, area in enumerate(areas):
+            if area > 0.0:
+                box = boxes[index]
+                report += (f"\n  frame {index + 1:04d}: {box['width_px']:.0f}x"
+                           f"{box['height_px']:.0f} px = {area * 100.0:.3f} % of the frame "
+                           f"(score {box['score']:.3f})")
+        log(report)
+        return areas, boxes, report
+
+    def _prepare_face_masks(self, images, alpha_images, face_frames, enabled,
+                            prompt="face", threshold=0.75,
+                            dilate=FACE_MASK_DILATE_DEFAULT, mode=FACE_MASK_CUT):
+        """(masks [N,1,H,W] or None, report) - the face-detail mask pass.
+
+        Which frames are the face orbit's comes from `face_frames` when the camera node
+        hands them over (authoritative), otherwise from the scan's own box sizes, where
+        the close-ups are the outlier group at the top of the list (see
+        `enndee_face_detect.face_frame_indices`).
+
+        `mode` decides what the mask then says:
+        * ``FACE_MASK_CUT``   - the close-ups keep the whole frame; the body frames keep
+          the RMBG foreground with the (dilated) head removed. This is the pass that
+          actually buys face detail, because it stops the body views from arguing with
+          the close-ups about how big the face's Gaussians should be.
+        * ``FACE_MASK_UNION`` - the RMBG mask with the face region OR-ed in, nothing
+          removed.
+
+        The mask is built on the RMBG alpha when there is one (that is the "united with
+        the RMBG masks" part), else on the full frame.
+        """
+        if not enabled:
+            return None, "face-detail masks off"
+        if images is None or images.shape[0] == 0:
+            return None, "face-detail masks: no images"
+
+        height, width = int(images.shape[1]), int(images.shape[2])
+        count = int(images.shape[0])
+
+        # --- which frames are the face orbit's -----------------------------
+        # The indices are **0-based**, matching the camera node's face_frames output
+        # (it emits `round(key * (frames-1) / (keys-1))`, i.e. frame numbers 0..n-1).
+        # Out-of-range tokens are dropped with a warning rather than silently shifted,
+        # so a 1-based list (0001 ... ) is visibly wrong instead of quietly off by one.
+        chosen, areas, boxes = [], [], []
+        text = str(face_frames or "").strip()
+        if text:
+            dropped = []
+            for token in text.replace(";", ",").split(","):
+                token = token.strip()
+                if not token:
+                    continue
+                try:
+                    value = int(float(token))
+                except ValueError:
+                    dropped.append(token)
+                    continue
+                if 0 <= value < count:
+                    chosen.append(value)
+                else:
+                    dropped.append(token)
+            chosen = sorted(set(chosen))
+            if dropped:
+                log_warn(f"face_frames: ignoring {dropped} - the indices are 0-based "
+                         f"frame numbers, so they must be 0..{count - 1}")
+            source = f"face_frames input ({len(chosen)} frame(s))"
+        else:
+            from enndee_face_detect import face_frame_indices
+            areas, boxes, _report = self._scan_faces(images, prompt, threshold)
+            chosen = face_frame_indices(areas)
+            source = ("the scan's own box sizes (frames with a face at least 4x the "
+                      "median face size)")
+            if chosen:
+                log(f"face detail: biggest face {max(areas) * 100.0:.3f} % of the frame; "
+                    f"close-ups = {[index + 1 for index in chosen]}")
+            else:
+                return None, ("face-detail masks: no frame stands out as a face "
+                              "close-up - nothing to mask")
+
+        if not chosen:
+            return None, "face-detail masks: the face_frames input named no usable frame"
+        if not boxes:
+            # `face_frames` was connected, so the boxes still have to be measured - the
+            # cut-out needs to know WHERE the head is on the body frames.
+            areas, boxes, _report = self._scan_faces(images, prompt, threshold)
+        return self._face_mask_from_boxes(
+            images, alpha_images, chosen, boxes, width, height, count,
+            int(dilate), mode, source)
+
+    @staticmethod
+    def _face_mask_from_boxes(images, alpha_images, chosen, boxes, width, height,
+                              count, dilate, mode, source):
+        """(masks, report) - the RMBG base with the face pass applied to it.
+
+        Everything is moved to the CPU first: `masks_lichtfeld` comes out of
+        `_as_mask_tensor` on the CPU and `track()` then does `torch.maximum` against
+        this, so a GPU alpha would raise the same mixed-device error the camera path
+        hit. The exported masks go to disk as numpy anyway.
+        """
+        import torch as _torch
+
+        if alpha_images is not None:
+            alpha_images = alpha_images.detach().to("cpu")
+        base = None
+        if alpha_images is not None and alpha_images.dim() == 4:
+            if int(alpha_images.shape[-1]) == 4:
+                base = alpha_images[..., 3:4].permute(0, 3, 1, 2).float()
+                base = _torch.nn.functional.interpolate(
+                    base, size=(height, width), mode="bilinear", align_corners=False)
+            elif int(alpha_images.shape[1]) == 1:
+                base = alpha_images.float()
+        if base is None or int(base.shape[0]) != count:
+            base = _torch.ones((count, 1, height, width), dtype=_torch.float32)
+        else:
+            base = base.clamp(0.0, 1.0)
+
+        face_set = set(int(index) for index in chosen)
+        masks = base.clone()
+        cut, added = 0, 0
+        for index in range(count):
+            if index in face_set:
+                # A close-up exists to show the face: train on all of it.
+                masks[index] = 1.0
+                continue
+            box = boxes[index] if index < len(boxes) else None
+            if box is None:
+                continue
+            x0 = max(0, int(round(float(box["x0"]) * width - dilate)))
+            x1 = min(width, int(round(float(box["x1"]) * width + dilate)))
+            y0 = max(0, int(round(float(box["y0"]) * height - dilate)))
+            y1 = min(height, int(round(float(box["y1"]) * height + dilate)))
+            if x1 <= x0 or y1 <= y0:
+                continue
+            if str(mode) == FACE_MASK_UNION:
+                masks[index, :, y0:y1, x0:x1] = 1.0
+                added += 1
+            else:
+                masks[index, :, y0:y1, x0:x1] = 0.0
+                cut += 1
+
+        if str(mode) == FACE_MASK_UNION:
+            detail = f"face region added to {added} body frame(s)"
+        else:
+            detail = (f"head removed from {cut} body frame(s), "
+                      f"{len(face_set)} close-up(s) kept whole")
+        report = (f"face-detail masks ({mode}): {detail}, dilate {int(dilate)} px at "
+                  f"{width}x{height}, source {source}")
+        log(report)
+        return masks.contiguous(), report
 
     # =======================================================================
     # Helpers: folders

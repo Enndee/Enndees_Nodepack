@@ -170,9 +170,9 @@ class ImageLoaderResizeEnndee:
         }
 
 
-    RETURN_TYPES = ("IMAGE", "IMAGE", "MASK", "INT", "INT", "STRING", "FLOAT")
+    RETURN_TYPES = ("IMAGE", "IMAGE", "MASK", "INT", "INT", "STRING", "FLOAT", "STRING")
     RETURN_NAMES = ("image", "original_image", "mask", "width", "height", "image_path",
-                    "megapixels")
+                    "megapixels", "file_name")
     OUTPUT_TOOLTIPS = (
         "The loaded image, resized when 'resize' is enabled.",
         "The loaded image at its original file size, never resized.",
@@ -180,6 +180,8 @@ class ImageLoaderResizeEnndee:
         "Width of the resized image (source width when 'resize' is off).",
         "Height of the resized image (source height when 'resize' is off).",
         "Resolved path of the loaded file.",
+        "Megapixel target used for resize.",
+        "Selected image filename without its extension.",
     )
     FUNCTION = "load"
     CATEGORY = "Enndee/image"
@@ -257,7 +259,7 @@ class ImageLoaderResizeEnndee:
             mask = mask.repeat(repeat, 1, 1)
 
         return (result, original, mask, result.shape[2], result.shape[1], image_path,
-                float(megapixels))
+                float(megapixels), os.path.splitext(os.path.basename(image))[0])
 
     @classmethod
     def IS_CHANGED(cls, image, **kwargs):

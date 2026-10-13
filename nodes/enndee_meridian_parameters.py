@@ -44,6 +44,7 @@ import shlex
 
 import torch
 
+import enndee_meridian_fast_depth as fast_depth
 from enndee_meridian_auto_camera import (
     AUTO_TARGETS,
     BAND_COUNT_DEFAULT,
@@ -76,6 +77,8 @@ from enndee_meridian_auto_camera import (
     ORBIT_END_DEFAULT,
     ORBIT_END_MAX,
     ORBIT_END_MIN,
+    ORBIT_LOOK_DEFAULT,
+    ORBIT_LOOK_MODES,
     ORBIT_SIZE_DEFAULT,
     ORBIT_SIZE_MAX,
     ORBIT_SIZE_MIN,
@@ -157,7 +160,7 @@ AUTO_WIDGET_NAMES = ("auto_target", "auto_max_speed", "auto_path_mode", "auto_su
                      "auto_orbit_distance", "auto_orbit_size", "auto_orbit_end",
                      "auto_orbit_direction", "auto_orbit_view_angle", "auto_orbit_coverage",
                      "auto_pivot_x", "auto_pivot_y", "auto_pivot_z", "auto_orbit_angle",
-                     "spiral_end", "spiral_slope")
+                     "spiral_end", "spiral_slope", "auto_orbit_look")
 
 
 def build_meridian_arguments(output_frames):
@@ -388,7 +391,7 @@ class MeridianParametersAndCamera:
                 "model_size": (["Depth-Anything-V2-Small-hf", "Depth-Anything-V2-Base-hf",
                                 "Depth-Anything-V2-Large-hf", "Depth-Anything-3-Small",
                                 "Depth-Anything-3-Base", "Depth-Anything-3-Large",
-                                "Depth-Anything-3-Mono-Large"], {
+                                "Depth-Anything-3-Mono-Large", "MoGe-3-ViT-L"], {
                     "default": "Depth-Anything-3-Mono-Large",
                     "tooltip": (
                         "Depth model the automatic pivot is ESTIMATED with. It must be the SAME "
@@ -471,7 +474,12 @@ class MeridianParametersAndCamera:
                         f"the same sphere around the pivot, so the framing and the distance never "
                         f"change and the camera never rolls. A {BAND_WIDTH_MAX:g} deg 'Band Width' "
                         f"is a full turn, which ends where it began - so it does NOT alternate: the "
-                        f"camera carries on the way it was going, one turn per band."
+                        f"camera carries on the way it was going, one turn per band. "
+                        f"'{ORBIT_COVERAGES[4]}' flies that SAME stack and then repeats it on the "
+                        f"far side: the camera does NOT turn back at the top - it extends the top "
+                        f"band's sweep, same heading, across to the far side, then walks the same "
+                        f"bands back DOWN there, each swept the way its front twin was. No arc is "
+                        f"shown twice and the whole visit stays as short as it can be."
                     ),
                 }),
                 # The front O's angular radius, appended last (same reason as the shape widgets
@@ -553,7 +561,8 @@ class MeridianParametersAndCamera:
                     "default": round(BAND_START_ANGLE_DEFAULT, 1),
                     "min": BAND_START_ANGLE_MIN, "max": BAND_START_ANGLE_MAX, "step": 5.0,
                     "tooltip": (
-                        f"Automatic camera, '{ORBIT_COVERAGES[3]}' coverage: the elevation of the "
+                        f"Automatic camera, '{ORBIT_COVERAGES[3]}' / '{ORBIT_COVERAGES[4]}' "
+                        f"coverage: the elevation of the "
                         f"FIRST (lowest) band, in degrees above/below the pivot. "
                         f"{BAND_START_ANGLE_DEFAULT:g} (the default) starts level with the subject; "
                         f"{BAND_START_ANGLE_MIN:g} starts from the farthest point below - looking up "
@@ -569,7 +578,8 @@ class MeridianParametersAndCamera:
                     "default": int(BAND_COUNT_DEFAULT),
                     "min": int(BAND_COUNT_MIN), "max": int(BAND_COUNT_MAX), "step": 1,
                     "tooltip": (
-                        f"Automatic camera, '{ORBIT_COVERAGES[3]}' coverage: how many circle "
+                        f"Automatic camera, '{ORBIT_COVERAGES[3]}' / '{ORBIT_COVERAGES[4]}' "
+                        f"coverage: how many circle "
                         f"segments (bands) the path is made of. One band is a plain partial orbit "
                         f"at the Band Start Angle; every extra one adds a full sweep at a new "
                         f"elevation, and the camera steps straight between them. Three bands "
@@ -581,7 +591,8 @@ class MeridianParametersAndCamera:
                     "default": round(BAND_WIDTH_DEFAULT, 1),
                     "min": BAND_WIDTH_MIN, "max": BAND_WIDTH_MAX, "step": 5.0,
                     "tooltip": (
-                        f"Automatic camera, '{ORBIT_COVERAGES[3]}' coverage: how many degrees of "
+                        f"Automatic camera, '{ORBIT_COVERAGES[3]}' / '{ORBIT_COVERAGES[4]}' "
+                        f"coverage: how many degrees of "
                         f"azimuth ONE band sweeps, measured around the subject. "
                         f"{BAND_WIDTH_DEFAULT:g} deg (the default) is half a turn: the camera flies "
                         f"from the Band Start Yaw to the opposite side, steps to the next band "
@@ -596,7 +607,8 @@ class MeridianParametersAndCamera:
                     "default": round(BAND_START_YAW_DEFAULT, 1),
                     "min": BAND_START_YAW_MIN, "max": BAND_START_YAW_MAX, "step": 5.0,
                     "tooltip": (
-                        f"Automatic camera, '{ORBIT_COVERAGES[3]}' coverage: where around the "
+                        f"Automatic camera, '{ORBIT_COVERAGES[3]}' / '{ORBIT_COVERAGES[4]}' "
+                        f"coverage: where around the "
                         f"subject the FIRST band BEGINS, in degrees about the subject's vertical "
                         f"axis. {BAND_START_YAW_DEFAULT:g} (the default) is the frontal azimuth - "
                         f"the same side the source camera saw. POSITIVE values start on the "
@@ -611,7 +623,8 @@ class MeridianParametersAndCamera:
                     "default": round(BAND_STEP_DEFAULT, 1),
                     "min": BAND_STEP_MIN, "max": BAND_STEP_MAX, "step": 5.0,
                     "tooltip": (
-                        f"Automatic camera, '{ORBIT_COVERAGES[3]}' coverage: how many degrees of "
+                        f"Automatic camera, '{ORBIT_COVERAGES[3]}' / '{ORBIT_COVERAGES[4]}' "
+                        f"coverage: how many degrees of "
                         f"ELEVATION separate two neighbouring bands. {BAND_STEP_DEFAULT:g} (the "
                         f"default) is AUTO: the stack is spread over the whole range that is left "
                         f"in the direction with more room, so three bands from -90 deg become "
@@ -620,6 +633,53 @@ class MeridianParametersAndCamera:
                         f"to {BAND_STEP_MIN:g}..{BAND_STEP_MAX:g} deg."
                     ),
                 }),
+                # What the camera LOOKS at along the automatic path. Appended last (same reason
+                # as the band widgets): every saved workflow's positional widgets_values array
+                # stays valid. The JS panel shows it with the automatic group.
+                "auto_orbit_look": (list(ORBIT_LOOK_MODES), {
+                    "default": ORBIT_LOOK_DEFAULT,
+                    "tooltip": (
+                        f"Automatic camera: what the camera LOOKS at along the path. "
+                        f"'{ORBIT_LOOK_MODES[0]}' (the default) aims every pose at the estimated "
+                        f"pivot itself, so the subject stays centred and its apparent size holds "
+                        f"(the camera orbits the pivot on a sphere, one radius from it at every "
+                        f"pose). '{ORBIT_LOOK_MODES[1]}' keeps the forward LEVEL: the camera aims "
+                        f"at the vertical AXIS through the pivot at its OWN height, so the horizon "
+                        f"stays straight and the subject keeps its horizontal place while the "
+                        f"camera rides up and down the bands. Because a level look wants a level "
+                        f"stand-off, that mode also moves the camera onto a CYLINDER around that "
+                        f"axis, so the straight (perpendicular) distance to the axis is the SAME on "
+                        f"every orbit - the subject's width then stays constant however high the "
+                        f"camera goes. The heights each pose visits are unchanged; only the "
+                        f"stand-off and the aim move. Applies to every coverage."
+                    ),
+                }),
+                "face_orbit": (["Off", "Auto (SAM3)"], {
+                    "default": "Off",
+                    "tooltip": "Face-detail orbit. 'Auto (SAM3)' looks for a face on the reference image BEFORE the path is estimated and, when one is found, spends the centre of the highest band on it: the frames already flying past the head zoom in until the face fills Face Orbit Fill percent of the picture, then the path returns to the normal orbit. The frame count never changes, so no body frame loses a training pass. 'Off' flies the plain path. Only meaningful for the banded coverages (Banded Orbits / Banded Orbits Front & Back), whose stack has a definite highest band.",
+                }),
+                "face_fill": ("FLOAT", {
+                    "default": 20.0, "min": 1.0, "max": 80.0, "step": 0.5,
+                    "tooltip": "How much of the picture the face should cover during the face orbit, in percent of the frame area. The turntable shows the face at about 0.4-0.8 %, so 20 % is roughly a 30x area gain (a 5.5x linear zoom). The camera stops at a stand-off of ~1.35 face radii, so a very high value is clamped by geometry rather than crashing into the head.",
+                }),
+                "face_yaw_span": ("FLOAT", {
+                    "default": 60.0, "min": 6.0, "max": 360.0, "step": 1.0,
+                    "tooltip": "The yaw window (degrees, centred on the front) inside the highest band that flies the zoom - the spec's 'at -30 to 30 deg it zooms into the face'. The frames just outside the window keep the normal orbit, so the zoom grows and decays out of the band instead of cutting.",
+                }),
+                "face_prompt": ("STRING", {
+                    "default": "face",
+                    "tooltip": "Text prompt the SAM3 gate looks for. Measured on this scene: 'face' (or 'the face') finds the figurine's face at 0.90-0.92 confidence on every front-facing frame; 'head' returns a larger box that includes the hair; 'person' returns the whole figure.",
+                }),
+                "face_threshold": ("FLOAT", {
+                    "default": 0.75, "min": 0.05, "max": 0.95, "step": 0.01,
+                    "tooltip": "SAM3 confidence floor for the face gate. SAM3's own default is 0.5, which on this capture also accepts boxes invented on frames that turned away from the face (0.51-0.73); the real face scores 0.80-0.92, so 0.75 keeps it and drops the inventions.",
+                }),
+                # Append after all existing widgets so saved positional widget_values remain valid.
+                "depth_relief": ("FLOAT", {
+                    "default": 1.0, "min": 0.25, "max": 4.0, "step": 0.05,
+                    "tooltip": "Depth RELIEF used by both camera estimation and Geometry. The face pivot and all camera-path measurements use the relieved surface. This value travels in custom_camera and overrides Geometry's fallback relief, so it matches the render (e.g. 1.2). 1.0 leaves depth unchanged.",
+                }),
+
             },
             "optional": {
                 "reference_image": ("IMAGE", {
@@ -628,15 +688,22 @@ class MeridianParametersAndCamera:
                 "subject_mask": ("MASK", {
                     "tooltip": "Automatic camera mode (optional): a subject mask from any segmentation node (white = subject). Without it the estimator splits the near depth layer off the background itself.",
                 }),
+                "face_bbox": ("STRING", {
+                    "force_input": True,
+                    "tooltip": "Face orbit override: 'cx,cy,w,h' normalised (the Enndee Face Detect node's face_bbox output). When connected it REPLACES the built-in SAM3 gate, so a face found on another image or a hand-placed box can drive the zoom. Leave it unconnected to let the node run SAM3 itself.",
+                }),
             },
         }
 
-    RETURN_TYPES = ("STRING", CAMERA_SIGNAL_TYPE)
-    RETURN_NAMES = ("args", "custom_camera")
+    RETURN_TYPES = ("STRING", CAMERA_SIGNAL_TYPE, "STRING")
+    RETURN_NAMES = ("args", "custom_camera", "face_frames")
     OUTPUT_TOOLTIPS = (
         "Meridian sample.py arguments for the Geometry node's args_override input.",
         "Camera path for the Geometry node's custom_camera input: the manual path widgets or the "
         "estimated automatic orbit, always as long as Output Frames.",
+        "Comma-separated indices of the frames the face orbit re-aimed onto the face (empty when it "
+        "did not run). Feed it to the COLMAP node's face_frames input so the head is masked out of "
+        "the body frames and the face is only supervised by the close-ups.",
     )
     FUNCTION = "build"
     CATEGORY = "Enndee/Meridian"
@@ -653,11 +720,41 @@ class MeridianParametersAndCamera:
         "counter-clockwise or clockwise, always fitted to the Auto Max Speed budget - or lateral "
         "survey rows across a scene's width) or the manual "
         "path around that pivot, always fitted to a camera-speed budget and guarded against "
-        "colliding with the scene geometry. VGGT is gone: Meridian Geometry runs its in-process "
+        "colliding with the scene geometry. Auto Orbit Look picks what the camera looks at: the "
+        "pivot itself (the default), or 'Horizontally straight' - a level forward at the pivot's "
+        "vertical axis, on a cylinder of the orbit radius, so the straight distance to that axis "
+        "is the same on every orbit. VGGT is gone: Meridian Geometry runs its in-process "
         "fast-depth backend only."
     )
 
-    def build(self, reference_image=None, subject_mask=None, **kwargs):
+    @staticmethod
+    def _face_gate(reference_image, kwargs, face_bbox):
+        """(face box string, report) - the SAM3 gate in front of the face orbit.
+
+        Runs only when Face Orbit is armed. A connected `face_bbox` wins over the
+        detector, so the box can come from another image (or be placed by hand) while
+        the built-in gate stays the default. Every failure is reported and returns an
+        empty string: no gate signal means no head orbit, i.e. the path falls back to
+        today's behaviour instead of breaking.
+        """
+        if str(kwargs.get("face_orbit", "Off")) != "Auto (SAM3)":
+            return "", "face orbit off"
+        if face_bbox and str(face_bbox).strip():
+            return str(face_bbox).strip(), "face box from the face_bbox input"
+        try:
+            from enndee_face_detect import detect_faces, face_bbox_string, largest_face
+        except Exception as exc:                                    # pragma: no cover
+            return "", f"face gate unavailable ({type(exc).__name__}: {exc})"
+        faces, report = detect_faces(
+            reference_image,
+            prompt=str(kwargs.get("face_prompt", "face")),
+            threshold=float(kwargs.get("face_threshold", 0.75)),
+            device="Auto",
+        )
+        print(f"[Enndee] Meridian face gate: {report}", flush=True)
+        return face_bbox_string(largest_face(faces)), report
+
+    def build(self, reference_image=None, subject_mask=None, face_bbox=None, **kwargs):
         """Emit the argument string plus the camera-path signal for the selected camera mode."""
         frames = int(kwargs["output_frames"])
         if frames not in {int(value) for value in OUTPUT_FRAME_OPTIONS}:
@@ -665,7 +762,17 @@ class MeridianParametersAndCamera:
                 f"Unsupported Meridian output length {frames}; "
                 f"choose one of {', '.join(OUTPUT_FRAME_OPTIONS)}."
             )
+        kwargs["depth_relief"] = fast_depth.resolve_depth_relief(kwargs.get("depth_relief", 1.0))
         camera_mode = kwargs["camera_mode"]
+        # The gate runs BEFORE the estimate, as the spec asks, and only where a path
+        # exists to shape: the face orbit is a pass over the *automatic* path, so a
+        # manual camera never pays for a SAM3 load.
+        box, _report = ("", "not automatic mode")
+        if camera_mode == AUTOMATIC_MODE:
+            box, _report = self._face_gate(reference_image, kwargs, face_bbox)
+        # `_build_automatic_path` reads the box off kwargs, so the gate result travels
+        # with the rest of the widget values and the private chain keeps its shape.
+        kwargs["face_box"] = box or None
         if camera_mode == AUTOMATIC_MODE:
             if reference_image is None:
                 raise ValueError(
@@ -677,7 +784,23 @@ class MeridianParametersAndCamera:
             signal = self._build_manual_path(kwargs)
         else:
             raise ValueError(f"Unknown Meridian camera mode {camera_mode!r}.")
-        return (build_meridian_arguments(frames), signal)
+        # The relief value travels on every path document: Geometry prefers the camera's
+        # depth_relief over its own fallback, so the face pivot and the rendered cloud
+        # always share one depth scale.
+        document = json.loads(signal)
+        document["depth_relief"] = float(kwargs["depth_relief"])
+        signal = json.dumps(document)
+        # The face frames ride on the path document itself (see `document_from_keys`'s
+        # `extra`), so the node can hand them to COLMAP without a second return value
+        # through the private builders.
+        face_frames = ""
+        try:
+            found = document.get("face_frames")
+            if found:
+                face_frames = ",".join(str(index) for index in found)
+        except Exception:
+            face_frames = ""
+        return (build_meridian_arguments(frames), signal, face_frames)
 
     @classmethod
     def _build_automatic_path(cls, reference_image, subject_mask, kwargs):
@@ -685,6 +808,7 @@ class MeridianParametersAndCamera:
         path_mode = kwargs["auto_path_mode"]
         if path_mode not in AUTO_PATH_MODES:
             raise ValueError(f"Unknown automatic Meridian path mode {path_mode!r}.")
+        depth_relief = fast_depth.resolve_depth_relief(kwargs.get("depth_relief", 1.0))
         target = kwargs["auto_target"]
         offset = (float(kwargs["auto_pivot_x"]), float(kwargs["auto_pivot_y"]),
                   float(kwargs["auto_pivot_z"]))
@@ -694,6 +818,7 @@ class MeridianParametersAndCamera:
                 reference_image, int(kwargs["output_frames"]), target=target,
                 max_speed=float(kwargs["auto_max_speed"]) / 100.0,
                 subject_mask=subject_mask, device=device, pivot_offset=offset,
+
                 # The estimate's pivot lives in THIS model's depth scale; the renderer scales the
                 # keys by the model it renders with, so both nodes must name the same one.
                 model_size=str(kwargs.get("model_size", "") or ""),
@@ -726,20 +851,33 @@ class MeridianParametersAndCamera:
                 spiral_end=float(kwargs["spiral_end"]),
                 # Spiral Center Slope: the lean of the spiral's central axis (-90..90).
                 spiral_slope=float(kwargs["spiral_slope"]),
-                # 'Banded Orbits': the stack of circle segments. Every number that path needs is
-                # its own widget - the O-orbit amplitude, the view angle and the direction play no
-                # part in it, so these five are all the backend reads.
+                # 'Banded Orbits' and its 'Front & Back' variant: the stack of circle segments.
+                # Every number that path needs is its own widget - the O-orbit amplitude, the view
+                # angle and the direction play no part in it, so these five are all the backend
+                # reads. The variant flies the same stack, mirrored, on the back side as well.
                 bands_start_angle=float(kwargs["band_start_angle"]),
                 bands_count=int(kwargs["band_count"]),
                 bands_width=float(kwargs["band_width"]),
                 bands_start_yaw=float(kwargs["band_start_yaw"]),
                 bands_step=float(kwargs["band_step"]),
+                # Auto Orbit Look: 'Pivot point' (default) aims at the pivot, 'Horizontally
+                # straight' keeps the forward level and rides a cylinder around the pivot's
+                # vertical axis. Every coverage honours it.
+                orbit_look=kwargs["auto_orbit_look"],
+                # Face-detail orbit: the SAM3 gate's box (measured in `build()`, before
+                # the estimate runs) plus the two shape widgets. `None` = no face = the
+                # plain path, unchanged.
+                face_box=kwargs.get("face_box"),
+                face_fill=float(kwargs.get("face_fill", 20.0)),
+                face_span=float(kwargs.get("face_yaw_span", 60.0)),
+                depth_relief=depth_relief,
             )
             print(f"[Enndee] Meridian {format_summary(summary)}", flush=True)
             return signal
         frame_count = int(kwargs["output_frames"])
         surface = probe_surface(reference_image, target=target, subject_mask=subject_mask,
-                                model_size=str(kwargs.get("model_size", "") or ""), device=device)
+                                model_size=str(kwargs.get("model_size", "") or ""), device=device,
+                                depth_relief=depth_relief)
         pivot = offset_pivot(surface, offset)
         aimed = dict(kwargs, path_pivot_x=pivot[0], path_pivot_y=pivot[1], path_pivot_z=pivot[2])
         keys = json.loads(cls._build_manual_path(aimed))["path"]
@@ -751,7 +889,8 @@ class MeridianParametersAndCamera:
         unit = max(1e-6, float(surface["median_depth"]))
         keys = [{"pos": [round(value / unit, 6) for value in key["pos"]],
                  "look": [round(value / unit, 6) for value in key["look"]],
-                 "src": key["src"], "t": key["t"]} for key in keys]
+                 "src": key["src"], "t": key["t"],
+                 **({"face": True} if key.get("face") else {})} for key in keys]
         description = (
             f"Manual path '{kwargs['path_camera_mode']}' around the estimated pivot "
             f"[{pivot[0]:.3g}, {pivot[1]:.3g}, {pivot[2]:.3g}] - the geometric midpoint of the "
@@ -764,7 +903,8 @@ class MeridianParametersAndCamera:
             f"[Enndee] Meridian manual path on the estimated pivot "
             f"[{pivot[0]:.3g}, {pivot[1]:.3g}, {pivot[2]:.3g}] ({target}, {surface['source']}), "
             f"closest approach {worst_before * 100:.1f} % -> {worst_after * 100:.1f} % of the "
-            f"content radius, {fixed} collision fix(es)",
+            f"content radius, {fixed} collision fix(es) "
+            f"(depth_relief {depth_relief:g})",
             flush=True,
         )
         return document_from_keys(

@@ -168,10 +168,19 @@ def _load_rmbg2(device: str, log: Callable[[str], None]):
     model = AutoModelForImageSegmentation.from_pretrained(repo, trust_remote_code=True)
     model.eval()
     model.to(device)
-    # BiRefNet runs a large convolution stack at 1024x1024; bf16 halves the
+    # BiRefNet runs a large convolution stack at 1024x1024; a 16-bit dtype halves the
     # memory and matches the reference CUDA implementation.
-    if str(device).startswith("cuda") and torch.cuda.is_bf16_supported():
-        model.to(torch.bfloat16)
+    #
+    # It must be float16, NOT bfloat16: torchvision's CUDA `deform_conv2d` has no
+    # BFloat16 kernel, so `model.to(torch.bfloat16)` made every CUDA run throw
+    #   "deformable_im2col" not implemented for 'BFloat16'
+    # and fall back to the CPU (measured: 158 frames in ~15 min instead of ~1).
+    # `torch.cuda.is_bf16_supported()` does NOT catch this - the 5090 supports bf16
+    # arithmetic, it is the operator that is missing. Verified on this build
+    # (torch 2.14.1+cu130 / torchvision 0.29.1+cu130): deform_conv2d works in
+    # float32 and float16 on CUDA and fails only in bfloat16.
+    if str(device).startswith("cuda"):
+        model.to(torch.float16)
 
     _rmbg2_model = model
     _rmbg2_key = (repo, device)

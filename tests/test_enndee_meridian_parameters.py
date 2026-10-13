@@ -23,7 +23,7 @@ sys.path.insert(0, str(PACK_DIR))
 sys.path.insert(0, str(PACK_DIR / "nodes"))
 
 import enndee_meridian_parameters as parameters  # noqa: E402
-from enndee_meridian_camera_path import ORBIT_OPTIONS, SWEEP_SUBSTEPS  # noqa: E402
+from enndee_meridian_camera_path import SWEEP_SUBSTEPS  # noqa: E402
 
 NODE = parameters.MeridianParametersAndCamera
 JS_PATH = PACK_DIR / "web" / "js" / "enndee_meridian_parameters.js"
@@ -89,7 +89,34 @@ class MeridianParametersWidgetTests(unittest.TestCase):
         for name in parameters.PATH_WIDGET_NAMES:
             self.assertIn(name, required)
         self.assertTrue(all("tooltip" in metadata for _options, metadata in required.values()))
-        self.assertEqual(set(NODE.INPUT_TYPES()["optional"]), {"reference_image", "subject_mask"})
+        self.assertIn("depth_relief", required)
+        # The face-detail block is still at the end, with relief appended after it -
+        # appended LAST so no saved workflow's positional widget_values move.
+        self.assertEqual(list(required)[-6:],
+                         ["face_orbit", "face_fill", "face_yaw_span", "face_prompt",
+                          "face_threshold", "depth_relief"])
+        self.assertEqual(set(NODE.INPUT_TYPES()["optional"]),
+                         {"reference_image", "subject_mask", "face_bbox"})
+
+    def test_depth_relief_widget_is_forwarded_to_camera_estimation(self):
+        fake, calls, _report = estimate_stub()
+        values = all_defaults()
+        values.update(camera_mode=parameters.AUTOMATIC_MODE, depth_relief=1.2)
+        with mock.patch.object(parameters, "estimate_camera_path", side_effect=fake):
+            NODE().build(reference_image=torch.zeros(1, 8, 8, 3), **values)
+        self.assertAlmostEqual(calls[0]["depth_relief"], 1.2)
+
+    def test_depth_relief_is_recorded_for_manual_estimated_paths(self):
+        values = all_defaults()
+        values.update(camera_mode=parameters.AUTOMATIC_MODE, auto_path_mode=parameters.MANUAL_PATH,
+                      depth_relief=1.4)
+        surface = surface_stub()
+        surface["depth_relief"] = 1.4
+        with mock.patch.object(parameters, "probe_surface", return_value=surface), \
+                mock.patch.object(parameters, "guard_collisions", return_value=([], 0, 0.0, 0.0)):
+            _args, signal, _face = NODE().build(
+                reference_image=torch.zeros(1, 8, 8, 3), **values)
+        self.assertEqual(json.loads(signal)["depth_relief"], 1.4)
 
     def test_removed_widgets_are_gone(self):
         required = NODE.INPUT_TYPES()["required"]
@@ -111,7 +138,7 @@ class MeridianParametersWidgetTests(unittest.TestCase):
         for frames in parameters.OUTPUT_FRAME_OPTIONS:
             self.assertEqual(parameters.build_meridian_arguments(frames), f"--frames {frames}")
         self.assertNotIn("--cull", parameters.build_meridian_arguments("73"))
-        args, _signal = NODE().build(**manual_defaults())
+        args, _signal, _face = NODE().build(**manual_defaults())
         self.assertNotIn("--cull", shlex.split(args))
 
     def test_camera_mode_and_auto_defaults(self):
@@ -195,14 +222,14 @@ class MeridianManualCameraTests(unittest.TestCase):
         values = manual_defaults(output_frames="124", path_orbit_left=False,
                                  path_orbit_right=False, path_orbit_left_back=True,
                                  path_orbit_right_back=True, path_start_station="RightBack")
-        args, signal = NODE().build(**values)
+        args, signal, _face = NODE().build(**values)
         document = json.loads(signal)
         self.assertEqual(document["frames"], 124)
         self.assertEqual(document["stations"], ["RightBack", "Front", "LeftBack"])
         self.assertEqual(shlex.split(args), ["--frames", "124"])
 
     def test_default_selection_uses_the_builders_sweep_order(self):
-        args, signal = NODE().build(**manual_defaults())
+        args, signal, _face = NODE().build(**manual_defaults())
         document = json.loads(signal)
         self.assertEqual(document["stations"], ["Right", "Front", "Left"])
         keys = document["path"]
@@ -216,7 +243,7 @@ class MeridianManualCameraTests(unittest.TestCase):
                                  path_start_yaw=-90.0, path_target_yaw=90.0,
                                  path_low_elevation=-30.0, path_high_elevation=30.0,
                                  path_arc_switches=3, path_first_arc="Low arc")
-        _, signal = NODE().build(**values)
+        _, signal, _face = NODE().build(**values)
         document = json.loads(signal)
         self.assertEqual(document["stations"], ["HeightSweep"])
         keys = document["path"]
@@ -242,7 +269,7 @@ class MeridianManualCameraTests(unittest.TestCase):
                                  path_start_yaw=0.0, path_target_yaw=270.0,
                                  path_spiral_start_elevation=-20.0,
                                  path_spiral_end_elevation=45.0)
-        _, signal = NODE().build(**values)
+        _, signal, _face = NODE().build(**values)
         document = json.loads(signal)
         self.assertEqual(document["stations"], ["SpiralSweep"])
         keys = document["path"]
@@ -263,8 +290,8 @@ class MeridianAutomaticCameraTests(unittest.TestCase):
         buffer = io.StringIO()
         with mock.patch.object(parameters, "estimate_camera_path", side_effect=fake), \
                 contextlib.redirect_stdout(buffer):
-            args, signal = NODE().build(reference_image=reference, subject_mask=mask, **values)
-        self.assertEqual(signal, '{"frames": 73, "path": []}')
+            args, signal, _face = NODE().build(reference_image=reference, subject_mask=mask, **values)
+        self.assertEqual(json.loads(signal), {"frames": 73, "path": [], "depth_relief": 1.0})
         self.assertEqual(shlex.split(args), ["--frames", "73"])
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["frames"], 73)
@@ -361,7 +388,7 @@ class MeridianAutomaticCameraTests(unittest.TestCase):
             raise AssertionError("the estimator must not run in manual mode")
 
         with mock.patch.object(parameters, "estimate_camera_path", side_effect=explode):
-            args, signal = NODE().build(**manual_defaults())
+            args, signal, _face = NODE().build(**manual_defaults())
         self.assertIn("--frames", args)
         self.assertTrue(signal)
 
@@ -391,7 +418,7 @@ class MeridianAutomaticCameraTests(unittest.TestCase):
         with mock.patch.object(parameters, "probe_surface", return_value=surface), \
                 mock.patch.object(parameters, "estimate_camera_path", side_effect=explode), \
                 contextlib.redirect_stdout(buffer):
-            args, signal = NODE().build(reference_image=torch.zeros(1, 8, 8, 3), **values)
+            args, signal, _face = NODE().build(reference_image=torch.zeros(1, 8, 8, 3), **values)
         document = json.loads(signal)
         self.assertEqual(document["frames"], 73)
         self.assertIn("on the estimated pivot", document["name"])

@@ -811,6 +811,36 @@ class EndToEndTests(unittest.TestCase):
             self.assertTrue((export / "images" / "0003.png").is_file())
             self.assertFalse((export / "images" / "0004.png").exists())
 
+    def test_track_without_an_export_folder_says_so_instead_of_reporting_done(self):
+        """A run that writes nothing must not read as a success.
+
+        ``_resolve_export_dir`` answers ``None`` when no path is given *and* ComfyUI's
+        output folder is unknown. The reconstruction still runs - the node's trajectory
+        and point cloud sockets are usable in memory - but nothing reaches disk, and the
+        preview used to read "done - N/N views". That is how "the DA3 node did not work
+        and did not produce any dataset" reads, with no hint as to why.
+        """
+        import glomap_lichtfeld_node
+
+        backend = StubBackend(make_reconstruction(2))
+        images = torch.from_numpy(make_images(2, 48, 64))
+        with tempfile.TemporaryDirectory() as folder:
+            export = Path(folder) / "dataset"
+            original = glomap_lichtfeld_node.COMFY_OUTPUT_DIR
+            glomap_lichtfeld_node.COMFY_OUTPUT_DIR = None
+            try:
+                answer = self._run_track_raw(backend, export, images,
+                                             lichtfeld_export_path="")
+            finally:
+                glomap_lichtfeld_node.COMFY_OUTPUT_DIR = original
+
+            self.assertFalse(export.exists())
+            text = answer["ui"]["text"][0]
+            self.assertIn("done -", text)            # the run itself did succeed
+            self.assertIn("WARNING", text)
+            self.assertIn("no dataset written", text)
+            self.assertEqual(answer["result"][3], "")
+
     def test_track_returns_an_empty_result_without_a_checkpoint(self):
         images = torch.from_numpy(make_images(2, 48, 64))
         with tempfile.TemporaryDirectory() as folder:

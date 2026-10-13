@@ -36,7 +36,7 @@ Lichtfeld Studio dataset in a single step.
 | **Resolution Selector (Enndee)** | `Enndee_ResolutionSelector` | Aspect-ratio + megapixel sizing plus the nine core resize types and a resized image output |
 | **Load & Resize Image (Enndee)** | `Enndee_ImageLoaderResize` | Load an image with the classic load-and-resize widgets, core resize types, mask channel, and original-size output |
 | **Meridian Parameters and Camera (Enndee)** | `Enndee_MeridianParametersAndCamera` | Meridian geometry arguments plus the camera path: hand-authored O orbits / alternating-height pendulum / spiral sweeps, or an automatic mode that estimates the subject's (or scene's) geometric pivot from the still's depth profile and flies a speed-capped, collision-guarded path around it (subject: almost a full circle; scene: lateral survey rows for side coverage) |
-| **Meridian Geometry (Enndee)** | `Enndee_MeridianGeometry` | Run the geometry condition pass for one still: the Depth-Anything-3 Mono-Large point-cloud flight, or an **external depth map** you connect (the only way several shots get one consistent geometry) |
+| **Meridian Geometry (Enndee)** | `Enndee_MeridianGeometry` | Run the geometry condition pass for one still: the Depth-Anything-3 Mono-Large or MoGe-3 point-cloud flight (MoGe-3's refinement-step count is a widget, and its measured FOV replaces the assumed one), drawn as a triangulated mesh or the original point splat, or an **external depth map** you connect (the only way several shots get one consistent geometry) |
 | **Meridian Camera Path LLM (Enndee)** | `Enndee_MeridianCameraPathLLM` | Author a custom camera path with a local vision LLM (LM Studio / Ollama): describe the move in plain language, the LLM sees the still + depth map and outputs an orbit trajectory, and the node renders it into a `MERIDIAN_CAMERA_PATH` signal using the real pivot/framing geometry |
 | **Lichtfeld Headless Trainer (Enndee)** | `Enndee_LichtfeldHeadlessTrainer` | Start configurable Lichtfeld Studio Gaussian-splat training from a tracker dataset and export the result as .ply, .sog or .spz |
 | **Standby On Signal (Enndee)** | `Enndee_StandbyOnSignal` | Puts the PC into S3 standby when the workflow reaches the node and the ComfyUI queue is empty (last queued prompt) |
@@ -297,6 +297,26 @@ image the Geometry node receives. The estimator:
        backend - a path document may carry the `up` it is levelled to), and the
        auto-camera's measurements use the same basis, so a pixel measured is a pixel
        rendered.
+     - `Banded Orbits` - a stack of PARTIAL orbits (circle segments) at increasing
+       elevation: sweep a band, step straight up at the same azimuth, sweep back, and
+       so on, so the top and the bottom of the subject are visited in one continuous,
+       roll-free move. The Band Start Angle / Count / Width / Start Yaw / Step widgets
+       are the whole path (a full 360 deg width never alternates). `Banded Orbits
+       Front & Back` flies that SAME stack and then repeats it on the far side: the
+       camera does NOT turn back at the top - it extends the top band's sweep, same
+       heading, across to the far side, then walks the same bands back DOWN there, each
+       swept the way its front twin was. No arc is shown twice, so the visit stays as
+       short as it can be.
+   - **Auto Orbit Look** (`auto_orbit_look`) - what the camera *looks at* along the
+     automatic path. `Pivot point` (the default) aims every pose at the estimated
+     pivot itself: the camera orbits the pivot on a sphere and every pose is exactly
+     one radius from it, so the subject stays centred and its apparent size holds.
+     `Horizontally straight` keeps the forward LEVEL - the camera aims at the vertical
+     axis through the pivot at its own height - and rides a CYLINDER of the orbit
+     radius around that axis, so the straight (perpendicular) distance to the axis is
+     the same on every orbit and the subject's width stays constant however high the
+     camera goes; the heights each pose visits are unchanged. The horizon stays level
+     either way (the level look always keeps the world up, even for a sloped spiral).
    - **Manual** - the manual styles below, but aimed at the estimated pivot
      instead of the absolute look-pivot (the `path_pivot_*` widgets are ignored
      and hidden then; every other path widget applies as usual).
@@ -389,19 +409,79 @@ the node pack to register the new node.
 
 ### Meridian Geometry: where the depth comes from
 
-`Model Size` offers exactly two choices:
+`Model Size` offers exactly three choices:
 
 - **Depth Anything 3 Mono Large** - the node runs the depth model itself (one
   forward pass per queue; `python -m pip install --no-deps depth-anything-3` in
   the ComfyUI `python_embeded`, weights land in the Hugging Face cache,
   Apache-2.0). The best depth for a single still.
+- **MoGe 3** - Microsoft's MoGe-3 (`Ruicheng/moge-3-vitl`, MIT) in-process. Like
+  DA3 it predicts depth directly (the point map's z), so there is no disparity
+  inversion; what it adds is a *self-guided sparse volumetric refinement* stage:
+  its coarse point map is voxelised into a sparse 3D grid and walked by a sparse
+  3D-UNet, `MoGe Refinement Steps` times. `0` disables the stage (a single-pass,
+  MoGe-2-style result, and the fastest), `3` is MoGe's own default, and past ~8
+  the extra time buys little. **Installed here** (2026-10-10): `moge` 3.0.0 plus
+  `flex_gemm`, `utils3d_moge` and `pipeline` - all pure Python, because FlexGEMM
+  is Triton-only, so nothing had to be compiled. Restart ComfyUI after installing
+  (it caches imported modules); the first run downloads the ~1.3 GB checkpoint.
+  Every other depth source works without it, and picking MoGe 3 without the
+  package reports the install command instead of failing silently.
 - **external** - no model is loaded at all. Connect your own map to the
   `external_depth` socket and the node uses that instead.
 
 The former V2 trio and the V3 Small/Base/Large options were removed: none of them
 beat Mono-Large on a still, and a shorter list is a shorter decision. A workflow
 saved before the picker shrank still routes (the old names are accepted), but
-pick one of the two in the UI.
+pick one of the three in the UI.
+
+`MoGe Refinement Steps` is appended on purpose, because ComfyUI maps a saved
+workflow's `widgets_values` by insertion order - and it is ignored by the other two
+sources. The estimator side has the same model: **Meridian Parameters and Camera**'s
+`Depth Model` offers `MoGe-3-ViT-L`, and the path is estimated with MoGe's own
+default step count, so the two nodes agree out of the box (a mismatch puts the
+orbit's aim at the wrong depth - see the warning in that node's tooltip).
+
+### Meridian Geometry: how the depth grid is drawn
+
+`Surface Mode` (the last widget) picks the renderer:
+
+- **points** (default) - the original square-footprint splat renderer: fast, proven, and
+  it honours every legacy widget as before.
+- **mesh** - the depth grid is triangulated, so the flight is a closed surface: real
+  occlusion, **no holes between points**, and no square point footprints. `Point Size`
+  and `Back Face Cull` do not apply in this mode (they only existed to patch the point
+  renderer); `Edge Cull` and `Edge Threshold` still do - for the mesh they are what cuts
+  the sheet at a silhouette, **or at a depth step inside it**, instead of bridging it
+  with long stretched triangles.
+
+  A triangle that crosses the camera plane is **clipped** against it rather than dropped
+  whole, so geometry is only lost when the whole of it is behind the camera. (A crossing
+  is magnified by `z / near`, so one that lands further than a canvas or two out is still
+  dropped - it would smear across the frame at ~zero depth.)
+
+  The mesh is **still opt-in**, but the near plane is no longer why. Flying the
+  auto-camera spiral end to end and counting the subject's pixels per frame:
+
+  | renderer | frames without the subject | worst off-centre | frame 72 |
+  |---|---|---|---|
+  | points | 0 / 73 | 8.9 px | 318 px |
+  | mesh | 1 / 73 | 9.2 px | 0 px |
+
+  Frame 72 is the one frame where they disagree, and there the mesh is the *more* correct
+  of the two: by then the camera has flown through the backdrop (10171 of 31874 triangles
+  are behind it), so a solid surface fills the view and the subject genuinely is occluded
+  - the point splat hides that by dropping the occluder's near vertices. What separates
+  the two is the camera path, not the renderer. Use the mesh to compare the two renderers
+  on the same clip.
+
+**The source FOV is measured when the model can report it.** MoGe-3 returns camera
+`intrinsics`, and the renderer uses the vertical FOV derived from them instead of its
+55 degree assumption (beach.jpg measures **42.53 degrees**). That matters because the
+same number drives *both* the unprojection and the target canvas: at the opening pose
+a wrong value is invisible, but as soon as the camera moves the depth is stretched and
+the parallax is wrong. Depth-Anything-3, the V2 family and `external` maps report no
+camera, so they keep the assumption.
 
 **Why you would want `external`.** A depth *estimate* is only self-consistent
 frame by frame. Shoot a scene in several takes, or render the same set from

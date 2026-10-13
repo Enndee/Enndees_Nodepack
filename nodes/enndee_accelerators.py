@@ -345,6 +345,40 @@ def _onnx_spec(cuda_major: Optional[int]) -> str:
     return ONNX_GPU_SPECS.get(cuda_major or 0, ONNX_GPU_FALLBACK)
 
 
+def _onnx_files_locked() -> bool:
+    """True when onnxruntime's native files cannot be replaced.
+
+    On Windows a running ComfyUI holds ``capi/*.pyd`` and ``*.dll`` open. Uninstalling
+    then deletes the *pure-Python* half of the package and aborts on the locked file,
+    leaving ``import onnxruntime`` as an empty **namespace** package with no
+    ``get_available_providers`` - strictly worse than the CPU wheel it was trying to
+    remove, and it takes a manual reinstall to recover. Probing for write access first
+    keeps the swap atomic: it either happens, or the package is left working.
+    """
+    try:
+        import glob
+        import os
+        import site
+
+        roots = [os.path.join(entry, "onnxruntime", "capi")
+                 for entry in (getattr(site, "getsitepackages", lambda: [])() or [])]
+        candidates = []
+        for root in roots:
+            candidates += glob.glob(os.path.join(root, "*.pyd"))
+            candidates += glob.glob(os.path.join(root, "*.dll"))
+        if not candidates:
+            return False
+        for path in candidates:
+            try:
+                with open(path, "r+b"):
+                    pass
+            except OSError:
+                return True
+        return False
+    except Exception:                                               # noqa: BLE001
+        return False
+
+
 def ensure_accelerators(auto_install: bool = True, dry: bool = False,
                         log: Optional[Callable[[str], None]] = None,
                         install_onnx: bool = True,
@@ -377,14 +411,23 @@ def ensure_accelerators(auto_install: bool = True, dry: bool = False,
 
     # ---- onnxruntime: the CPU wheel shadows the GPU one -----------------
     if install_onnx and allowed and cuda_major is not None and not ort["cuda"]:
-        if ort.get("cpu_wheel"):
-            say("removing the CPU onnxruntime wheel - it shadows onnxruntime-gpu")
-            pip(["uninstall", "-y", "onnxruntime"], dry=dry)
         spec = _onnx_spec(cuda_major)
-        say(f"installing {spec} (CUDA {cuda_major})")
-        code, _ = pip(["install", "--upgrade", spec], dry=dry)
-        if code != 0:
-            say(f"WARNING: could not install {spec} - the ONNX nodes stay on the CPU")
+        if _onnx_files_locked():
+            # Doing this while ComfyUI holds the DLL deletes the pure-Python half of the
+            # package and aborts on the locked file, leaving `import onnxruntime` as an
+            # empty namespace module - strictly worse than the CPU wheel. Skip and say
+            # why: the CPU wheel still works, the swap is not worth the breakage.
+            say("onnxruntime is loaded by another process (its native files are locked) "
+                "- leaving the CPU wheel in place instead of half-removing it. "
+                "Close ComfyUI and re-run for the CPU -> GPU swap.")
+        else:
+            if ort.get("cpu_wheel"):
+                say("removing the CPU onnxruntime wheel - it shadows onnxruntime-gpu")
+                pip(["uninstall", "-y", "onnxruntime"], dry=dry)
+            say(f"installing {spec} (CUDA {cuda_major})")
+            code, _ = pip(["install", "--upgrade", spec], dry=dry)
+            if code != 0:
+                say(f"WARNING: could not install {spec} - the ONNX nodes stay on the CPU")
         report["onnxruntime"] = onnxruntime_state()
         say("onnxruntime providers now: %s"
             % (", ".join(report["onnxruntime"]["providers"]) or "none"))

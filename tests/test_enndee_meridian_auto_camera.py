@@ -25,6 +25,8 @@ from enndee_meridian_auto_camera import (  # noqa: E402
     BAND_COUNT_MIN,
     BAND_COVERAGE,
     BAND_ELEVATION_LIMIT,
+    BAND_FRONT_BACK_COVERAGE,
+    BAND_FRONT_BACK_TURN,
     BAND_START_ANGLE_DEFAULT,
     BAND_START_ANGLE_MAX,
     BAND_START_ANGLE_MIN,
@@ -49,10 +51,13 @@ from enndee_meridian_auto_camera import (  # noqa: E402
     FRONT_YAW_AMPLITUDE,
     FRONT_YAW_LIMIT,
     FULL_CIRCLE,
+    HORIZONTAL_LOOK,
     NO_SUBJECT_SOURCE,
     ORBIT_COVERAGE_DEGREES,
     ORBIT_COVERAGES,
     ORBIT_DIRECTION_DEFAULT,
+    ORBIT_LOOK_DEFAULT,
+    ORBIT_LOOK_MODES,
     ORBIT_VIEW_ANGLE_DEFAULT,
     REST_ELEVATION_HIGH,
     SCENE_ELEVATION_HIGH,
@@ -67,6 +72,7 @@ from enndee_meridian_auto_camera import (  # noqa: E402
     SUBJECT_FILL,
     SUBJECT_TARGET,
     VISIBILITY_MARGIN,
+    VISIBILITY_MAX_SCALE,
     VISIBILITY_QUARTILES,
     automatic_keys,
     balanced_front_share,
@@ -90,6 +96,7 @@ from enndee_meridian_auto_camera import (  # noqa: E402
     probe_surface,
     project_points,
     resolve_front_orbit_amplitude,
+    resolve_look_mode,
     resolve_band_count,
     resolve_band_start_angle,
     resolve_band_start_yaw,
@@ -106,6 +113,10 @@ from enndee_meridian_auto_camera import (  # noqa: E402
     subject_share_curve,
     surface_points,
     visibility_clearances,
+    _aim,
+    _band_front_back_info,
+    _band_front_back_legs,
+    _band_front_back_samples,
     _band_info,
     _band_legs,
     _band_orbit,
@@ -296,10 +307,16 @@ class AutoCameraProbeTests(unittest.TestCase):
         surface = probe_surface(_reference(), depth_fn=lambda reference: _depth_with_subject())
         self.assertEqual(surface["target"], SUBJECT_TARGET)
         self.assertIn("near depth layer", surface["source"])
-        self.assertAlmostEqual(surface["pivot"][2], 1.0, delta=0.05)        # the subject's plane
-        # The scene pivot is the midpoint of the *cloud's* gauge (raw 1.0..4.0 -> mapped 1.0..5.0),
-        # because the estimator runs in the same window the renderer unprojects.
-        self.assertAlmostEqual(surface["scene_pivot"][2], 3.0, delta=0.1)   # (mapped near + far) / 2
+        # The gauge is *proportional* (`fast_depth.depth_gauge_scale`), anchored on the old affine
+        # map's value at the median. The pool's median is the background (raw 4.0, 86 % of the
+        # frame), so that median is anchored at 1.0 + 4.0 * (4.0 - 1.0) / (4.0 - 1.0) = 5.0 and
+        # everything else is scaled by 5.0 / 4.0 = 1.25: the subject's raw 1.0 lands at 1.25, which
+        # is its true 1.0 : 4.0 ratio against the median. The affine window used to force it to 1.0
+        # and flatten the subject's relief by C = 1.25 - the MoGe-3 bug in miniature.
+        self.assertAlmostEqual(surface["pivot"][2], 1.25, delta=0.05)       # the subject's plane
+        # The scene pivot is the midpoint of the *cloud's* gauge (raw 1.0..4.0 -> mapped 1.25..5.0),
+        # because the estimator runs in the same gauge the renderer unprojects.
+        self.assertAlmostEqual(surface["scene_pivot"][2], 3.125, delta=0.1)  # (mapped near + far) / 2
         self.assertGreater(surface["scene_radius"], surface["content_radius"])
         self.assertEqual(surface["points"], 64 * 64)
         self.assertEqual(surface["content_points"], 24 * 24)
@@ -582,17 +599,28 @@ class AutoCameraPathTests(unittest.TestCase):
         self.assertLessEqual(short_run["orbit_end"], FULL_CIRCLE + 1e-9)
         self.assertGreater(short_run["orbit_coverage"], 0.5 * FULL_CIRCLE)
         self.assertLess(short_run["amplitude_scale"], long_run["amplitude_scale"])
-        # the background is never part of the budget: the same subject 10x farther out is identical
+        # The background is never part of the budget: the same subject 10x farther out is framed
+        # identically. The gauge is proportional, so every *cloud-unit* number follows the pool
+        # median the background sets (the subject sits at raw 1.0 against a 4.0 vs a 40.0 median,
+        # i.e. 1.25 vs 0.125 cloud units, and the camera distance follows it 10x). What has to match
+        # is what the rendered frame sees: the subject's pixel radius, its distance measured in its
+        # *own radii* (the number the framing solve fixes - the renderer's `zm` scaling cancels
+        # against the cloud it scales) and the dimensionless fit. Two gauges 10x apart agree to
+        # ~5e-8 relative in float32, so these use relative deltas instead of `places=6` (3e-9).
         far_surface = probe_surface(_reference(),
                                     depth_fn=lambda reference: _depth_with_subject(background=40.0))
         far_distance, far_pivot, far_metrics = subject_framing(far_surface, 40.0)
-        self.assertAlmostEqual(far_metrics["radius_px"], metrics["radius_px"], places=6)
-        self.assertAlmostEqual(far_distance, distance, places=6)
+        self.assertAlmostEqual(far_metrics["radius_px"], metrics["radius_px"],
+                               delta=1e-5 * metrics["radius_px"])
+        self.assertAlmostEqual(far_distance / far_surface["content_radius"],
+                               distance / surface["content_radius"],
+                               delta=1e-5 * (distance / surface["content_radius"]))
         _, far_run = automatic_keys(73, far_pivot, far_distance, far_surface["content_radius"],
                                     **dict(options, surface=far_surface,
                                            cap_px=DEFAULT_MAX_SPEED * far_metrics["radius_px"]))
-        self.assertAlmostEqual(far_run["drift_px"], short_run["drift_px"], places=6)
-        self.assertAlmostEqual(far_run["amplitude_scale"], short_run["amplitude_scale"], places=6)
+        self.assertAlmostEqual(far_run["drift_px"], short_run["drift_px"],
+                               delta=1e-5 * max(1.0, abs(short_run["drift_px"])))
+        self.assertAlmostEqual(far_run["amplitude_scale"], short_run["amplitude_scale"], delta=1e-5)
 
     def test_keys_are_in_median_depth_units(self):
         """The emitted keys are relative to the median depth, exactly like the manual path.
@@ -925,16 +953,18 @@ class AutoCameraEstimateTests(unittest.TestCase):
         self.assertEqual(with_model["depth_model"], "Depth-Anything-3-Mono-Large")
         plain = json.loads(document_from_keys(73, json.loads(document)["path"], "n", "d"))
         self.assertNotIn("depth_model", plain)                    # other callers stay unchanged
+        with_relief = json.loads(document_from_keys(
+            73, json.loads(document)["path"], "n", "d", extra={"depth_relief": 1.2}))
+        self.assertEqual(with_relief["depth_relief"], 1.2)
 
-    def test_depth_from_reference_returns_depth_and_model_for_both_model_families(self):
-        """`probe_surface` unpacks (depth, model_name) - BOTH model families must honour that.
+    def test_depth_from_reference_prefers_moge_and_falls_back_to_the_older_families(self):
+        """`probe_surface` unpacks (depth, model_name) - EVERY branch must honour that.
 
-        The DA3 branch goes through `fast_depth._predict_da3_depth`, which returns a bare (H, W)
-        tensor, while the V2 branch inlines its own inference. The tuple contract was only added
-        to the V2 branch, so the first real DA3 pick on the new Depth Model widget
-        (production: `Depth-Anything-3-Mono-Large`) died with
-        "too many values to unpack (expected 2)" - every test injects `depth_fn`, which is why
-        nothing caught it. Both branches run here against fakes, so no weights are needed.
+        MoGe-3 runs FIRST whatever name arrives (the picker label is resolved upstream and
+        MoGe is the only source reporting the camera intrinsics the face orbit needs); the
+        older families stay as fallbacks for a machine without the `moge` package. A bare
+        tensor on any branch surfaces as "too many values to unpack (expected 2)", and the
+        name that actually RAN comes back with the depth so the renderer can check its gauge.
         """
         reference = torch.zeros(1, 16, 16, 3)
         sentinel = torch.full((6, 4), 2.5)                 # non-square, like a portrait DA3 grid
@@ -947,29 +977,56 @@ class AutoCameraEstimateTests(unittest.TestCase):
             def __call__(self, pixel_values=None):
                 return _Prediction()
 
+        def fake_moge(model_name, first, device):
+            seen["moge"] = model_name
+            return sentinel
+
         def fake_da3(model_name, first, device, process_res=0):
             seen["da3"] = model_name
             return sentinel
 
         def fake_v2(model_name, device):
+            if not model_name.startswith("Depth-Anything-V2"):
+                raise RuntimeError(f"no V2 weights for {model_name}")
             seen["v2"] = model_name
             return _Model()
 
-        original_da3, original_v2 = fast_depth._predict_da3_depth, fast_depth._get_depth_model
-        fast_depth._predict_da3_depth, fast_depth._get_depth_model = fake_da3, fake_v2
+        def unavailable(*_args, **_kwargs):
+            raise RuntimeError("this family is not installed")
+
+        originals = (fast_depth._predict_moge_depth, fast_depth._predict_da3_depth,
+                     fast_depth._get_depth_model)
         try:
+            fast_depth._predict_moge_depth = fake_moge
+            fast_depth._predict_da3_depth, fast_depth._get_depth_model = fake_da3, fake_v2
             depth, name = depth_from_reference(reference,
                                                model_size="Depth-Anything-3-Mono-Large")
-            self.assertIs(depth, sentinel)                  # the DA3 branch returns the bare tensor
-            self.assertEqual(name, "Depth-Anything-3-Mono-Large")   # ... plus its name now
+            self.assertIs(depth, sentinel)                  # the MoGe branch returns the bare tensor
+            self.assertEqual(name, "MoGe-3-ViT-L")          # ... plus the name that ran
+            self.assertEqual(seen, {"moge": "MoGe-3-ViT-L"})  # a stale pick never re-routes it
+
+            seen.clear()
+            fast_depth._predict_moge_depth = unavailable
+            depth, name = depth_from_reference(reference,
+                                               model_size="Depth-Anything-3-Mono-Large")
+            self.assertIs(depth, sentinel)                  # the DA3 fallback answers for DA3 names
+            self.assertEqual(name, "Depth-Anything-3-Mono-Large")
+            self.assertEqual(seen, {"da3": "Depth-Anything-3-Mono-Large"})
+
+            seen.clear()
+            fast_depth._predict_da3_depth = unavailable
             depth, name = depth_from_reference(reference,
                                                model_size="Depth-Anything-V2-Small-hf")
-            self.assertIsNotNone(depth)
+            self.assertTrue(torch.is_tensor(depth))         # the V2 fallback inlines its inference
             self.assertEqual(name, "Depth-Anything-V2-Small-hf")
-            self.assertEqual(seen.get("da3"), "Depth-Anything-3-Mono-Large")
-            self.assertEqual(seen.get("v2"), "Depth-Anything-V2-Small-hf")
+            self.assertEqual(seen, {"v2": "Depth-Anything-V2-Small-hf"})
+
+            fast_depth._get_depth_model = unavailable
+            with self.assertRaisesRegex(RuntimeError, "No depth model"):
+                depth_from_reference(reference)
         finally:
-            fast_depth._predict_da3_depth, fast_depth._get_depth_model = original_da3, original_v2
+            (fast_depth._predict_moge_depth, fast_depth._predict_da3_depth,
+             fast_depth._get_depth_model) = originals
 
     def test_estimate_is_invariant_to_the_depth_gauge(self):
         """The estimate runs in the cloud's gauge, so a raw depth's absolute scale must not matter.
@@ -1350,7 +1407,8 @@ class AutoCameraSceneTests(unittest.TestCase):
         self.assertEqual(int(surface["subject_cloud"].shape[0]),
                          reference_subject["content_points"])
         self.assertLess(int(surface["subject_cloud"].shape[0]), surface["content_points"])
-        self.assertAlmostEqual(surface["subject_pivot"][2], 1.0, delta=0.05)   # the subject's plane
+        # the subject's plane: raw 1.0 x the 1.25 gauge scale of `_depth_with_subject`'s 4.0 median
+        self.assertAlmostEqual(surface["subject_pivot"][2], 1.25, delta=0.05)
         self.assertGreater(surface["subject_radius"], 0.0)
         # a scene without a near layer reports no subject instead of pretending the scene is one
         flat = probe_surface(_reference(), target=SCENE_TARGET,
@@ -2046,14 +2104,38 @@ class AutoCameraSpiralCoverageTests(unittest.TestCase):
         image[0, top:top + block, left:left + block, 2] = 0.0
         model = _FakeV2Model(size=size, block=block, centre_x=centre_x)
         device = torch.device("cpu")
-        with mock.patch.object(fast_depth, "_get_depth_model", lambda *a, **k: model):
+
+        def fake_v2_loader(*args, **kwargs):
+            name = str(args[0]) if args else str(kwargs.get("model_name", ""))
+            if name != "Depth-Anything-V2-Small-hf":
+                raise RuntimeError(f"no weights for {name}")
+            return model
+
+        def unavailable(*_args, **_kwargs):
+            raise RuntimeError("this family is not installed")
+
+        # The estimator now runs MoGe-3 FIRST whatever name arrives, so the two newer
+        # families are knocked out here: estimate AND render then share the one fake V2
+        # scene - exactly the gauge agreement this test measures.
+        with mock.patch.object(fast_depth, "_predict_moge_depth", unavailable), \
+                mock.patch.object(fast_depth, "_predict_da3_depth", unavailable), \
+                mock.patch.object(fast_depth, "_get_depth_model", fake_v2_loader):
             document, _summary = estimate_camera_path(
                 image, 73, target=SUBJECT_TARGET, max_speed=DEFAULT_MAX_SPEED, subject_fill=40.0,
                 coverage=SPIRAL_COVERAGE, device=device, model_size="Depth-Anything-V2-Small-hf")
+            # This estimate was calibrated against the point splat, and the test is really about
+            # the estimator/renderer *gauge* agreement, so keep it on that renderer. The mesh is
+            # covered by tests/test_enndee_meridian_surface_mesh.py. Measured on this very
+            # scenario (see `fast_depth.SURFACE_DEFAULT`): with the near-plane clip in place the
+            # mesh keeps the subject for 72 of these 73 frames and loses it on the last one - not
+            # because anything was dropped, but because the camera has flown through the backdrop
+            # by then, so the surface fills the view and the subject really is occluded. The point
+            # splat hides that by dropping the occluder's near vertices.
             _source, render, width, height, length = fast_depth.render_depth_aligned(
                 image, device, model_size="Depth-Anything-V2-Small-hf", frames=73,
                 canvas_mode="custom", custom_width=size, custom_height=size, cloud_scale=1,
-                point_size=1, edge_cull=True, edge_threshold=0.30, custom_camera=document)
+                point_size=1, edge_cull=True, edge_threshold=0.30, custom_camera=document,
+                surface_mode=fast_depth.SURFACE_POINTS)
         self.assertEqual(length, 73)
         for index in range(length):
             subject = ((render[index, :, :, 0] > 0.35)
@@ -2394,6 +2476,255 @@ class AutoCameraBandCoverageTests(unittest.TestCase):
                 self.assertIsNone(summary.get("band_start_angle_deg"))
                 self.assertIsNone(summary.get("band_count"))
                 self.assertIsNone(summary.get("band_elevations_deg"))
+
+
+class AutoCameraBandFrontBackCoverageTests(unittest.TestCase):
+    """The 'Banded Orbits Front & Back' coverage: the same stack, on both sides.
+
+    The spec: fly the ordinary band stack on the front - the lowest band first, up to
+    the highest - and when it reaches the end of the highest band carry on to that
+    pose's mirror on the back side and walk the SAME stack back DOWN the bands there,
+    mirrored and reversed. One continuous, roll-free move that shows the top and the
+    bottom of the subject from both sides; every pose still lives on the one sphere.
+    """
+
+    PIVOT = [0.3, -0.2, 4.0]
+    RADIUS = 3.0
+
+    def test_front_and_back_is_a_coverage_option(self):
+        self.assertIn(BAND_FRONT_BACK_COVERAGE, ORBIT_COVERAGES)
+        self.assertEqual(ORBIT_COVERAGES[4], BAND_FRONT_BACK_COVERAGE)
+
+    @staticmethod
+    def _angles(position, pivot):
+        """(yaw, elevation) of a camera position about the pivot, in `_place` terms."""
+        yaw = math.degrees(math.atan2(position[0] - pivot[0], -(position[2] - pivot[2])))
+        horizontal = math.hypot(position[0] - pivot[0], position[2] - pivot[2])
+        elevation = math.degrees(math.atan2(-(position[1] - pivot[1]), horizontal))
+        return yaw, elevation
+
+    def _sample(self, frames=241, start_yaw=0.0, elevations=None, width=120.0):
+        elevations = [-45.0, 0.0, 45.0] if elevations is None else elevations
+        positions = _band_front_back_samples(frames, self.PIVOT, self.RADIUS, start_yaw,
+                                             elevations, width)
+        return positions, [self._angles(position, self.PIVOT) for position in positions]
+
+    def test_the_legs_climb_the_front_bridge_across_and_descend_the_back(self):
+        """The leg list is the plain stack, one bridge, then the mirrored bands."""
+        elevations = [-45.0, 0.0, 45.0]
+        legs = _band_front_back_legs(0.0, elevations, 120.0)
+        self.assertEqual(len(legs), 11)                    # 5 front legs + 1 bridge + 5 back
+        self.assertEqual(legs[:5], _band_legs(0.0, elevations, 120.0))
+        front, bridge, back = legs[:5], legs[5], legs[6:]
+        self.assertEqual((front[0][1], front[0][2]), (0.0, -45.0))        # lowest band first
+        self.assertEqual((front[-1][3], front[-1][4]), (-120.0, 45.0))    # highest band last
+        # The top band's sweep is EXTENDED - same heading, not a turn back - until it
+        # reaches the mirror of its own start, so the bridge holds the top elevation,
+        # keeps the top band's way round and covers a half turn minus the band's width.
+        self.assertEqual(bridge[2], bridge[4])
+        self.assertAlmostEqual(abs(bridge[3] - bridge[1]),
+                               BAND_FRONT_BACK_TURN - 120.0, places=9)
+        self.assertEqual(math.copysign(1.0, bridge[3] - bridge[1]),
+                         math.copysign(1.0, front[-1][3] - front[-1][1]))
+        self.assertAlmostEqual((bridge[3] - front[-1][1] - BAND_FRONT_BACK_TURN) % FULL_CIRCLE,
+                               0.0, places=9)             # lands on the mirror of the start
+        # The far side starts exactly where the bridge stopped and carries on the same
+        # way: the SAME bands, walked back DOWN, each swept the way its front twin was.
+        self.assertEqual(math.copysign(1.0, bridge[3] - bridge[1]),
+                         math.copysign(1.0, back[0][3] - back[0][1]))
+        self.assertEqual((back[0][1], back[0][2]), (bridge[3], bridge[4]))
+        self.assertEqual((back[-1][3], back[-1][4]), (-300.0, -45.0))
+        self.assertAlmostEqual(back[0][2], 45.0, places=9)                # highest band first
+        self.assertAlmostEqual((back[-1][3] - (front[-1][3] + BAND_FRONT_BACK_TURN)) % FULL_CIRCLE,
+                               0.0, places=9)             # ends on the mirror of the front end
+        for low, high in zip(back, back[1:]):
+            self.assertAlmostEqual(low[3], high[1], places=9)             # legs stay connected
+
+    def test_every_pose_stays_on_the_orbit_sphere(self):
+        positions, _angles = self._sample()
+        for position in positions:
+            self.assertAlmostEqual(math.dist(position, self.PIVOT), self.RADIUS, places=9)
+
+    def test_the_camera_climbs_the_front_then_descends_the_back(self):
+        _positions, angles = self._sample()
+        elevations = [elevation for _yaw, elevation in angles]
+        top = elevations.index(max(elevations))                           # first top-band frame
+        self.assertAlmostEqual(angles[0][1], -45.0, places=6)             # the lowest band first
+        self.assertAlmostEqual(elevations[top], 45.0, places=6)           # ... up to the highest
+        self.assertTrue(all(a <= b + 1e-6
+                            for a, b in zip(elevations[:top], elevations[1:top + 1])),
+                        "the front half must climb")
+        self.assertTrue(all(a >= b - 1e-6
+                            for a, b in zip(elevations[top:], elevations[top + 1:])),
+                        "the back half must descend")
+        self.assertAlmostEqual(elevations[-1], -45.0, places=6)           # back to the lowest
+        # the path ends on the mirror of the front top band's end (0 -> -120, +180 = 60)
+        self.assertAlmostEqual(angles[-1][0], 60.0, places=6)
+
+    def test_the_top_band_reaches_across_to_the_back(self):
+        """The wrap carries the top-elevation frames over to the far side."""
+        _positions, angles = self._sample()
+        top_yaws = [yaw for yaw, elevation in angles if abs(elevation - 45.0) < 1e-6]
+        self.assertTrue(any(yaw < -90.0 for yaw in top_yaws))    # the front end, to the left
+        self.assertTrue(any(yaw > 90.0 for yaw in top_yaws))     # ... and over on the back side
+
+    def test_the_first_pose_is_the_plain_stack_s_first(self):
+        plain = _band_samples(241, self.PIVOT, self.RADIUS, 0.0, [-45.0, 0.0, 45.0], 120.0)
+        both = _band_front_back_samples(241, self.PIVOT, self.RADIUS, 0.0,
+                                        [-45.0, 0.0, 45.0], 120.0)
+        self.assertEqual(both[0], plain[0])
+
+    def test_subject_samples_routes_the_coverage_and_ignores_the_o_widgets(self):
+        direct = _band_front_back_samples(73, self.PIVOT, self.RADIUS)
+        self.assertEqual(subject_samples(73, self.PIVOT, self.RADIUS,
+                                         coverage=BAND_FRONT_BACK_COVERAGE), direct)
+        self.assertEqual(subject_samples(73, self.PIVOT, self.RADIUS,
+                                         coverage=BAND_FRONT_BACK_COVERAGE,
+                                         view_angle=137.0, direction="clockwise", scale=0.4),
+                         direct)
+
+    def test_band_front_back_info_reports_both_halves(self):
+        info = _band_front_back_info(start_yaw=20.0, width=120.0)
+        for key in ("band_front_back", "band_start_angle", "band_count", "band_width",
+                    "band_start_yaw", "band_step", "band_elevations", "band_front_end_yaw",
+                    "band_front_end_elevation", "band_back_start_yaw", "band_end_yaw",
+                    "band_end_elevation", "orbit_coverage"):
+            self.assertIn(key, info)
+        self.assertTrue(info["band_front_back"])
+        self.assertEqual(info["band_width"], 120.0)
+        self.assertEqual(info["band_elevations"], [0.0, 44.0, 88.0])
+        # the front half stops at the top band's end; the extended top band reaches the
+        # mirror of that band's own START (the top band begins at the start yaw here)
+        self.assertAlmostEqual(info["band_front_end_yaw"], 20.0 - 120.0, places=9)
+        self.assertAlmostEqual(info["band_back_start_yaw"],
+                               info["band_start_yaw"] + BAND_FRONT_BACK_TURN, places=9)
+        # a band's width plus the half-turn bridge across the top is the azimuth shown
+        self.assertAlmostEqual(info["orbit_coverage"], 120.0 + BAND_FRONT_BACK_TURN, places=9)
+
+    def test_the_entry_point_sets_and_restores_the_band_widgets(self):
+        """`estimate_camera_path(bands_*=...)` drives the estimate, then puts them back."""
+        before = (auto_camera.band_start_angle(), auto_camera.band_count(),
+                  auto_camera.band_width(), auto_camera.band_start_yaw(), auto_camera.band_step())
+        _document, summary = _estimate(_depth_with_subject(), coverage=BAND_FRONT_BACK_COVERAGE,
+                                       bands_start_angle=-90.0, bands_count=3, bands_width=120.0,
+                                       bands_start_yaw=45.0, bands_step=45.0)
+        self.assertEqual(summary.get("coverage"), BAND_FRONT_BACK_COVERAGE)
+        self.assertTrue(summary.get("band_front_back"))
+        self.assertAlmostEqual(summary.get("band_width_deg"), 120.0, places=6)
+        self.assertEqual(summary.get("band_count"), 3)
+        # the FIRST band is held BAND_ELEVATION_LIMIT off the pole, so -90 is flown as -88
+        self.assertEqual(summary.get("band_elevations_deg"), [-BAND_ELEVATION_LIMIT, -45.0, 0.0])
+        self.assertIsNotNone(summary.get("band_front_end_yaw_deg"))
+        self.assertIsNotNone(summary.get("band_back_start_yaw_deg"))
+        self.assertAlmostEqual(summary.get("band_back_start_yaw_deg"),
+                               45.0 + BAND_FRONT_BACK_TURN, places=6)
+        self.assertEqual(before, (auto_camera.band_start_angle(), auto_camera.band_count(),
+                                  auto_camera.band_width(), auto_camera.band_start_yaw(),
+                                  auto_camera.band_step()))
+
+    def test_the_console_line_names_the_front_and_back_stack(self):
+        _document, summary = _estimate(_depth_with_subject(), coverage=BAND_FRONT_BACK_COVERAGE,
+                                       bands_width=120.0)
+        text = format_summary(summary)
+        self.assertIn("banded orbits front & back", text)
+
+
+class AutoCameraLookModeTests(unittest.TestCase):
+    """Auto Orbit Look: aim at the pivot, or keep the forward level on a cylinder.
+
+    'Pivot point' (the default) is the behaviour the other tests already pin. 'Horizontally
+    straight' keeps the forward LEVEL - the camera aims at the vertical axis through the pivot
+    at its OWN height - and rides a CYLINDER around that axis, so the straight (perpendicular)
+    distance to the axis is the same on every orbit while the heights are unchanged.
+    """
+
+    PIVOT = [0.3, -0.2, 4.0]
+
+    def _horizontal(self):
+        """Force the level look for a unit test and restore it afterwards."""
+        previous = auto_camera._ACTIVE_LOOK_MODE
+        auto_camera._ACTIVE_LOOK_MODE = HORIZONTAL_LOOK
+        self.addCleanup(setattr, auto_camera, "_ACTIVE_LOOK_MODE", previous)
+
+    def test_look_is_a_widget_option(self):
+        self.assertEqual(ORBIT_LOOK_DEFAULT, ORBIT_LOOK_MODES[0])
+        self.assertIn(HORIZONTAL_LOOK, ORBIT_LOOK_MODES)
+        self.assertEqual(resolve_look_mode(None), ORBIT_LOOK_DEFAULT)
+        self.assertEqual(resolve_look_mode(HORIZONTAL_LOOK), HORIZONTAL_LOOK)
+        with self.assertRaises(ValueError):
+            resolve_look_mode("sideways")
+
+    def test_the_level_look_rides_a_cylinder_of_the_orbit_radius(self):
+        """Every pose keeps the horizontal stand-off; the heights match the sphere."""
+        self._horizontal()
+        for elevation in (-88.0, -45.0, 0.0, 45.0, 88.0):
+            for yaw in (0.0, 90.0, 180.0, -120.0):
+                position = _place(self.PIVOT, 3.0, yaw, elevation)
+                self.assertAlmostEqual(
+                    math.hypot(position[0] - self.PIVOT[0], position[2] - self.PIVOT[2]),
+                    3.0, places=9)
+                self.assertAlmostEqual(position[1] - self.PIVOT[1],
+                                       -3.0 * math.sin(math.radians(elevation)), places=9)
+
+    def test_the_pivot_look_orbits_a_sphere(self):
+        """The default look is untouched: the distance to the pivot is the radius."""
+        for elevation in (-45.0, 0.0, 45.0):
+            position = _place(self.PIVOT, 3.0, 30.0, elevation)
+            self.assertAlmostEqual(math.dist(position, self.PIVOT), 3.0, places=9)
+
+    def test_the_level_aim_is_level_and_on_the_axis(self):
+        self._horizontal()
+        position = _place(self.PIVOT, 3.0, 40.0, 55.0)
+        aim = _aim(self.PIVOT, position)
+        self.assertAlmostEqual(aim[1], position[1], places=9)      # same height -> level forward
+        self.assertAlmostEqual(aim[0], self.PIVOT[0], places=9)    # ... on the pivot's axis
+        self.assertAlmostEqual(aim[2], self.PIVOT[2], places=9)
+
+    def test_the_pivot_look_aims_at_the_pivot(self):
+        position = _place(self.PIVOT, 3.0, 40.0, 55.0)
+        self.assertEqual(_aim(self.PIVOT, position), [float(value) for value in self.PIVOT])
+
+    def test_the_estimate_emits_a_level_look_on_a_cylinder(self):
+        document, summary = _estimate(_depth_with_subject(), orbit_look=HORIZONTAL_LOOK)
+        self.assertEqual(summary.get("orbit_look"), HORIZONTAL_LOOK)
+        unit = summary["median_depth"]
+        pivot, radius = summary["pivot"], summary["orbit_radius"]
+        keys = json.loads(document)["path"]
+        self.assertGreaterEqual(len(keys), 5)
+        for key in keys:
+            self.assertAlmostEqual(key["look"][1], key["pos"][1], places=4)     # level forward
+            absolute = [value * unit for value in key["pos"]]
+            self.assertAlmostEqual(math.hypot(absolute[0] - pivot[0], absolute[2] - pivot[2]),
+                                   radius, delta=0.05)                          # constant stand-off
+
+    def test_the_pivot_look_estimate_keeps_the_aim_on_the_pivot(self):
+        document, summary = _estimate(_depth_with_subject())                    # the default look
+        self.assertEqual(summary.get("orbit_look"), ORBIT_LOOK_DEFAULT)
+        unit = summary["median_depth"]
+        for key in json.loads(document)["path"]:
+            for axis in range(3):
+                self.assertAlmostEqual(key["look"][axis] * unit, summary["pivot"][axis], delta=0.05)
+
+    def test_the_level_look_does_not_inflate_the_distance(self):
+        """A level look cannot fix a vertical crop with distance, so the room pass must not try.
+
+        The bug this pins: the vertical drift made `_room_distance` bisect forever and return
+        `distance * VISIBILITY_MAX_SCALE` (8x), so a 90 % fill request framed ~1 % of the frame.
+        """
+        _pivot_doc, pivot_summary = _estimate(_depth_with_subject(), subject_fill=90.0)
+        _level_doc, level_summary = _estimate(_depth_with_subject(), subject_fill=90.0,
+                                              orbit_look=HORIZONTAL_LOOK)
+        self.assertLess(level_summary["orbit_radius"], pivot_summary["orbit_radius"] * 1.5)
+        self.assertGreater(level_summary["subject_fill_area"], 0.5)
+        self.assertLess(level_summary["orbit_radius"],
+                        pivot_summary["orbit_radius"] * VISIBILITY_MAX_SCALE)
+
+    def test_the_entry_point_sets_and_restores_the_look_mode(self):
+        before = auto_camera.look_mode()
+        _document, summary = _estimate(_depth_with_subject(), orbit_look=HORIZONTAL_LOOK)
+        self.assertEqual(summary.get("orbit_look"), HORIZONTAL_LOOK)
+        self.assertEqual(before, ORBIT_LOOK_DEFAULT)
+        self.assertEqual(auto_camera.look_mode(), before)                       # restored
 
 
 if __name__ == "__main__":

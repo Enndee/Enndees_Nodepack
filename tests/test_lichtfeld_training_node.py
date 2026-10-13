@@ -2,6 +2,7 @@
 
 import importlib.util
 import json
+import re
 import sys
 import tempfile
 import types
@@ -11,12 +12,14 @@ from unittest import mock
 
 
 PACK_DIR = Path(__file__).resolve().parents[1]
+JS_PATH = PACK_DIR / "web" / "js" / "enndee_lichtfeld_trainer.js"
 sys.path.insert(0, str(PACK_DIR))
 sys.path.insert(0, str(PACK_DIR / "nodes"))
 
 from lichtfeld_training_node import (  # noqa: E402
     MASK_OPACITY_PENALTIES,
     EVALUATION_SPLITS,
+    HIDEABLE_WIDGETS,
     SUBJECT_MODES,
     _LFS_VALUE_FLAGS,
     ANCHOR_MESH_NAMES,
@@ -1667,6 +1670,53 @@ class LichtfeldEvaluationTests(unittest.TestCase):
         self.assertEqual(default_eval_steps(3), [1, 2, 3])
         self.assertEqual(default_eval_steps(1), [1])
         self.assertEqual(default_eval_steps(0), [1])
+
+
+class LichtfeldWidgetVisibilityTests(unittest.TestCase):
+    """The JS panel hides a dependent widget until its switch is on.
+
+    Hiding is display-only - the node keeps every value, and the backend already drops a
+    parameter whose switch is off - but the two sides must agree on WHICH widgets are
+    dependent, or the panel would show a dead control or hide a live one. The Python
+    `HIDEABLE_WIDGETS` and the JS RULES are read together here so they cannot drift.
+    """
+
+    @staticmethod
+    def _rule_widgets():
+        """(source, names) - every widget name the JS RULES own, parsed from the file."""
+        source = JS_PATH.read_text(encoding="utf-8")
+        names = set()
+        for match in re.finditer(r"widgets:\s*\[([^\]]*)\]", source):
+            names.update(re.findall(r'"([a-z0-9_]+)"', match.group(1)))
+        return source, names
+
+    def test_the_rules_own_exactly_the_hideable_widgets(self):
+        source, names = self._rule_widgets()
+        self.assertEqual(names, set(HIDEABLE_WIDGETS))
+        self.assertIn('"Enndee_LichtfeldHeadlessTrainer"', source)
+
+    def test_the_switches_are_never_hidden(self):
+        # A hidden switch could not be turned back on, so no rule may own one. These
+        # are the top-level controls: nothing hides them.
+        _source, names = self._rule_widgets()
+        for name in ("use_depth_loss", "use_normal_loss", "use_surface_anchors",
+                     "enable_eval", "evaluation", "disable_downscaling",
+                     "background_mode", "mask_mode"):
+            self.assertNotIn(name, names, name)
+
+    def test_the_nested_switches_hide_with_their_group_and_gate_their_own_dial(self):
+        # Two widgets are deliberately both a dependent row and a switch: they hide
+        # with their own group (meaningless without it) and gate a further widget.
+        _source, names = self._rule_widgets()
+        self.assertIn("anchor_freeze", names)        # hides with the anchor group ...
+        self.assertIn("freeze_lr_scale", names)      # ... and gates the unfreeze dial
+        self.assertIn("eval_steps", names)           # hides with the evaluation group ...
+        self.assertIn("save_eval_images", names)     # ... and its own value turns it on
+
+    def test_every_hideable_widget_is_declared_on_the_node(self):
+        spec = LichtfeldHeadlessTrainer.INPUT_TYPES()["required"]
+        for name in HIDEABLE_WIDGETS:
+            self.assertIn(name, spec, name)
 
 
 if __name__ == "__main__":

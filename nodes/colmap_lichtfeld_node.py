@@ -44,6 +44,8 @@ from enndee_accelerators import ensure_accelerators
 from enndee_colmap.pycolmap_wrapper import PyColmapWrapper, pycolmap_info, resolve_gpu_bridge
 from glomap_lichtfeld_node import (  # noqa: E402
     RMBG_DEFAULT_MODE,
+    FACE_MASK_CUT,
+    FACE_MASK_DILATE_DEFAULT,
     GLOMAPLichtfeldTracker,
     log,
     log_warn,
@@ -254,6 +256,12 @@ class ColmapLichtfeldTracker(GLOMAPLichtfeldTracker):
                 "binary; delaunay needs the COLMAP build under <pack>/bin."
             ),
         })
+        # The face-detail widgets the base class appends: they arrive here BEFORE the
+        # dense-MVS block above, which would shift every saved workflow's positional
+        # widget_values. Move them to the very end, in their original order.
+        for name in GLOMAPLichtfeldTracker._face_widgets():
+            optional.pop(name, None)
+        optional.update(GLOMAPLichtfeldTracker._face_widgets())
         return spec
 
     DESCRIPTION = (
@@ -381,7 +389,11 @@ class ColmapLichtfeldTracker(GLOMAPLichtfeldTracker):
               export_depth_maps=False, dense_max_image_size=1024,
               dense_geom_consistency=True, fuse_dense_cloud=False,
               dense_cloud_max_points=400000, mesh_dense_surface=False,
-              mesh_method="poisson", unique_id=None):
+              mesh_method="poisson",
+              face_frames="", prepare_masks_for_face_detail=False,
+              face_mask_mode=FACE_MASK_CUT, face_prompt="face",
+              face_threshold=0.75, face_mask_dilate=FACE_MASK_DILATE_DEFAULT,
+              unique_id=None):
         """Run the shared pipeline with the native backend (plus live status)."""
         backend = LEGACY_MAPPER_BACKENDS.get(str(mapper_backend).lower(),
                                              str(mapper_backend).lower())
@@ -428,6 +440,12 @@ class ColmapLichtfeldTracker(GLOMAPLichtfeldTracker):
             dense_cloud_max_points=dense_cloud_max_points,
             mesh_dense_surface=mesh_dense_surface,
             mesh_method=mesh_method,
+            face_frames=face_frames,
+            prepare_masks_for_face_detail=prepare_masks_for_face_detail,
+            face_mask_mode=face_mask_mode,
+            face_prompt=face_prompt,
+            face_threshold=face_threshold,
+            face_mask_dilate=face_mask_dilate,
         )
         self._status.finish(self._summary(result))
         # ``ui.text`` is ComfyUI's built-in text preview (see PreviewAny); the live

@@ -41,6 +41,29 @@ _LFS_VALUE_FLAGS = frozenset({
 _STUDIO_PROBE_CACHE = {}
 _TAIL_LINES = 80
 
+#: Widgets the JS panel may hide while their switch is off (web/js/
+#: enndee_lichtfeld_trainer.js). Every entry must also appear in that file's RULES -
+#: the test `test_javascript_mirrors_the_hideable_widgets` reads both sides, so the two
+#: can never drift. Hiding is purely a display change: the backend already drops a
+#: parameter whose switch is off (e.g. `--depth-loss-weight` only goes out with
+#: `--use-depth-loss`), and a hidden widget keeps its value.
+HIDEABLE_WIDGETS = (
+    # depth supervision (driven by use_depth_loss)
+    "depth_loss_mode", "depth_loss_weight",
+    # normal supervision (driven by use_normal_loss)
+    "normal_loss_weight", "normal_consistency_weight", "normal_flatten_weight",
+    "normal_loss_space",
+    # surface anchors (driven by use_surface_anchors); freeze_lr_scale also needs
+    # anchor_freeze, because the dial only exists while the anchors are frozen
+    "surface_anchor_mesh", "anchor_resolution", "anchor_freeze", "freeze_lr_scale",
+    # held-out evaluation (driven by enable_eval / evaluation / eval_steps)
+    "eval_steps", "save_eval_images",
+    # downscaling (driven by disable_downscaling), the solid background's colour
+    # (background_mode) and the mask details (mask_mode)
+    "image_resize_factor", "max_image_width", "background_color",
+    "mask_opacity_penalty", "invert_masks",
+)
+
 
 def _default_executable():
     """Prefer an explicit user setting, then PATH, then this machine's install."""

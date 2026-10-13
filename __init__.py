@@ -64,6 +64,12 @@ except Exception as _e:
     LichtfeldHeadlessTrainer = None
 
 try:
+    from gsplat_trainer_node import GsplatHeadlessTrainer
+except Exception as _e:
+    print(f"\033[31m[Enndee] GsplatHeadlessTrainer unavailable: {_e}\033[0m")
+    GsplatHeadlessTrainer = None
+
+try:
     from enndee_standby_signal import Enndee_StandbyOnSignal
 except Exception as _e:
     print(f"\033[31m[Enndee] Enndee_StandbyOnSignal unavailable: {_e}\033[0m")
@@ -85,6 +91,13 @@ try:
 except Exception as _e:
     print(f"\033[31m[Enndee] MeridianPromptComposer unavailable: {_e}\033[0m")
     MeridianPromptComposer = None
+
+# SAM3 face gate in front of the face-detail orbit (optional: needs comfyui-rmbg).
+try:
+    from enndee_face_detect import Enndee_FaceDetect
+except Exception as _e:
+    print(f"\033[31m[Enndee] Enndee_FaceDetect unavailable: {_e}\033[0m")
+    Enndee_FaceDetect = None
 
 try:
     from enndee_meridian_camera_path_llm import Enndee_MeridianCameraPathLLM
@@ -161,6 +174,10 @@ if LichtfeldHeadlessTrainer is not None:
     NODE_CLASS_MAPPINGS["Enndee_LichtfeldHeadlessTrainer"] = LichtfeldHeadlessTrainer
     NODE_DISPLAY_NAME_MAPPINGS["Enndee_LichtfeldHeadlessTrainer"] = "Lichtfeld Headless Trainer (Enndee)"
 
+if GsplatHeadlessTrainer is not None:
+    NODE_CLASS_MAPPINGS["Enndee_GsplatHeadlessTrainer"] = GsplatHeadlessTrainer
+    NODE_DISPLAY_NAME_MAPPINGS["Enndee_GsplatHeadlessTrainer"] = "gsplat Headless Trainer (Enndee)"
+
 if Enndee_StandbyOnSignal is not None:
     NODE_CLASS_MAPPINGS["Enndee_StandbyOnSignal"] = Enndee_StandbyOnSignal
     NODE_DISPLAY_NAME_MAPPINGS["Enndee_StandbyOnSignal"] = "Standby On Signal (Enndee)"
@@ -176,6 +193,10 @@ if Enndee_SharpFrameSelector is not None:
 if MeridianPromptComposer is not None:
     NODE_CLASS_MAPPINGS["MeridianPromptComposer"] = MeridianPromptComposer
     NODE_DISPLAY_NAME_MAPPINGS["MeridianPromptComposer"] = "Meridian Prompt Composer (conditional pictures)"
+
+if Enndee_FaceDetect is not None:
+    NODE_CLASS_MAPPINGS["Enndee_FaceDetect"] = Enndee_FaceDetect
+    NODE_DISPLAY_NAME_MAPPINGS["Enndee_FaceDetect"] = "Enndee Face Detect (SAM3 gate)"
 
 if Enndee_MeridianCameraPathLLM is not None:
     NODE_CLASS_MAPPINGS["Enndee_MeridianCameraPathLLM"] = Enndee_MeridianCameraPathLLM

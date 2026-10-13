@@ -626,6 +626,13 @@ class NativeNodeTests(unittest.TestCase):
     ADDED_OPTIONAL = ("export_depth_maps", "dense_max_image_size",
                       "dense_geom_consistency", "fuse_dense_cloud",
                       "dense_cloud_max_points", "mesh_dense_surface", "mesh_method")
+    #: ... and then the face-detail block, which the base class appends after
+    #: everything else. The native node pops it off the inherited dict and re-appends
+    #: it here so its own dense-MVS widgets keep their positions (see
+    #: `ColmapLichtfeldTracker.INPUT_TYPES`).
+    ADDED_FACE_OPTIONAL = ("face_frames", "prepare_masks_for_face_detail",
+                           "face_mask_mode", "face_prompt", "face_threshold",
+                           "face_mask_dilate")
 
     def test_widget_parity_with_the_binary_node(self):
         binary_types = binary.GLOMAPLichtfeldTracker.INPUT_TYPES()
@@ -642,10 +649,13 @@ class NativeNodeTests(unittest.TestCase):
                              binary_types["required"][name], name)
 
         expected_optional = [name for name in binary_types["optional"]
-                             if name not in self.REMOVED_OPTIONAL]
-        # ... plus the depth-export widgets, appended last
+                             if name not in self.REMOVED_OPTIONAL
+                             and name not in self.ADDED_FACE_OPTIONAL]
+        # ... plus the depth-export widgets, and then the face-detail block, both
+        # appended last so existing workflows keep their widget_values positions
         self.assertEqual(list(native_types["optional"]),
-                         expected_optional + list(self.ADDED_OPTIONAL))
+                         expected_optional + list(self.ADDED_OPTIONAL)
+                         + list(self.ADDED_FACE_OPTIONAL))
         for name in expected_optional:
             if name in self.OVERRIDDEN:
                 continue
@@ -829,6 +839,7 @@ class AcceleratorTests(unittest.TestCase):
                 mock.patch.object(accelerators, "cuda_state",
                                   return_value={"available": False, "version": "",
                                                 "device": ""}), \
+                mock.patch.object(accelerators, "_onnx_files_locked", return_value=False), \
                 mock.patch.object(accelerators, "onnxruntime_state",
                                   return_value={"providers": ["CUDAExecutionProvider"],
                                                 "cuda": True, "version": "1.30.0"}):
@@ -837,6 +848,37 @@ class AcceleratorTests(unittest.TestCase):
         self.assertIn(["install", "--upgrade", "onnxruntime-gpu>=1.30"], calls)
         self.assertIn(["install", "pycolmap"], calls)
         self.assertTrue(report["onnxruntime"]["cuda"])
+
+    def test_the_swap_is_skipped_when_the_files_are_locked(self):
+        """A running ComfyUI holds onnxruntime's DLL - do NOT half-remove the package.
+
+        Regression: `pip uninstall -y onnxruntime` deletes the pure-Python half first
+        and then aborts on the locked DLL, leaving `import onnxruntime` as an empty
+        namespace package with no `get_available_providers`. Skipping is strictly
+        better - the CPU wheel still works.
+        """
+        state = {"cuda_major": 13,
+                 "onnxruntime": {"version": "1.24.3",
+                                 "providers": ["CPUExecutionProvider"], "cuda": False,
+                                 "cpu_wheel": True, "gpu_wheel": True},
+                 "pycolmap": {"available": True, "version": "4.2.1", "cuda": True},
+                 "optional_attention": {}}
+        calls = []
+
+        def fake_pip(args, dry=False):
+            calls.append(args)
+            return 0, ""
+
+        with mock.patch.object(accelerators, "accelerator_report", return_value=state), \
+                mock.patch.object(accelerators, "pip", side_effect=fake_pip), \
+                mock.patch.object(accelerators, "_onnx_files_locked", return_value=True), \
+                mock.patch.object(accelerators, "onnxruntime_state",
+                                  return_value={"providers": ["CPUExecutionProvider"],
+                                                "cuda": False, "version": "1.24.3"}):
+            accelerators.ensure_accelerators(auto_install=True)
+        self.assertNotIn(["uninstall", "-y", "onnxruntime"], calls)
+        self.assertFalse([c for c in calls if c and c[0] == "install"
+                          and "onnxruntime" in str(c)], calls)
 
 
 class NodeStatusTests(unittest.TestCase):

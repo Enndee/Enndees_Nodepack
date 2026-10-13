@@ -213,18 +213,61 @@ class MeridianFastDepthHelperTests(unittest.TestCase):
     def test_cloud_gauge_puts_the_depth_in_the_renderers_window(self):
         """The auto camera must estimate in the gauge `render_depth_aligned` unprojects.
 
-        The renderer maps the model's raw depth onto `DEPTH_NEAR .. DEPTH_FAR` (1 %/99 % percentile
-        clip) and builds its cloud from *that*, so a camera path has to live in the same window: the
-        keys' x/y follow their z, so a rig in the wrong gauge is at the wrong depth *and* scale.
-        `cloud_gauge` is that map - affine, monotone and free of the raw depth's absolute scale.
+        The renderer maps the model's raw depth into the cloud's gauge and builds its cloud from
+        *that*, so a camera path has to live in the same gauge: the keys' x/y follow their z, so a
+        rig in the wrong gauge is at the wrong depth *and* scale. `cloud_gauge` is that map -
+        monotone, proportional and free of the raw depth's absolute scale.
+
+        The *scale* is anchored on the rig distance this backend has always used - the old affine
+        window map's value at the median - which is why the raw middle still lands on the window
+        middle: the shape fix moved no camera.
         """
         raw = torch.linspace(1.0, 4.0, 1001)
         mapped = fast_depth.cloud_gauge(raw)
         self.assertTrue(bool((mapped[1:] > mapped[:-1]).all()))              # monotone
         steps = mapped[1:] - mapped[:-1]
-        self.assertLess(float((steps - steps[0]).abs().max()), 1e-4)         # affine
-        self.assertAlmostEqual(float(mapped[500]), 3.0, delta=0.05)          # raw middle -> window middle
+        self.assertLess(float((steps - steps[0]).abs().max()), 1e-4)         # affine (b = 0)
+        self.assertAlmostEqual(float(mapped[500]), 3.0, delta=0.05)          # raw middle -> rig distance
         self.assertTrue(torch.allclose(fast_depth.cloud_gauge(raw * 3.0), mapped, atol=1e-4))
+        # ... and the far tail is no longer compressed into DEPTH_FAR: a map whose depth really
+        # does reach far keeps its own shape (the affine window pinned every p99 to exactly 5.0,
+        # which is what squashed a metric depth model's subject into the bottom of the window).
+        wide = torch.cat([torch.full((900,), 2.0), torch.linspace(10.0, 40.0, 100)])
+        self.assertGreater(float(fast_depth.cloud_gauge(wide).max()), fast_depth.DEPTH_FAR)
+
+    def test_the_gauge_preserves_the_shape_of_the_scene(self):
+        """The property an affine window breaks: an object's aspect has to survive the map.
+
+        The unprojection carries the mapped depth in x and y as well as z, so a map `a*z + b`
+        scales every point radially by `z_cloud / z` - a factor that varies with depth whenever
+        `b != 0` - and multiplies an object's lateral:depth aspect by `C = 1 + b / (a*z)`. Measured
+        on beach.jpg with MoGe-3 the affine map gave `C = 5.7` at a 1.6 m subject: a person's
+        thighs, the part of a body that extends *toward* the camera, showed 17 % of the depth
+        relief the model actually predicted. A proportional map (`b = 0`) gives `C = 1` for *any*
+        depth distribution - which is what these three fixtures check. The same three were 0.125x
+        (a narrow map, stretched), 3.50x and 3.35x (wide maps, flattened) off before.
+        """
+
+        def aspect_error(depth):
+            """rendered aspect / true aspect for a box protruding out of a backdrop."""
+            box_px, f = 212.0, 616.7
+            mapped = fast_depth.cloud_gauge(depth)
+            box_z, bg_z = float(depth[200, 200]), float(depth[10, 10])
+            m_box, m_bg = float(mapped[200, 200]), float(mapped[10, 10])
+            true_aspect = (box_px / f * box_z) / (bg_z - box_z)
+            got_aspect = (box_px / f * m_box) / (m_bg - m_box)
+            return got_aspect / true_aspect
+
+        def box_map(box_z, bg_z, sky=None):
+            depth = torch.full((384, 512), float(bg_z))
+            depth[100:284, 150:362] = float(box_z)     # ~20 % of the frame, so p1 = box_z
+            if sky is not None:
+                depth[:80] = float(sky)                # a sky-like mass the clip has to absorb
+            return depth
+
+        for box_z, bg_z, sky in ((2.0, 3.0, None), (2.0, 30.0, None), (1.6, 36.0, 36.0)):
+            error = aspect_error(box_map(box_z, bg_z, sky))
+            self.assertAlmostEqual(error, 1.0, delta=0.02)
 
 
 
@@ -557,11 +600,13 @@ class MeridianFastDepthEngineTests(unittest.TestCase):
         self.assertEqual(length, 73)
 
     def test_back_face_cull_empties_a_flat_plane_viewed_from_behind(self):
+        # `--cull` is a *point* renderer feature: the mesh resolves occlusion in the z-buffer, so
+        # it deliberately ignores the flag. Ask for points explicitly.
         flat = _FakeDepthModel(disparity=lambda fx, fy: 1.0)
         _, without, _, _, _ = self._generate(model=flat, camera=_camera("--yaw", "170"),
-                                             point_size=1)
+                                             point_size=1, surface_mode="points")
         _, with_cull, _, _, _ = self._generate(model=flat, camera=_camera("--yaw", "170", "--cull"),
-                                               point_size=1)
+                                               point_size=1, surface_mode="points")
         hole = 128 / 255
         without_holes = (without[-1].mean(dim=-1).sub(hole).abs() < 1e-6).float().mean().item()
         culled_holes = (with_cull[-1].mean(dim=-1).sub(hole).abs() < 1e-6).float().mean().item()
@@ -571,9 +616,10 @@ class MeridianFastDepthEngineTests(unittest.TestCase):
     def test_back_face_cull_widget_matches_the_args_flag(self):
         flat = _FakeDepthModel(disparity=lambda fx, fy: 1.0)
         _, widget_cull, _, _, _ = self._generate(model=flat, camera=_camera("--yaw", "170"),
-                                                 point_size=1, back_face_cull=True)
+                                                 point_size=1, back_face_cull=True,
+                                                 surface_mode="points")
         _, args_cull, _, _, _ = self._generate(model=flat, camera=_camera("--yaw", "170", "--cull"),
-                                               point_size=1)
+                                               point_size=1, surface_mode="points")
         torch.testing.assert_close(widget_cull, args_cull)
 
     def test_da3_models_use_true_depth_without_the_disparity_inversion(self):

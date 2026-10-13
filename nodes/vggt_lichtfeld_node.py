@@ -94,6 +94,10 @@ class VGGTLichtfeldTracker(GLOMAPLichtfeldTracker):
     #: last pipeline error, surfaced in the node's text preview (see ``_failed``)
     _last_error = ""
 
+    #: set when the run produced no dataset on purpose-less grounds (no export folder),
+    #: so the preview cannot say "done" while nothing was written
+    _no_export_notice = ""
+
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -385,6 +389,7 @@ class VGGTLichtfeldTracker(GLOMAPLichtfeldTracker):
 
         # ---------- 1. Backend + checkpoint ------------------------------
         self._last_error = ""
+        self._no_export_notice = ""
         if not torch.cuda.is_available():
             return self._failed("CUDA is not available - the feed-forward "
                                 "backends have no practical CPU path.")
@@ -447,7 +452,15 @@ class VGGTLichtfeldTracker(GLOMAPLichtfeldTracker):
         export_dir = self._resolve_export_dir(lichtfeld_export_path)
         has_alpha = bool(alpha_images is not None and alpha_images.shape[-1] == 4)
 
-        if export_dir is not None:
+        if export_dir is None:
+            # The reconstruction still runs - the node returns a trajectory and a point
+            # cloud on its output sockets, so an in-memory run is legitimate. But this
+            # node's whole purpose is the dataset, and silently writing nothing while
+            # reporting "done" is exactly how "the DA3 node did not work" reads. Say it.
+            self._no_export_notice = ("no dataset written - 'lichtfeld_export_path' is "
+                                      "empty and ComfyUI's output folder is unknown")
+            log_warn(self._no_export_notice)
+        else:
             self._export_dataset_images(
                 export_dir, export_images, alpha_images,
                 embed_alpha=bool(embed_alpha_in_images),
@@ -497,10 +510,15 @@ class VGGTLichtfeldTracker(GLOMAPLichtfeldTracker):
             return f"failed - {self._last_error}"
         try:
             trajectory, point_cloud, confidence = result[0], result[1], result[2]
-            return (f"done - {trajectory.get('reconstructed_frames')}/"
-                    f"{trajectory.get('num_frames')} views, "
-                    f"{point_cloud.get('num_points')} points, "
-                    f"confidence {float(confidence):.2f}")
+            summary = (f"done - {trajectory.get('reconstructed_frames')}/"
+                       f"{trajectory.get('num_frames')} views, "
+                       f"{point_cloud.get('num_points')} points, "
+                       f"confidence {float(confidence):.2f}")
+            # A run that wrote nothing must not read as a success: the preview is the
+            # only place a user looks when "the node did not produce a dataset".
+            if self._no_export_notice:
+                return f"{summary} - WARNING: {self._no_export_notice}"
+            return summary
         except Exception:  # noqa: BLE001 - the summary must never break the run
             return "done"
 
