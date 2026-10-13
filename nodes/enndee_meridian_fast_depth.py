@@ -1900,7 +1900,10 @@ def render_depth_aligned(first, device, model_size="Depth-Anything-V2-Small-hf",
             win = zk == zbuf[idx]
             img = hole.clone()
             img[idx[win]] = ck[win]
-            rendered.append(_fill_render_holes(img.view(out_h, out_w, 3)))
+            # Hole filling is a mesh presentation step. Keep point splats raw: filling them would
+            # hide the coverage differences from `point_size` and the holes intentionally left by
+            # back-face culling, changing the point renderer's established semantics.
+            rendered.append(img.view(out_h, out_w, 3))
 
     render = torch.stack(rendered).float().div_(255.0).cpu()
     source = F.interpolate(first.permute(0, 3, 1, 2), size=(out_h, out_w),
