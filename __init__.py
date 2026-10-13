@@ -105,13 +105,12 @@ except Exception as _e:
     print(f"\033[31m[Enndee] MeridianCameraPathLLM unavailable: {_e}\033[0m")
     Enndee_MeridianCameraPathLLM = None
 
-# COLMAP for Lichtfeld: the GLOMAP tracker through COLMAP's native Python API
-# (pycolmap) - no COLMAP/GLOMAP binaries are downloaded.
-try:
-    from colmap_lichtfeld_node import ColmapLichtfeldTracker
-except Exception as _e:
-    print(f"\033[31m[Enndee] ColmapLichtfeldTracker unavailable: {_e}\033[0m")
-    ColmapLichtfeldTracker = None
+# The former pycolmap COLMAP tracker remains in `nodes/colmap_lichtfeld_node.py`
+# for migration/reference, but is deliberately not registered: the binary GLOMAP
+# tracker is the single supported COLMAP node (GPU SIFT works directly and COLMAP
+# updates are a binary swap). Existing pycolmap workflows should switch to the
+# GLOMAP Lichtfeld Tracker node.
+ColmapLichtfeldTracker = None
 
 # VGGT for Lichtfeld: the feed-forward alternative to COLMAP - one forward pass
 # over the frame set yields poses, intrinsics AND depth in a single gauge.
@@ -201,10 +200,6 @@ if Enndee_FaceDetect is not None:
 if Enndee_MeridianCameraPathLLM is not None:
     NODE_CLASS_MAPPINGS["Enndee_MeridianCameraPathLLM"] = Enndee_MeridianCameraPathLLM
     NODE_DISPLAY_NAME_MAPPINGS["Enndee_MeridianCameraPathLLM"] = "Meridian Camera Path LLM (Enndee)"
-
-if ColmapLichtfeldTracker is not None:
-    NODE_CLASS_MAPPINGS["Enndee_ColmapLichtfeldTracker"] = ColmapLichtfeldTracker
-    NODE_DISPLAY_NAME_MAPPINGS["Enndee_ColmapLichtfeldTracker"] = "COLMAP for Lichtfeld (Enndee)"
 
 if VGGTLichtfeldTracker is not None:
     NODE_CLASS_MAPPINGS["Enndee_VGGTLichtfeldTracker"] = VGGTLichtfeldTracker

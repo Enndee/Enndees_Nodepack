@@ -23,6 +23,7 @@ import colmap_lichtfeld_node as native          # noqa: E402
 import enndee_accelerators as accelerators      # noqa: E402
 import glomap_lichtfeld_node as binary          # noqa: E402
 from enndee_colmap import pycolmap_wrapper      # noqa: E402
+import __init__ as nodepack                     # noqa: E402
 
 
 class FakePycolmap:
@@ -617,6 +618,10 @@ class MappingNoticeTests(unittest.TestCase):
 
 class NativeNodeTests(unittest.TestCase):
     """The node keeps every widget of the binary tracker except the paths."""
+
+    def test_legacy_pycolmap_tracker_is_not_registered(self):
+        self.assertNotIn("Enndee_ColmapLichtfeldTracker", nodepack.NODE_CLASS_MAPPINGS)
+        self.assertIn("Enndee_GLOMAPLichtfeldTracker", nodepack.NODE_CLASS_MAPPINGS)
 
     REMOVED_REQUIRED = ("colmap_path", "glomap_path")
     REMOVED_OPTIONAL = ("binary_flavor",)

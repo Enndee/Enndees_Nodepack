@@ -203,6 +203,11 @@ def laplacian_scores(images):
         frame = images[index].cpu().numpy()
         if frame.dtype != np.uint8:
             frame = (np.clip(frame, 0.0, 1.0) * 255.0).astype(np.uint8)
+        # RGBA is a supported tracker input (its alpha drives the subject/splat
+        # mask); sharpness is an RGB property, so do not pass the alpha channel to
+        # COLOR_RGB2GRAY.
+        if frame.ndim == 3 and frame.shape[-1] == 4:
+            frame = frame[..., :3]
         gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
         scores.append(float(cv2.Laplacian(gray, cv2.CV_64F).var()))
     return scores

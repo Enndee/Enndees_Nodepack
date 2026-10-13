@@ -68,7 +68,7 @@ const GROUPS = [
     when: [["sharp_selection", true]] },
   { show: ["rmbg_mode", "rmbg_threshold", "rmbg_resize"],
     when: [["use_rmbg", true]] },
-  { show: ["face_mask_mode", "face_prompt", "face_threshold", "face_mask_dilate"],
+  { show: ["face_frames", "face_mask_mode", "face_prompt", "face_threshold", "face_mask_dilate"],
     when: [["prepare_masks_for_face_detail", true]] },
   { show: ["glomap_path"], when: [["mapper_backend", "glomap"]] },
   { show: ["jpeg_quality"], when: [["image_format", "JPEG"]] },
@@ -83,7 +83,12 @@ const GROUPS = [
 ];
 
 // Display-only renames (widget.name stays as serialized).
-const LABELS = [["use_rmbg", "Use RMBG for COLMAP"]];
+const LABELS = [
+  ["use_rmbg", "Use RMBG for COLMAP"],
+  ["sharp_method", "Selection Method"],
+  ["sharp_batch", "Batch Size"],
+  ["sharp_num_frames", "Num Frames"],
+];
 
 const WATCHED_WIDGETS = new Set([
   "sharp_selection", "use_rmbg", "prepare_masks_for_face_detail",

@@ -35,6 +35,12 @@ class SharedSelectionFunctionTests(unittest.TestCase):
         scores = sharp.laplacian_scores(torch.stack([_flat(), _checkerboard()]))
         self.assertGreater(scores[1], scores[0] * 10 + 1.0)
 
+    def test_rgba_sharpness_ignores_alpha_and_scores_rgb(self):
+        rgb = torch.stack([_flat(), _checkerboard()])
+        rgba = torch.cat([rgb, torch.ones(2, 32, 32, 1)], dim=-1)
+        scores = sharp.laplacian_scores(rgba)
+        self.assertGreater(scores[1], scores[0] * 10 + 1.0)
+
     def test_batched_topn_keeps_the_top_of_every_chunk(self):
         scores = [1.0, 9.0, 2.0, 8.0, 3.0, 7.0]
         self.assertEqual(sharp.select_frames(scores, "batched_topn", 2, 1),
@@ -76,6 +82,26 @@ class SharpSelectionTrackerTests(unittest.TestCase):
     def test_empty_face_frames_stay_empty(self):
         self.assertEqual(GLOMAPLichtfeldTracker._remap_face_frames("", [0]), "")
 
+    def test_rgba_alpha_frames_follow_the_same_selection(self):
+        # The alpha channel is used by face-detail masks and must remain paired with
+        # the selected RGB frame after in-tracker deletion.
+        rgba = torch.arange(4 * 2 * 2 * 4.0).view(4, 2, 2, 4)
+        selected = GLOMAPLichtfeldTracker._subset_frame_batch(rgba, [0, 3])
+        self.assertTrue(torch.equal(selected, rgba[[0, 3]]))
+        self.assertTrue(torch.equal(selected[..., 3], rgba[[0, 3], ..., 3]))
+
+    def test_sidecar_final_mapping_composes_selection_and_frame_step(self):
+        self.assertEqual(
+            GLOMAPLichtfeldTracker._final_frame_indices([2, 4, 7, 9, 12], 2),
+            [2, 7, 12])
+        self.assertEqual(
+            GLOMAPLichtfeldTracker._final_frame_indices([2, 4, 7], 0),
+            [2, 4, 7])
+
+    def test_face_frames_remapping_keeps_selected_frames_in_order(self):
+        selected = GLOMAPLichtfeldTracker._remap_face_frames("2,7,12", [2, 7, 12])
+        self.assertEqual(selected, "0,1,2")
+
 
 class SubjectFocusTests(unittest.TestCase):
     def test_alpha_subject_reads_the_alpha_channel(self):
@@ -93,10 +119,28 @@ class SubjectFocusTests(unittest.TestCase):
         # subject at alpha=1 the background (alpha=0) must come out WHITE.
         rgba = torch.zeros(1, 4, 4, 4)
         rgba[0, :2, :, 3] = 1.0                    # top half = subject
-        subject = GLOMAPLichtfeldTracker._alpha_subject(rgba)
-        feature = 1.0 - subject
+        feature, derived = GLOMAPLichtfeldTracker._subject_focus_feature_source(
+            None, None, rgba)
+        self.assertTrue(derived)
         self.assertTrue(torch.all(feature[0, :, 2:, :] == 1.0))   # background excluded
         self.assertTrue(torch.all(feature[0, :, :2, :] == 0.0))   # subject kept
+
+    def test_explicit_feature_masks_take_precedence_over_derived_subject_masks(self):
+        explicit = torch.full((1, 1, 4, 4), 0.25)
+        rgba = torch.zeros(1, 4, 4, 4)
+        feature, derived = GLOMAPLichtfeldTracker._subject_focus_feature_source(
+            explicit, None, rgba)
+        self.assertIs(feature, explicit)
+        self.assertFalse(derived)
+
+    def test_lichtfeld_keep_mask_is_inverted_for_glomap(self):
+        keep = torch.zeros(1, 1, 4, 4)
+        keep[:, :, :2] = 1.0
+        feature, derived = GLOMAPLichtfeldTracker._subject_focus_feature_source(
+            None, keep, None)
+        self.assertTrue(derived)
+        self.assertTrue(torch.all(feature[:, :, :2] == 0.0))
+        self.assertTrue(torch.all(feature[:, :, 2:] == 1.0))
 
 
 class MaskSubsetTests(unittest.TestCase):
@@ -107,10 +151,13 @@ class MaskSubsetTests(unittest.TestCase):
         self.assertEqual(float(subset[0, 0, 0, 0]), 0.0)
         self.assertEqual(float(subset[1, 0, 0, 0]), 3.0)
 
-    def test_already_selected_masks_are_left_alone(self):
+    def test_mask_count_mismatch_is_dropped_not_misaligned(self):
         masks = torch.zeros(2, 1, 2, 2)
-        self.assertIs(GLOMAPLichtfeldTracker._subset_prepared_masks(
-            masks, [0, 3], 4, "G"), masks)
+        # A selection-sized mask without its source-index map cannot safely be
+        # aligned to a different selected subset. Fail closed instead of assigning
+        # a mask to the wrong image.
+        self.assertIsNone(GLOMAPLichtfeldTracker._subset_prepared_masks(
+            masks, [0, 3], 4, "G"))
 
     def test_missing_masks_stay_missing(self):
         self.assertIsNone(GLOMAPLichtfeldTracker._subset_prepared_masks(
@@ -142,6 +189,21 @@ class SidecarAndWidgetContractTests(unittest.TestCase):
             optional = list(cls.INPUT_TYPES()["optional"])
             self.assertEqual(optional[-len(face) - len(added):], face + added,
                              cls.__name__)
+
+    def test_sharp_widget_labels_and_visibility_rules_are_registered(self):
+        spec = GLOMAPLichtfeldTracker.INPUT_TYPES()["optional"]
+        self.assertIn("tooltip", spec["sharp_method"][1])
+        self.assertIn("tooltip", spec["sharp_batch"][1])
+        self.assertIn("tooltip", spec["sharp_num_frames"][1])
+        js_path = PACK_DIR / "web" / "js" / "enndee_colmap_widgets.js"
+        js = js_path.read_text(encoding="utf-8")
+        self.assertIn('"sharp_selection", true', js)
+        self.assertIn('"use_rmbg", true', js)
+        self.assertIn('"prepare_masks_for_face_detail", true', js)
+        self.assertIn('"Use RMBG for COLMAP"', js)
+        self.assertIn('"Selection Method"', js)
+        self.assertIn('"Batch Size"', js)
+        self.assertIn('"Num Frames"', js)
 
     def test_the_rmbg_widget_key_is_unchanged_for_saved_workflows(self):
         for cls in (GLOMAPLichtfeldTracker, ColmapLichtfeldTracker):

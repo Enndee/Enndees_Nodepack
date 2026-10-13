@@ -29,7 +29,6 @@ Lichtfeld Studio dataset in a single step.
 | Node | ID | Purpose |
 |------|----|---------|
 | **GLOMAP Lichtfeld Tracker (Enndee)** | `Enndee_GLOMAPLichtfeldTracker` | Global SfM camera tracking + Lichtfeld dataset export |
-| **COLMAP for Lichtfeld (Enndee)** | `Enndee_ColmapLichtfeldTracker` | The same tracker through COLMAP's **native Python API** (pycolmap) - GLOMAP is part of COLMAP >= 3.12, so no GLOMAP binary is needed; installs/repairs `pycolmap` + `onnxruntime-gpu` on demand and, on Windows (no CUDA pycolmap wheel), downloads the CUDA COLMAP build so the SIFT stages still run on the GPU. Also exports **COLMAP's own dense-MVS depth maps** (`export_depth_maps`) in the VGGT node's layout |
 | **VGGT for Lichtfeld (Enndee)** | `Enndee_VGGTLichtfeldTracker` | Feed-forward multi-view reconstruction in one pass (VGGT-Omega / **DA3-AnyView** / VGG-T3) with the same Lichtfeld dataset export - poses and depth in one gauge, so the depth loss cannot inject drift |
 | **Video Frame Extractor + Audio (Enndee)** | `Enndee_VideoFrameExtractorWithAudio` | Frame/audio extraction with an in-node timeline widget |
 | **MiniMax H3 Direct Promptor (Enndee)** | `H3_Multimodal_Promptor_Enndee` | Official-format MiniMax H3 prompts from reference images (vision LLM) |
@@ -933,8 +932,8 @@ seconds if an external command is quiet.
 | `images` | IMAGE | - | frame batch (preferred source) |
 | `masks_glomap` | MASK | - | masks for feature extraction (**white = excluded**) |
 | `masks_lichtfeld` | MASK | - | splat masks for Lichtfeld (**white = keep**) |
-| `use_rmbg` | BOOLEAN | true | built-in RMBG background removal |
-| `rmbg_mode` | COMBO | `base` | `base`, `fast`, `base-nightly` |
+| `use_rmbg` | BOOLEAN | true | **Use RMBG for COLMAP** and the Lichtfeld subject mask |
+| `rmbg_mode` | COMBO | `2.0` | RMBG-2.0, `base`, `fast`, `base-nightly` |
 | `rmbg_threshold` | FLOAT | 0.5 | segmentation sensitivity |
 | `rmbg_resize` | COMBO | `static` | `static` or `dynamic` (up to 1280 px) |
 | `use_gpu` | BOOLEAN | true | GPU for SIFT/RMBG |
@@ -952,6 +951,11 @@ seconds if an external command is quiet.
 | `embed_alpha_in_images` | BOOLEAN | false | also store the RMBG alpha in `images/` (RGBA PNGs) |
 | `image_format` | COMBO | `PNG` | Export `images/` as lossless PNG or JPEG |
 | `jpeg_quality` | INT | 90 | JPEG quality (1-100); used only when image format is JPEG |
+| `subject_focus` | COMBO | `full frame` | `subject only` builds a GLOMAP feature mask from the subject mask/alpha, excluding background features |
+| `sharp_selection` | BOOLEAN | false | Select sharp frames inside the tracker so face-frame indices stay aligned |
+| `sharp_method` | COMBO | `batched_topn` | `batched_topn`, `batched`, or global `best_n`; shown only when sharp selection is on |
+| `sharp_batch` | INT | 4 | Frame chunk size for batched selection; shown only when sharp selection is on |
+| `sharp_num_frames` | INT | 3 | Frames to retain per chunk or globally; shown only when sharp selection is on |
 
 PNG is the default and retains image alpha. JPEG exports RGB `.jpg` files;
 available alpha is retained in the separate Lichtfeld `masks/` export because
@@ -977,6 +981,25 @@ enter the SfM dataset.
   as-is in `masks/` (after `offset_splat`).
 * RGBA images: the alpha channel is used automatically for `masks/` when no
   explicit Lichtfeld mask is connected.
+
+### Subject-focused alignment and sharp-frame selection
+
+`subject_focus="subject only"` derives the COLMAP/GLOMAP feature mask from the
+subject matte: white/background is excluded from SIFT features, while the subject
+remains available for camera alignment. `masks_glomap` / `masks_path` explicitly
+supplied by the workflow take precedence. The subject matte can come from **Use
+RMBG for COLMAP**, an RGBA input's alpha, or `masks_lichtfeld`.
+
+Sharp selection is integrated in this tracker rather than placed upstream. It
+scores the original batch with Laplacian variance, then applies the same three
+methods as **Sharp Frame Selector Top-N (Enndee)**. Because the face-orbit
+`face_frames` list is expressed in original input-frame indices, the tracker maps
+those indices to the retained batch before generating face-detail masks. This
+prevents a face mask from silently landing on the wrong image after deletion.
+The optional `sharp_selection.json` records `kept_input_indices`,
+`dropped_input_indices`, the final frame-step mapping, and both the input and
+remapped face-frame lists. RGB, SfM images, RGBA/RMBG alpha and input masks all
+follow the same selected frames.
 
 ### Recommended settings
 
@@ -1029,7 +1052,21 @@ modes - RMBG-2.0 always runs at its native 1024 px.
 
 ---
 
-## Node: COLMAP for Lichtfeld (Enndee)
+## Legacy implementation: COLMAP for Lichtfeld (pycolmap)
+
+The former `Enndee_ColmapLichtfeldTracker` pycolmap variant is **not registered as
+a ComfyUI node**. Use **GLOMAP Lichtfeld Tracker (Enndee)** instead. It downloads
+the tested COLMAP/GLOMAP binaries into the pack when needed and uses their stable
+CLI. This is easier to keep current with COLMAP releases than tracking the Python
+binding's wheel/platform/CUDA coverage; on Windows the pycolmap variant needed the
+same downloaded CUDA COLMAP binaries for GPU SIFT anyway. The old source and tests
+remain in `nodes/colmap_lichtfeld_node.py` and `tests/test_colmap_lichtfeld_node.py`
+for reference or a future backend migration, but it will not appear in the node
+menu. Existing workflows using its node type must switch to GLOMAP Lichtfeld
+Tracker; the binary tracker has the same dataset outputs and now includes the
+sharp-selection/subject-focus controls documented below.
+
+<!-- Legacy pycolmap implementation notes retained below for migration reference. -->
 
 The same tracker as above, but the Structure-from-Motion backend is **COLMAP's own
 Python API** (`pycolmap`) instead of downloaded executables. GLOMAP was merged into

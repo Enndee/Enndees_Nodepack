@@ -571,6 +571,7 @@ class GLOMAPLichtfeldTracker:
             }),
             "sharp_method": (["batched_topn", "batched", "best_n"], {
                 "default": "batched_topn",
+                "label": "Selection Method",
                 **tooltip(
                     "batched_topn: keep the top 'Sharp Num Frames' of every 'Sharp "
                     "Batch' chunk (e.g. the 3 sharpest of every 4 - even coverage). "
@@ -580,10 +581,12 @@ class GLOMAPLichtfeldTracker:
             }),
             "sharp_batch": ("INT", {
                 "default": 4, "min": 2, "max": 64, "step": 1,
+                "label": "Batch Size",
                 **tooltip("Chunk size for the batched_topn / batched methods."),
             }),
             "sharp_num_frames": ("INT", {
                 "default": 3, "min": 1, "max": 64, "step": 1,
+                "label": "Num Frames",
                 **tooltip("Frames to keep per chunk (batched_topn) or in total "
                           "(best_n)."),
             }),
@@ -644,6 +647,14 @@ class GLOMAPLichtfeldTracker:
             f"({export_images.shape[2]}x{export_images.shape[1]}), "
             f"source={'folder' if images_from_path else 'IMAGE input'}")
 
+        # Preserve a connected RGBA alpha before selection so it is subset alongside
+        # RGB. Generated RMBG runs after selection, avoiding inference on discarded
+        # frames.
+        alpha_images = None
+        if isinstance(export_images, torch.Tensor) and export_images.shape[-1] == 4:
+            alpha_images = export_images
+            log("RGBA input detected - alpha channel will be used as mask")
+
         # ---------- 2.5 Sharp-frame selection (optional) ------------------
         # Runs HERE - before the face-detail pass - because `face_frames` numbers are
         # indices into THIS batch; deleting frames upstream of the tracker is exactly
@@ -669,20 +680,41 @@ class GLOMAPLichtfeldTracker:
                 log(f"sharp selection ({sharp_method}): kept all {frame_total} frames")
                 kept_indices = None
             else:
-                export_images = export_images[kept_indices]
-                sf_images = sf_images[kept_indices]
+                export_images = self._subset_frame_batch(export_images, kept_indices)
+                sf_images = self._subset_frame_batch(sf_images, kept_indices)
+                if alpha_images is not None:
+                    # RMBG alpha is indexed in the original batch too. It must
+                    # follow the exact same selection before face masks are built.
+                    alpha_images = self._subset_frame_batch(alpha_images, kept_indices)
                 face_frames = self._remap_face_frames(face_frames, kept_indices)
-                sharp_record["face_frames_selected"] = str(face_frames or "")
                 log(f"sharp selection ({sharp_method}): kept {len(kept_indices)} of "
                     f"{frame_total} frames (dropped {len(dropped)}); face_frames "
                     f"remapped onto the kept frames")
+            sharp_record["face_frames_selected"] = str(face_frames or "")
+            sharp_record["frame_step"] = max(1, int(frame_step))
+            final_input_indices = self._final_frame_indices(
+                sharp_record["kept_input_indices"], sharp_record["frame_step"])
+            sharp_record["final_input_indices"] = final_input_indices
+            sharp_record["final_output_to_input"] = {
+                str(output_index): input_index
+                for output_index, input_index in enumerate(final_input_indices)
+            }
+            sharp_record["face_frames_final"] = self._remap_face_frames(
+                sharp_record["face_frames_selected"],
+                list(range(0, len(sharp_record["kept_input_indices"]),
+                          sharp_record["frame_step"])))
+
+        if use_rmbg and alpha_images is None:
+            log("Starting background removal")
+            alpha_images = self._run_rmbg(
+                export_images, use_gpu, rmbg_mode, rmbg_threshold, rmbg_resize,
+            )
+            if alpha_images is not None:
+                log(f"RMBG done: {tuple(alpha_images.shape)}")
 
         # ---------- 3. Background removal (optional) ---------------------
-        alpha_images = None  # RGBA batch used for alpha based splat masks
-        if isinstance(export_images, torch.Tensor) and export_images.shape[-1] == 4:
-            alpha_images = export_images
-            log("RGBA input detected - alpha channel will be used as mask")
-
+        # Run after sharp selection so discarded frames do not incur RMBG cost;
+        # the output remains aligned with the selected IMAGE batch.
         if use_rmbg and alpha_images is None:
             log("Starting background removal")
             alpha_images = self._run_rmbg(
@@ -700,19 +732,21 @@ class GLOMAPLichtfeldTracker:
         # Subject-focused alignment: derive the GLOMAP feature masks from the
         # subject mask (background = excluded) when nothing explicit connected.
         # Explicit masks_glomap / masks_path always win.
-        if masks_glomap is None and str(subject_focus) == "subject only":
-            subject = masks_lichtfeld if masks_lichtfeld is not None else \
-                self._alpha_subject(alpha_images)
-            if subject is not None:
+        if str(subject_focus) == "subject only":
+            feature_source, derived_from_subject = self._subject_focus_feature_source(
+                masks_glomap, masks_lichtfeld, alpha_images)
+            if masks_glomap is None and feature_source is not None:
                 masks_glomap = self._prepare_masks(
-                    1.0 - subject, "", downscale_factor, offset_glomap, "GLOMAP")
-                log("subject_focus='subject only': GLOMAP feature masks derived "
-                    "from the subject mask (background excluded from feature "
-                    "extraction)")
+                    feature_source, "", downscale_factor, offset_glomap, "GLOMAP")
+                if derived_from_subject:
+                    log("subject_focus='subject only': GLOMAP feature masks derived "
+                        "from the subject mask (background excluded from feature "
+                        "extraction)")
             else:
-                log_warn("subject_focus='subject only' but no subject mask is "
-                         "available (enable 'Use RMBG for COLMAP', connect "
-                         "masks_lichtfeld or RGBA images) - tracking the full frame")
+                if masks_glomap is None:
+                    log_warn("subject_focus='subject only' but no subject mask is "
+                             "available (enable 'Use RMBG for COLMAP', connect "
+                             "masks_lichtfeld or RGBA images) - tracking the full frame")
 
         # The sharp selection ran on the full input batch above; mask tensors are
         # aligned with THAT batch, so they follow the same selection here.
@@ -756,7 +790,6 @@ class GLOMAPLichtfeldTracker:
             if masks_lichtfeld is not None:
                 masks_lichtfeld = masks_lichtfeld[::step]
             log(f"frame_step={step}: {sf_images.shape[0]} frames kept")
-
         sf_images, masks_glomap = self._match_lengths(
             sf_images, masks_glomap, "GLOMAP masks")
         export_images, alpha_images = self._match_lengths(
@@ -1167,12 +1200,25 @@ class GLOMAPLichtfeldTracker:
         return ",".join(kept_tokens)
 
     @staticmethod
+    def _subset_frame_batch(batch, kept_indices):
+        """Select IMAGE/RGBA frames on axis 0 with the shared original indices."""
+        return batch[kept_indices]
+
+    @staticmethod
+    def _final_frame_indices(kept_input_indices, frame_step):
+        """Original input-frame IDs for final outputs after sharp selection + step."""
+        return list(kept_input_indices)[::max(1, int(frame_step))]
+
+    @staticmethod
     def _subset_prepared_masks(masks, kept_indices, original_count, label):
         """Slice prepared masks that still span the full input batch."""
         if masks is None:
             return None
         if int(masks.shape[0]) != int(original_count):
-            return masks          # already selection-sized (e.g. derived from alpha)
+            log_warn(f"{label} mask count {int(masks.shape[0])} does not match the "
+                     f"original {int(original_count)} frames; ignoring masks rather "
+                     "than silently assigning them to the wrong selected frames")
+            return None
         subset = masks[kept_indices]
         log(f"{label} masks follow the sharp selection: {tuple(subset.shape)}")
         return subset
@@ -1183,6 +1229,22 @@ class GLOMAPLichtfeldTracker:
         if alpha_images is None or alpha_images.shape[-1] != 4:
             return None
         return alpha_images[..., 3].unsqueeze(1).contiguous()
+
+    @staticmethod
+    def _subject_focus_feature_source(masks_glomap, masks_lichtfeld, alpha_images):
+        """Return (feature mask, derived) with explicit COLMAP masks taking precedence.
+
+        GLOMAP masks use WHITE = excluded; the subject source uses WHITE = keep, so
+        only derived masks are inverted. An explicit masks_glomap already has the
+        correct polarity and must be passed through unchanged.
+        """
+        if masks_glomap is not None:
+            return masks_glomap, False
+        subject = (masks_lichtfeld if masks_lichtfeld is not None else
+                   GLOMAPLichtfeldTracker._alpha_subject(alpha_images))
+        if subject is None:
+            return None, False
+        return 1.0 - subject, True
 
     @staticmethod
     def _write_sharp_selection_sidecar(export_dir, record):
