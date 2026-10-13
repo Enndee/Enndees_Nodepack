@@ -939,23 +939,29 @@ seconds if an external command is quiet.
 | `use_gpu` | BOOLEAN | true | GPU for SIFT/RMBG |
 | `keep_workspace` | BOOLEAN | false | keep the temporary COLMAP workspace |
 | `auto_align` | BOOLEAN | true | align to the ground plane (Y up, floor at Y=0) |
-| `sequential_overlap` | INT | 15 | neighbouring frames compared by the matcher |
+| `sequential_overlap` | INT | 15 | neighbouring frames compared by the matcher; shown only for `matcher=sequential` |
 | `max_image_size` | INT | 5120 | longest edge for feature extraction (export stays full res) |
 | `frame_step` | INT | 2 | use every n-th frame |
 | `downscale_factor` | FLOAT | 1.0 | SfM input scale only |
-| `offset_glomap` | INT | 4 | erode (+) / dilate (-) the GLOMAP masks in px |
-| `offset_splat` | INT | 12 | erode (+) / dilate (-) the Lichtfeld masks in px |
+| `offset_glomap` | INT | 4 | erode (+) / dilate (-) the GLOMAP masks in px; shown only when **Use RMBG for COLMAP** is on |
+| `offset_splat` | INT | 12 | erode (+) / dilate (-) the Lichtfeld masks in px; shown only when **Use RMBG for COLMAP** is on |
 | `mapper_backend` | COMBO | `glomap` | `glomap` (GLOMAP 1.2.0) or `colmap_global` (COLMAP >= 3.12) |
 | `auto_install_binaries` | BOOLEAN | true | download missing binaries on demand |
-| `binary_flavor` | COMBO | `auto` | `auto`, `cuda`, `nocuda` |
+| `binary_flavor` | hidden compatibility input | `auto` | Not user-selectable; binary flavor is always resolved automatically |
 | `embed_alpha_in_images` | BOOLEAN | false | also store the RMBG alpha in `images/` (RGBA PNGs) |
 | `image_format` | COMBO | `PNG` | Export `images/` as lossless PNG or JPEG |
 | `jpeg_quality` | INT | 90 | JPEG quality (1-100); used only when image format is JPEG |
 | `subject_focus` | COMBO | `full frame` | `subject only` builds a GLOMAP feature mask from the subject mask/alpha, excluding background features |
 | `sharp_selection` | BOOLEAN | false | Select sharp frames inside the tracker so face-frame indices stay aligned |
-| `sharp_method` | COMBO | `batched_topn` | `batched_topn`, `batched`, or global `best_n`; shown only when sharp selection is on |
-| `sharp_batch` | INT | 4 | Frame chunk size for batched selection; shown only when sharp selection is on |
+| `sharp_method` | COMBO | `batched_topn` | `batched_topn` or global `best_n`; shown only when sharp selection is on |
+| `sharp_batch` | INT | 4 | Frame chunk size for `batched_topn`; shown only when sharp selection is on and that method is selected |
 | `sharp_num_frames` | INT | 3 | Frames to retain per chunk or globally; shown only when sharp selection is on |
+
+The **Sharp Batch** control is shown only for `sharp_method=batched_topn`;
+`sequential_overlap` is shown only for the sequential matcher. `offset_glomap`
+and `offset_splat` are shown only while **Use RMBG for COLMAP** is enabled.
+The legacy `binary_flavor` workflow value remains accepted for compatibility,
+but is hidden and binary selection always uses `auto`.
 
 PNG is the default and retains image alpha. JPEG exports RGB `.jpg` files;
 available alpha is retained in the separate Lichtfeld `masks/` export because
@@ -991,8 +997,11 @@ supplied by the workflow take precedence. The subject matte can come from **Use
 RMBG for COLMAP**, an RGBA input's alpha, or `masks_lichtfeld`.
 
 Sharp selection is integrated in this tracker rather than placed upstream. It
-scores the original batch with Laplacian variance, then applies the same three
-methods as **Sharp Frame Selector Top-N (Enndee)**. Because the face-orbit
+scores the original batch with Laplacian variance and offers two methods:
+`batched_topn` keeps the top N frames in each chunk; `best_n` keeps the globally
+sharpest N frames. The single-sharpest-per-chunk behavior is achieved by setting
+`sharp_num_frames=1` with `batched_topn`, so it is not a separate tracker method.
+Because the face-orbit
 `face_frames` list is expressed in original input-frame indices, the tracker maps
 those indices to the retained batch before generating face-detail masks. This
 prevents a face mask from silently landing on the wrong image after deletion.

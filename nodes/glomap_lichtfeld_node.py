@@ -569,20 +569,19 @@ class GLOMAPLichtfeldTracker:
                     "is used (frame_step still applies)."
                 ),
             }),
-            "sharp_method": (["batched_topn", "batched", "best_n"], {
+            "sharp_method": (["batched_topn", "best_n"], {
                 "default": "batched_topn",
                 "label": "Selection Method",
                 **tooltip(
                     "batched_topn: keep the top 'Sharp Num Frames' of every 'Sharp "
                     "Batch' chunk (e.g. the 3 sharpest of every 4 - even coverage). "
-                    "batched: keep only the single sharpest frame of every chunk. "
-                    "best_n: the globally sharpest 'Sharp Num Frames' frames."
+                    "best_n: keep the globally sharpest 'Sharp Num Frames' frames."
                 ),
             }),
             "sharp_batch": ("INT", {
                 "default": 4, "min": 2, "max": 64, "step": 1,
                 "label": "Batch Size",
-                **tooltip("Chunk size for the batched_topn / batched methods."),
+                **tooltip("Chunk size for the batched_topn method."),
             }),
             "sharp_num_frames": ("INT", {
                 "default": 3, "min": 1, "max": 64, "step": 1,
@@ -946,7 +945,10 @@ class GLOMAPLichtfeldTracker:
             log(f"Missing binaries: {', '.join(missing)} - downloading the "
                 f"pinned builds into the pack folder (happens only once)")
             try:
-                ensure_binaries(kinds=missing, flavor=binary_flavor, log=log)
+                # The binary tracker always picks the platform-appropriate build.
+                # `binary_flavor` remains in the signature for saved-workflow and
+                # native-subclass compatibility, but is not a user choice here.
+                ensure_binaries(kinds=missing, flavor="auto", log=log)
             except Exception as exc:  # noqa: BLE001
                 log_warn(f"Automatic binary install failed: {exc}")
             colmap_exe = resolve_binary("colmap", colmap_path)

@@ -47,7 +47,7 @@ class SharpFrameSelectorTests(unittest.TestCase):
         required = Enndee_SharpFrameSelector.INPUT_TYPES()["required"]
         self.assertEqual(list(required)[:2], ["images", "scores"])
         self.assertEqual(list(required["selection_method"][0]),
-                         ["batched_topn", "batched", "best_n"])
+                         ["batched_topn", "best_n"])
         self.assertEqual(required["selection_method"][1]["default"], "batched_topn")
         self.assertTrue(all("tooltip" in metadata for _o, metadata in required.values()))
 
@@ -89,6 +89,15 @@ class SharpFrameSelectorTests(unittest.TestCase):
         selected, count = self.select(images, scores, selection_method="batched")
         self.assertEqual(count, 3)
         self.assertEqual(selected_ids(selected), [3, 7, 11])
+
+    def test_batched_topn_one_is_equivalent_to_legacy_batched(self):
+        images = frames_with_ids(12)
+        scores = [float(i) for i in range(12)]
+        topn, topn_count = self.select(images, scores, selection_method="batched_topn",
+                                       num_frames=1)
+        legacy, legacy_count = self.select(images, scores, selection_method="batched")
+        self.assertEqual((legacy_count, selected_ids(legacy)),
+                         (topn_count, selected_ids(topn)))
 
     def test_best_n_keeps_global_top_frames(self):
         images = frames_with_ids(10)

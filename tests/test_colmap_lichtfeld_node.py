@@ -670,6 +670,25 @@ class NativeNodeTests(unittest.TestCase):
             self.assertEqual(native_types["optional"][name],
                              binary_types["optional"][name], name)
 
+    def test_sequential_overlap_is_preserved_but_binary_flavor_stays_automatic(self):
+        optional = binary.GLOMAPLichtfeldTracker.INPUT_TYPES()["optional"]
+        self.assertIn("sequential_overlap", optional)
+        self.assertEqual(list(optional["binary_flavor"][0]), ["auto", "cuda", "nocuda"])
+        js = (Path(binary.__file__).resolve().parents[1] / "web" / "js"
+              / "enndee_colmap_widgets.js").read_text(encoding="utf-8")
+        self.assertIn('[["matcher", "sequential"]]', js)
+        self.assertIn('setWidgetHidden(findWidget(node, "binary_flavor"), true)', js)
+
+    def test_binary_backend_forces_automatic_flavor(self):
+        node = binary.GLOMAPLichtfeldTracker()
+        with mock.patch.object(binary, "resolve_binary",
+                               side_effect=[None, None, "COLMAP", "GLOMAP"]), \
+                mock.patch.object(binary, "auto_download_enabled", return_value=True), \
+                mock.patch.object(binary, "ensure_binaries") as ensure:
+            self.assertEqual(node._setup_binaries("", "", "glomap", True, "cuda"),
+                             ("COLMAP", "GLOMAP"))
+        self.assertEqual(ensure.call_args.kwargs["flavor"], "auto")
+
     def test_mapper_backend_defaults_to_the_native_global_mapper(self):
         widget = native.ColmapLichtfeldTracker.INPUT_TYPES()["optional"]["mapper_backend"]
         self.assertEqual(list(widget[0]), ["global", "incremental"])

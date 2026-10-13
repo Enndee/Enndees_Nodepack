@@ -9,7 +9,8 @@ The selector adds a ``selection_method`` option the original node lacks:
 
 * ``batched_topn`` (default) - keep the **top ``num_frames`` frames of every
   ``batch_size`` chunk**, e.g. the 3 sharpest of every 4 frames.
-* ``batched``  - original behaviour: the single sharpest frame of every chunk.
+* ``batched``  - legacy alias for ``batched_topn`` with ``num_frames=1``; accepted
+  for old workflows but no longer offered as a separate choice.
 * ``best_n``   - the globally sharpest ``num_frames`` frames.
 
 ``batch_buffer`` skips frames between chunks (stride = batch_size + buffer); 0
@@ -64,12 +65,11 @@ class Enndee_SharpFrameSelector:
             "scores": ("SHARPNESS_SCORES", {
                 "tooltip": "Scores from a Sharpness Analyzer node (Enndee or "
                            "ComfyUI-Sharp-Selector)."}),
-            "selection_method": (["batched_topn", "batched", "best_n"], {
+            "selection_method": (["batched_topn", "best_n"], {
                 "default": "batched_topn",
                 "tooltip": "batched_topn: keep the top num_frames of every "
-                           "batch_size chunk (e.g. 3 of every 4). batched: keep "
-                           "only the single sharpest frame of every chunk. "
-                           "best_n: keep the globally sharpest num_frames "
+                           "batch_size chunk (e.g. 3 of every 4). best_n: keep "
+                           "the globally sharpest num_frames "
                            "frames."}),
             "batch_size": ("INT", {
                 "default": 24, "min": 1, "max": 100000, "step": 1,
@@ -83,8 +83,8 @@ class Enndee_SharpFrameSelector:
             "num_frames": ("INT", {
                 "default": 10, "min": 1, "max": 100000, "step": 1,
                 "tooltip": "How many frames to keep: per chunk in batched_topn "
-                           "(e.g. 3) and globally in best_n. Ignored by "
-                           "batched."}),
+                           "(e.g. 3) and globally in best_n. The legacy "
+                           "batched value always keeps one per chunk."}),
             "min_sharpness": ("FLOAT", {
                 "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.1,
                 "tooltip": "Drop frames scoring below this Laplacian-variance "
@@ -98,7 +98,8 @@ class Enndee_SharpFrameSelector:
     DESCRIPTION = (
         "Reduce an IMAGE batch to its sharpest frames. batched_topn keeps the "
         "top num_frames of every batch_size chunk (e.g. the 3 sharpest of every "
-        "4 frames); batched keeps one per chunk; best_n keeps the global top N.")
+        "4 frames); best_n keeps the global top N. The legacy batched value is "
+        "still accepted for saved workflows.")
 
     def select_frames(self, images, scores, selection_method, batch_size,
                       batch_buffer, num_frames, min_sharpness):
@@ -114,12 +115,10 @@ class Enndee_SharpFrameSelector:
             images = images[:limit]
             scores = scores[:limit]
 
-        if selection_method == "batched_topn":
+        if selection_method in ("batched", "batched_topn"):
             selected = self._select_batched_topn(
-                scores, batch_size, batch_buffer, num_frames, min_sharpness)
-        elif selection_method == "batched":
-            selected = self._select_batched(
-                scores, batch_size, batch_buffer, min_sharpness)
+                scores, batch_size, batch_buffer,
+                1 if selection_method == "batched" else num_frames, min_sharpness)
         else:  # "best_n"
             selected = self._select_best_n(scores, num_frames, min_sharpness)
 
@@ -220,12 +219,10 @@ def select_frames(scores, selection_method="batched_topn", batch_size=4,
     Shared by the Sharp Frame Selector node and the trackers' in-tracker selection,
     so both pick exactly the same frames for the same scores and parameters.
     """
-    if selection_method == "batched_topn":
+    if selection_method in ("batched", "batched_topn"):
         return Enndee_SharpFrameSelector._select_batched_topn(
-            scores, batch_size, batch_buffer, num_frames, min_sharpness)
-    if selection_method == "batched":
-        return Enndee_SharpFrameSelector._select_batched(
-            scores, batch_size, batch_buffer, min_sharpness)
+            scores, batch_size, batch_buffer,
+            1 if selection_method == "batched" else num_frames, min_sharpness)
     return Enndee_SharpFrameSelector._select_best_n(scores, num_frames, min_sharpness)
 
 

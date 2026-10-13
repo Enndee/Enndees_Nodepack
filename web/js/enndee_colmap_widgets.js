@@ -2,8 +2,11 @@
  * COLMAP / GLOMAP Lichtfeld Tracker (Enndee) - dependent widget visibility.
  *
  * Widgets appear only while the widget they depend on is active:
- *   sharp_selection        -> Sharp Method / Sharp Batch / Sharp Num Frames
+ *   sharp_selection        -> Sharp Method / Sharp Num Frames
+ *   sharp_method=batched_topn -> Sharp Batch
+ *   matcher=sequential    -> sequential_overlap
  *   use_rmbg               -> rmbg_mode / rmbg_threshold / rmbg_resize
+ *   use_rmbg               -> offset_glomap / offset_splat
  *   prepare_masks_for_face_detail -> face_mask_mode / face_prompt / face_threshold / face_mask_dilate
  *   mapper_backend=glomap  -> glomap_path (binary node only)
  *   image_format           -> jpeg_quality (JPEG) / embed_alpha_in_images (PNG)
@@ -64,10 +67,14 @@ function finishVisibilityUpdate(node) {
 // show: widgets that appear when EVERY condition in `when` holds. A widget listed in
 // several groups is visible when ANY of its groups is satisfied.
 const GROUPS = [
-  { show: ["sharp_method", "sharp_batch", "sharp_num_frames"],
+  { show: ["sharp_method", "sharp_num_frames"],
     when: [["sharp_selection", true]] },
+  { show: ["sharp_batch"],
+    when: [["sharp_selection", true], ["sharp_method", "batched_topn"]] },
+  { show: ["sequential_overlap"], when: [["matcher", "sequential"]] },
   { show: ["rmbg_mode", "rmbg_threshold", "rmbg_resize"],
     when: [["use_rmbg", true]] },
+  { show: ["offset_glomap", "offset_splat"], when: [["use_rmbg", true]] },
   { show: ["face_frames", "face_mask_mode", "face_prompt", "face_threshold", "face_mask_dilate"],
     when: [["prepare_masks_for_face_detail", true]] },
   { show: ["glomap_path"], when: [["mapper_backend", "glomap"]] },
@@ -91,7 +98,7 @@ const LABELS = [
 ];
 
 const WATCHED_WIDGETS = new Set([
-  "sharp_selection", "use_rmbg", "prepare_masks_for_face_detail",
+  "sharp_selection", "sharp_method", "matcher", "use_rmbg", "prepare_masks_for_face_detail",
   "mapper_backend", "image_format", "export_depth_maps",
   "fuse_dense_cloud", "mesh_dense_surface",
 ]);
@@ -125,6 +132,12 @@ function applyVisibility(node) {
     if (setWidgetHidden(findWidget(node, name), !visible.has(name))) {
       changed = true;
     }
+  }
+
+  // Retain the serialized widget in the input schema for old workflows, but do not
+  // expose a flavor choice: the binary tracker always resolves the automatic build.
+  if (setWidgetHidden(findWidget(node, "binary_flavor"), true)) {
+    changed = true;
   }
 
   if (changed) {

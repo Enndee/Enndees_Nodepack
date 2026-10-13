@@ -45,7 +45,10 @@ class SharedSelectionFunctionTests(unittest.TestCase):
         scores = [1.0, 9.0, 2.0, 8.0, 3.0, 7.0]
         self.assertEqual(sharp.select_frames(scores, "batched_topn", 2, 1),
                          [1, 3, 5])
-        self.assertEqual(sharp.select_frames(scores, "batched", 2, 1), [1, 3, 5])
+        # The former single-best-per-chunk mode is simply top-N with N=1.
+        self.assertEqual(sharp.select_frames(scores, "batched_topn", 2, 1),
+                         sharp.Enndee_SharpFrameSelector._select_batched(
+                             scores, 2, 0, 0.0))
 
     def test_best_n_keeps_the_global_top(self):
         scores = [1.0, 9.0, 2.0, 8.0, 3.0, 7.0]
@@ -185,6 +188,8 @@ class SidecarAndWidgetContractTests(unittest.TestCase):
         added = list(GLOMAPLichtfeldTracker._new_widgets())
         self.assertEqual(added, ["subject_focus", "sharp_selection", "sharp_method",
                                  "sharp_batch", "sharp_num_frames"])
+        sharp_methods = GLOMAPLichtfeldTracker.INPUT_TYPES()["optional"]["sharp_method"][0]
+        self.assertEqual(list(sharp_methods), ["batched_topn", "best_n"])
         for cls in (GLOMAPLichtfeldTracker, ColmapLichtfeldTracker):
             optional = list(cls.INPUT_TYPES()["optional"])
             self.assertEqual(optional[-len(face) - len(added):], face + added,
@@ -198,6 +203,10 @@ class SidecarAndWidgetContractTests(unittest.TestCase):
         js_path = PACK_DIR / "web" / "js" / "enndee_colmap_widgets.js"
         js = js_path.read_text(encoding="utf-8")
         self.assertIn('"sharp_selection", true', js)
+        self.assertIn('[["matcher", "sequential"]]', js)
+        self.assertIn('["offset_glomap", "offset_splat"]', js)
+        self.assertIn('[["sharp_selection", true], ["sharp_method", "batched_topn"]]', js)
+        self.assertIn('setWidgetHidden(findWidget(node, "binary_flavor"), true)', js)
         self.assertIn('"use_rmbg", true', js)
         self.assertIn('"prepare_masks_for_face_detail", true', js)
         self.assertIn('"Use RMBG for COLMAP"', js)
