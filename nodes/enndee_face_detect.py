@@ -179,11 +179,18 @@ def _faces_from_state(state, width: int, height: int, threshold: float) -> List[
 
     boxes = state.get("boxes")
     scores = state.get("scores")
+    masks = state.get("masks")
     if boxes is None or len(boxes) == 0:
         return []
     boxes = boxes.detach().float().cpu().reshape(-1, 4)
     scores = (scores.detach().float().cpu().reshape(-1) if scores is not None
               else torch.ones(len(boxes)))
+    if masks is not None:
+        masks = masks.detach().bool().cpu()
+        if masks.ndim == 4 and masks.shape[1] == 1:
+            masks = masks[:, 0]
+        if masks.ndim != 3 or masks.shape[0] != len(boxes):
+            masks = None
     faces: List[Dict] = []
     for index in range(len(boxes)):
         score = float(scores[index])
@@ -200,14 +207,29 @@ def _faces_from_state(state, width: int, height: int, threshold: float) -> List[
         width_px, height_px = x1 - x0, y1 - y0
         if width_px <= 0 or height_px <= 0:
             continue
-        faces.append({
+        face = {
             "x0": x0 / width, "y0": y0 / height, "x1": x1 / width, "y1": y1 / height,
             "cx": (x0 + x1) / (2.0 * width), "cy": (y0 + y1) / (2.0 * height),
             "width": width_px / width, "height": height_px / height,
             "width_px": width_px, "height_px": height_px,
             "area": (width_px * height_px) / (width * height),
             "score": score,
-        })
+        }
+        if masks is not None:
+            # Keep SAM3's actual segmentation, not just its rectangular detection.
+            # It is resized to the original image by Sam3Processor and is binary
+            # after the processor's 0.5 threshold. Store only its occupied region:
+            # retaining one full-resolution mask per input frame wastes substantial
+            # RAM on long captures whose face occupies only a small part of each image.
+            segmentation = masks[index]
+            rows, columns = torch.where(segmentation)
+            if rows.numel():
+                y0, y1 = int(rows.min()), int(rows.max()) + 1
+                x0, x1 = int(columns.min()), int(columns.max()) + 1
+                face["mask"] = segmentation[y0:y1, x0:x1].numpy()
+                face["mask_bounds"] = (x0, y0, x1, y1)
+                face["mask_size"] = (int(height), int(width))
+        faces.append(face)
     faces.sort(key=lambda face: face["area"], reverse=True)
     return faces
 

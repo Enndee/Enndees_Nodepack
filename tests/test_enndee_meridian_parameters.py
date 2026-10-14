@@ -89,34 +89,56 @@ class MeridianParametersWidgetTests(unittest.TestCase):
         for name in parameters.PATH_WIDGET_NAMES:
             self.assertIn(name, required)
         self.assertTrue(all("tooltip" in metadata for _options, metadata in required.values()))
-        self.assertIn("depth_relief", required)
-        # The face-detail block is still at the end, with relief appended after it -
-        # appended LAST so no saved workflow's positional widget_values move.
-        self.assertEqual(list(required)[-6:],
+        for removed in ("model_size", "auto_orbit_distance", "auto_orbit_end", "auto_orbit_size"):
+            self.assertNotIn(removed, required)
+        self.assertIn("auto_scene_survey_width", required)
+        self.assertEqual(list(required)[-5:],
                          ["face_orbit", "face_fill", "face_yaw_span", "face_prompt",
-                          "face_threshold", "depth_relief"])
+                          "face_threshold"])
         self.assertEqual(set(NODE.INPUT_TYPES()["optional"]),
-                         {"reference_image", "subject_mask", "face_bbox"})
+                         {"reference_image", "subject_mask"})
+        self.assertIn("auto_orbit_angle", required)
 
-    def test_depth_relief_widget_is_forwarded_to_camera_estimation(self):
+    def test_depth_relief_is_fixed_to_identity(self):
         fake, calls, _report = estimate_stub()
         values = all_defaults()
-        values.update(camera_mode=parameters.AUTOMATIC_MODE, depth_relief=1.2)
+        values.update(camera_mode=parameters.AUTOMATIC_MODE)
         with mock.patch.object(parameters, "estimate_camera_path", side_effect=fake):
             NODE().build(reference_image=torch.zeros(1, 8, 8, 3), **values)
-        self.assertAlmostEqual(calls[0]["depth_relief"], 1.2)
+        self.assertAlmostEqual(calls[0]["depth_relief"], 1.0)
 
-    def test_depth_relief_is_recorded_for_manual_estimated_paths(self):
+    def test_face_bbox_socket_has_been_removed(self):
+        self.assertNotIn("face_bbox", NODE.INPUT_TYPES()["optional"])
+
+    def test_band_stop_angle_uses_its_label_as_the_widget_name(self):
+        required = NODE.INPUT_TYPES()["required"]
+        band_names = list(required)
+        self.assertEqual(band_names.index("band_stop_angle"),
+                         band_names.index("band_start_angle") + 1)
+        self.assertIn("band_stop_angle", required)
+        self.assertNotIn("band_step", required)
+        source = JS_PATH.read_text(encoding="utf-8")
+        self.assertIn('["band_stop_angle", "Band Stop Angle"]', source)
+        self.assertIn('["band_width", "Band Width (Yaw)"]', source)
+        self.assertNotIn("node.widgets.splice", source)
+
+    def test_mode_specific_auto_controls_are_hidden_by_coverage_logic(self):
+        source = JS_PATH.read_text(encoding="utf-8")
+        self.assertIn('if (!O_ORBIT_COVERAGES.has(coverage))', source)
+        self.assertIn('if (coverage !== "Spiral")', source)
+        self.assertIn('if (BAND_COVERAGES.has(coverage))', source)
+        self.assertNotIn("initialWidgetOrder", source)
+
+    def test_manual_estimated_paths_emit_identity_relief(self):
         values = all_defaults()
-        values.update(camera_mode=parameters.AUTOMATIC_MODE, auto_path_mode=parameters.MANUAL_PATH,
-                      depth_relief=1.4)
+        values.update(camera_mode=parameters.AUTOMATIC_MODE, auto_path_mode=parameters.MANUAL_PATH)
         surface = surface_stub()
         surface["depth_relief"] = 1.4
         with mock.patch.object(parameters, "probe_surface", return_value=surface), \
                 mock.patch.object(parameters, "guard_collisions", return_value=([], 0, 0.0, 0.0)):
             _args, signal, _face = NODE().build(
                 reference_image=torch.zeros(1, 8, 8, 3), **values)
-        self.assertEqual(json.loads(signal)["depth_relief"], 1.4)
+        self.assertEqual(json.loads(signal)["depth_relief"], 1.0)
 
     def test_removed_widgets_are_gone(self):
         required = NODE.INPUT_TYPES()["required"]
@@ -153,30 +175,21 @@ class MeridianParametersWidgetTests(unittest.TestCase):
             metadata = required[f"auto_pivot_{axis}"][1]
             self.assertEqual(metadata["default"], 0.0)
             self.assertEqual((metadata["min"], metadata["max"]), (-1.0, 1.0))
-        distance = required["auto_orbit_distance"][1]
-        self.assertEqual(distance["default"], 0.0)          # 0 = the auto framing decides the distance
-        self.assertEqual((distance["min"], distance["max"]),
-                         (0.0, parameters.ORBIT_DISTANCE_MAX))
         fill = required["auto_subject_fill"][1]
         self.assertAlmostEqual(fill["default"], parameters.SUBJECT_FILL_DEFAULT)
         self.assertEqual((fill["min"], fill["max"]),
                          (parameters.SUBJECT_FILL_MIN, parameters.SUBJECT_FILL_MAX))
-        size = required["auto_orbit_size"][1]
+        size = required["auto_scene_survey_width"][1]
         self.assertAlmostEqual(size["default"], parameters.ORBIT_SIZE_DEFAULT)
         self.assertEqual((size["min"], size["max"]),
                          (parameters.ORBIT_SIZE_MIN, parameters.ORBIT_SIZE_MAX))
-        end = required["auto_orbit_end"][1]
-        self.assertAlmostEqual(end["default"], parameters.ORBIT_END_DEFAULT)
-        self.assertEqual((end["min"], end["max"]),
-                         (parameters.ORBIT_END_MIN, parameters.ORBIT_END_MAX))
         turn = required["auto_orbit_direction"][1]
         self.assertEqual(turn["default"], parameters.ORBIT_DIRECTION_DEFAULT)
         self.assertIn(turn["default"], parameters.ORBIT_DIRECTIONS)
         self.assertEqual(required["auto_orbit_direction"][0], list(parameters.ORBIT_DIRECTIONS))
         self.assertEqual(all_defaults()["path_camera_mode"], "O Orbits")
 
-    def test_orbit_shape_widgets_replaced_the_deprecated_pair(self):
-        """The two new widgets are visible and the deprecated pair stays (hidden) for old graphs."""
+    def test_orbit_shape_widgets_are_the_active_coverage_controls(self):
         required = NODE.INPUT_TYPES()["required"]
         view = required["auto_orbit_view_angle"][1]
         self.assertAlmostEqual(view["default"], parameters.ORBIT_VIEW_ANGLE_DEFAULT)
@@ -185,14 +198,14 @@ class MeridianParametersWidgetTests(unittest.TestCase):
         coverage = required["auto_orbit_coverage"]
         self.assertEqual(coverage[0], list(parameters.ORBIT_COVERAGES))
         self.assertEqual(coverage[1]["default"], parameters.ORBIT_COVERAGE_DEFAULT)
-        self.assertEqual(parameters.ORBIT_COVERAGE_DEFAULT, "Front and Back")
-        # both deprecated widgets still exist (saved workflows keep loading) and the JS hides them
-        self.assertIn("auto_orbit_size", required)
-        self.assertIn("auto_orbit_end", required)
+        self.assertEqual(parameters.ORBIT_COVERAGE_DEFAULT, "O-Orbit Front&Back")
+        self.assertNotIn("auto_orbit_distance", required)
+        self.assertNotIn("auto_orbit_end", required)
         source = JS_PATH.read_text(encoding="utf-8")
-        self.assertIn('const DEPRECATED_PANEL = ["auto_orbit_distance", "auto_orbit_end", "auto_orbit_size"];',
-                      source)
         self.assertIn('"auto_orbit_view_angle", "auto_orbit_coverage"', source)
+        self.assertIn('"auto_scene_survey_width"', source)
+        self.assertIn('"O-Orbit Front", "O-Orbit Front&Back"', source)
+        self.assertIn('"Band Width (Yaw)"', source)
 
     def test_javascript_mirrors_the_widget_names_and_mode_labels(self):
         source = JS_PATH.read_text(encoding="utf-8")
@@ -300,58 +313,64 @@ class MeridianAutomaticCameraTests(unittest.TestCase):
         self.assertEqual(calls[0]["pivot_offset"], (0.25, 0.0, 0.0))
         self.assertIs(calls[0]["subject_mask"], mask)
         self.assertIs(calls[0]["reference"], reference)
-        # the estimate must name the depth model the Geometry node renders with - two models do
-        # not share a scale, and the keys are emitted in the estimating model's median units
-        self.assertIn("model_size", NODE.INPUT_TYPES()["required"])
-        self.assertEqual(calls[0]["model_size"], values["model_size"])
+        # MoGe-3 is selected internally and has no user-facing selector.
         printed = buffer.getvalue()
         self.assertIn("[Enndee] Meridian auto camera:", printed)
         self.assertIn("2 %/frame", printed)          # the speed cap is reported in percent
 
-    def test_automatic_path_forwards_the_orbit_shape_widgets(self):
-        """View Angle / Coverage reach the estimator; Size / End / Distance are deprecated."""
+    def test_automatic_path_forwards_coverage_and_scene_survey_width(self):
+        """Coverage controls the subject path; survey width controls scene-target rows."""
         fake, calls, _report = estimate_stub()
         values = all_defaults()
-        values.update(camera_mode=parameters.AUTOMATIC_MODE, auto_orbit_distance=3.5,
-                      auto_orbit_size=0.6, auto_orbit_end=270.0, auto_subject_fill=25.0,
+        values.update(camera_mode=parameters.AUTOMATIC_MODE, auto_subject_fill=25.0,
                       auto_orbit_view_angle=90.0,
                       auto_orbit_coverage=parameters.ORBIT_COVERAGES[0],
                       auto_orbit_angle=25.0)
         with mock.patch.object(parameters, "estimate_camera_path", side_effect=fake):
             NODE().build(reference_image=torch.zeros(1, 8, 8, 3), **values)
         self.assertEqual(len(calls), 1)
-        self.assertIsNone(calls[0]["orbit_distance"])   # deprecated: always ignored now
-        self.assertIsNone(calls[0]["orbit_size"])       # deprecated for a subject: the O is fixed
-        self.assertIsNone(calls[0]["orbit_end"])        # deprecated: Coverage picks the path
+        self.assertIsNone(calls[0]["orbit_size"])       # scene survey width only applies to scenes
         self.assertAlmostEqual(calls[0]["subject_fill"], 25.0)
         self.assertEqual(calls[0]["view_angle"], 90.0)
         self.assertEqual(calls[0]["coverage"], parameters.ORBIT_COVERAGES[0])
         self.assertAlmostEqual(calls[0]["orbit_amplitude"], 25.0)
 
+    def test_o_orbit_coverage_labels_are_forwarded_as_canonical_values(self):
+        for coverage in parameters.ORBIT_COVERAGES[:2]:
+            with self.subTest(coverage=coverage):
+                fake, calls, _report = estimate_stub()
+                values = all_defaults()
+                values.update(camera_mode=parameters.AUTOMATIC_MODE,
+                              auto_orbit_coverage=coverage)
+                with mock.patch.object(parameters, "estimate_camera_path", side_effect=fake):
+                    NODE().build(reference_image=torch.zeros(1, 8, 8, 3), **values)
+                self.assertEqual(calls[0]["coverage"], coverage)
+
     def test_o_orbit_angle_widget_is_visible_and_reaches_the_estimator(self):
         required = NODE.INPUT_TYPES()["required"]
         angle = required["auto_orbit_angle"][1]
         self.assertAlmostEqual(angle["default"], parameters.FRONT_ORBIT_ANGLE_DEFAULT)
-        # The slider spans both meanings of the slot: the O's radius and the Spiral End Angle
-        # (the backend clamps each to its own window, the JS panel narrows the range per coverage).
         self.assertEqual((angle["min"], angle["max"]),
-                         (min(parameters.FRONT_ORBIT_ANGLE_MIN, parameters.SPIRAL_END_ARC_MIN),
-                          max(parameters.FRONT_ORBIT_LIMIT, parameters.SPIRAL_END_ARC_MAX)))
+                         (parameters.FRONT_ORBIT_ANGLE_MIN, parameters.FRONT_ORBIT_LIMIT))
         self.assertIn("auto_orbit_angle", parameters.AUTO_WIDGET_NAMES)
         source = JS_PATH.read_text(encoding="utf-8")
         self.assertIn('"auto_orbit_angle"', source)
-        self.assertIn("Spiral End Angle", source)          # the panel renames it in Spiral mode
+        self.assertIn('"O-Orbit Angle"', source)
+        self.assertIn('"O-Orbit Front", "O-Orbit Front&Back"', source)
+        self.assertIn('"Band Width (Yaw)"', source)
+        self.assertIn('"band_stop_angle", "Band Stop Angle"', source)
 
-    def test_the_spiral_end_angle_rides_along_the_orbit_angle_widget(self):
-        """The shared widget reaches the estimator as both the O radius and the Spiral End Angle."""
+    def test_o_orbit_angle_is_not_used_as_the_spiral_end_angle(self):
         fake, calls, _report = estimate_stub()
         values = all_defaults()
-        values.update(camera_mode=parameters.AUTOMATIC_MODE, auto_orbit_angle=75.0)
+        values.update(camera_mode=parameters.AUTOMATIC_MODE, auto_orbit_angle=25.0,
+                      auto_orbit_coverage="Spiral")
         with mock.patch.object(parameters, "estimate_camera_path", side_effect=fake):
             NODE().build(reference_image=torch.zeros(1, 8, 8, 3), **values)
         self.assertEqual(len(calls), 1)
-        self.assertAlmostEqual(calls[0]["orbit_amplitude"], 75.0)
-        self.assertAlmostEqual(calls[0]["spiral_end_arc"], 75.0)
+        self.assertAlmostEqual(calls[0]["orbit_amplitude"], 25.0)
+        self.assertAlmostEqual(calls[0]["spiral_end_arc"], parameters.SPIRAL_END_ARC_DEFAULT)
+        self.assertEqual(calls[0]["coverage"], "Spiral")
 
     def test_the_spiral_winding_and_slope_widgets_reach_the_estimator(self):
         fake, calls, _report = estimate_stub()
@@ -367,15 +386,24 @@ class MeridianAutomaticCameraTests(unittest.TestCase):
         self.assertIn("Spiral Center Slope", source)
         self.assertIn("Spiral Winding", source)
 
-    def test_a_scene_survey_still_uses_orbit_size(self):
-        """Auto Orbit Size only lost its meaning for the subject; the rows still follow it."""
+    def test_a_scene_survey_uses_its_width_control(self):
+        """The scene survey width controls row breadth and is not used for a subject path."""
         fake, calls, _report = estimate_stub()
         values = all_defaults()
         values.update(camera_mode=parameters.AUTOMATIC_MODE, auto_target="scene",
-                      auto_orbit_size=0.6)
+                      auto_scene_survey_width=0.6)
         with mock.patch.object(parameters, "estimate_camera_path", side_effect=fake):
             NODE().build(reference_image=torch.zeros(1, 8, 8, 3), **values)
         self.assertAlmostEqual(calls[0]["orbit_size"], 0.6)
+
+    def test_subject_path_ignores_scene_survey_width(self):
+        fake, calls, _report = estimate_stub()
+        values = all_defaults()
+        values.update(camera_mode=parameters.AUTOMATIC_MODE, auto_target="subject",
+                      auto_scene_survey_width=0.6)
+        with mock.patch.object(parameters, "estimate_camera_path", side_effect=fake):
+            NODE().build(reference_image=torch.zeros(1, 8, 8, 3), **values)
+        self.assertIsNone(calls[0]["orbit_size"])
 
     def test_automatic_mode_requires_the_reference_image(self):
         values = all_defaults()

@@ -51,42 +51,41 @@ class MeridianGeometryFastDepthTests(unittest.TestCase):
         inputs = geometry.EnndeeMeridianGeometry.INPUT_TYPES()
         self.assertEqual(
             list(inputs["required"]),
-            ["video", "args", "model_size", "canvas_mode", "custom_width", "custom_height",
+            ["video", "args", "canvas_mode", "custom_width", "custom_height",
              "cloud_scale", "point_size", "edge_cull", "edge_threshold", "back_face_cull",
-             "depth_res", "external_depth_polarity", "moge_refine_steps", "surface_mode"],
+             "depth_res", "moge_refine_steps", "surface_mode"],
         )
         self.assertEqual(list(inputs["optional"]),
-                         ["image", "args_override", "depth_relief",
-                          "custom_camera", "external_depth"])
+                         ["image", "args_override", "custom_camera"])
+        self.assertNotIn("external_depth", inputs["optional"])
+        self.assertNotIn("external_depth_polarity", inputs["required"])
+        self.assertNotIn("model_size", inputs["required"])
         for name, (_options, metadata) in inputs["required"].items():
             self.assertIn("tooltip", metadata, f"{name} needs a tooltip")
 
-    def test_the_external_depth_inputs_are_appended_last(self):
-        # ComfyUI maps a saved workflow's widget_values by INSERTION ORDER, so a widget added
-        # in the middle would silently remap every later widget of existing workflows. Any new
-        # control therefore goes last.
+    def test_optional_input_schema_has_no_depth_relief_widget(self):
         inputs = geometry.EnndeeMeridianGeometry.INPUT_TYPES()
         self.assertEqual(list(inputs["required"])[-1], "surface_mode")
         self.assertEqual(list(inputs["optional"]),
-                         ["image", "args_override", "depth_relief", "custom_camera", "external_depth"])
+                         ["image", "args_override", "custom_camera"])
 
-    def test_custom_camera_depth_relief_overrides_geometry_fallback(self):
+    def test_custom_camera_depth_relief_metadata_is_still_respected(self):
         capture = _FastCapture()
         image = torch.zeros(1, 64, 112, 3)
         camera = json.dumps({**_two_key_path(73), "depth_relief": 1.2})
         with mock.patch.object(geometry, "render_depth_aligned", capture):
             geometry.EnndeeMeridianGeometry().build(
                 video="unused.mp4", args="--frames 73", image=image,
-                custom_camera=camera, depth_relief=0.8)
+                custom_camera=camera)
         self.assertEqual(capture.kwargs["depth_relief"], 1.2)
 
-    def test_geometry_fallback_depth_relief_is_forwarded_without_camera_metadata(self):
+    def test_geometry_defaults_to_identity_depth_relief(self):
         capture = _FastCapture()
         with mock.patch.object(geometry, "render_depth_aligned", capture):
             geometry.EnndeeMeridianGeometry().build(
                 video="unused.mp4", args="--frames 90", image=torch.zeros(1, 64, 112, 3),
-                custom_camera=json.dumps(_two_key_path(90)), depth_relief=1.4)
-        self.assertEqual(capture.kwargs["depth_relief"], 1.4)
+                custom_camera=json.dumps(_two_key_path(90)))
+        self.assertEqual(capture.kwargs["depth_relief"], 1.0)
 
     def test_the_vggt_surface_is_gone(self):
         inputs = geometry.EnndeeMeridianGeometry.INPUT_TYPES()
@@ -144,7 +143,7 @@ class MeridianGeometryFastDepthTests(unittest.TestCase):
             for depth_res in (fast_depth.DA3_RES, 0, 1008):
                 geometry.EnndeeMeridianGeometry().build(
                     video="unused.mp4", args="--frames 73", image=images, depth_res=depth_res,
-                    model_size="MoGe 3", canvas_mode="custom", custom_width=112,
+                    canvas_mode="custom", custom_width=112,
                     custom_height=64, cloud_scale=1, point_size=0, edge_threshold=0.2)
                 self.assertEqual(capture.kwargs["depth_res"], depth_res)
         self.assertEqual(capture.kwargs["model_size"], "MoGe-3-ViT-L")
@@ -195,20 +194,21 @@ class MeridianGeometryFastDepthTests(unittest.TestCase):
             geometry.EnndeeMeridianGeometry().build(video="clip.mp4", args="--frames 73")
         self.assertEqual(capture.first.shape, (1, 64, 112, 3))
         with self.assertRaisesRegex(ValueError, "video path"):
+
             geometry.EnndeeMeridianGeometry().build(video="missing.mp4", args="--frames 73")
 
-    def test_model_size_offers_moge_3_only(self):
-        spec = geometry.EnndeeMeridianGeometry.INPUT_TYPES()["required"]["model_size"]
-        self.assertEqual(list(spec[0]), ["MoGe 3"])
-        self.assertEqual(spec[1]["default"], "MoGe 3")
-        self.assertEqual(geometry.resolve_depth_model("MoGe 3"), ("MoGe-3-ViT-L", False))
-        # Every other depth source is REJECTED rather than silently degraded: without MoGe's
-        # camera intrinsics the face orbit registers at the wrong focal (see MODEL_OPTIONS).
-        for rejected in ("external", "Depth Anything 3 Mono Large", "Depth-Anything-3-Small",
-                         "Depth-Anything-3-Mono-Large", "Depth-Anything-V2-Base-hf", "nonsense"):
-            with self.subTest(model=rejected), \
-                    self.assertRaisesRegex(ValueError, "Unsupported depth model"):
-                geometry.resolve_depth_model(rejected)
+    def test_depth_model_is_fixed_to_moge_3_without_a_selector_widget(self):
+        self.assertNotIn("model_size", geometry.EnndeeMeridianGeometry.INPUT_TYPES()["required"])
+        self.assertEqual(geometry.MOGE_MODEL_ID, "MoGe-3-ViT-L")
+
+    def test_geometry_always_selects_the_moge3_backend(self):
+        capture = _FastCapture()
+        with mock.patch.object(geometry, "render_depth_aligned", capture):
+            geometry.EnndeeMeridianGeometry().build(
+                video="unused.mp4", args="--frames 73", image=torch.zeros(1, 64, 112, 3),
+                moge_refine_steps=0)
+        self.assertEqual(capture.kwargs["model_size"], "MoGe-3-ViT-L")
+        self.assertEqual(capture.kwargs["moge_refine_steps"], 0)
 
     def test_the_refinement_widget_defaults_to_moges_own_value(self):
         spec = geometry.EnndeeMeridianGeometry.INPUT_TYPES()["required"]["moge_refine_steps"]
@@ -251,7 +251,7 @@ class MeridianGeometryFastDepthTests(unittest.TestCase):
         with mock.patch.object(geometry, "render_depth_aligned", capture):
             geometry.EnndeeMeridianGeometry().build(
                 video="unused.mp4", args="--frames 73", image=torch.zeros(1, 64, 112, 3),
-                model_size="MoGe 3", moge_refine_steps=0)
+                moge_refine_steps=0)
         self.assertEqual(capture.kwargs["model_size"], "MoGe-3-ViT-L")
         self.assertEqual(capture.kwargs["moge_refine_steps"], 0)      # 0 = stage disabled
 
@@ -267,46 +267,7 @@ class MeridianGeometryFastDepthTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaisesRegex(ValueError, "moge_refine_steps"):
                 geometry.EnndeeMeridianGeometry().build(
                     video="unused.mp4", args="--frames 73", image=torch.zeros(1, 64, 112, 3),
-                    model_size="MoGe 3", moge_refine_steps=value)
-
-    def test_external_model_is_rejected_even_with_a_connected_map(self):
-        # External depth went with the MoGe-3-only migration: a bare depth map has no camera
-        # intrinsics, so the face orbit would register the SAM3 box at the wrong focal.
-        depth = torch.linspace(0.0, 1.0, 64 * 112).view(1, 64, 112, 1)
-        with self.assertRaisesRegex(ValueError, "Unsupported depth model"):
-            geometry.EnndeeMeridianGeometry().build(
-                video="unused.mp4", args="--frames 73", image=torch.zeros(1, 64, 112, 3),
-                model_size="external", external_depth=depth)
-
-    def test_external_depth_polarity_sets_the_invert_flag(self):
-        for label, expected in geometry.EXTERNAL_DEPTH_POLARITIES.items():
-            capture = _FastCapture()
-            with mock.patch.object(geometry, "render_depth_aligned", capture):
-                geometry.EnndeeMeridianGeometry().build(
-                    video="unused.mp4", args="--frames 73", image=torch.zeros(1, 64, 112, 3),
-                    model_size="MoGe 3", external_depth_polarity=label)
-            self.assertIs(capture.kwargs["external_depth_invert"], expected, label)
-
-    def test_external_model_without_a_map_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "Unsupported depth model"):
-            geometry.EnndeeMeridianGeometry().build(
-                video="unused.mp4", args="--frames 73", image=torch.zeros(1, 64, 112, 3),
-                model_size="external")
-
-    def test_a_connected_external_map_is_ignored(self):
-        capture = _FastCapture()
-        depth = torch.linspace(0.0, 1.0, 64 * 112).view(1, 64, 112, 1)
-        with mock.patch.object(geometry, "render_depth_aligned", capture):
-            geometry.EnndeeMeridianGeometry().build(
-                video="unused.mp4", args="--frames 73", image=torch.zeros(1, 64, 112, 3),
-                model_size="MoGe 3", external_depth=depth)
-        self.assertIsNone(capture.kwargs["external_depth"])
-
-    def test_an_unknown_polarity_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "polarity"):
-            geometry.EnndeeMeridianGeometry().build(
-                video="unused.mp4", args="--frames 73", image=torch.zeros(1, 64, 112, 3),
-                model_size="MoGe 3", external_depth_polarity="sideways")
+                    moge_refine_steps=value)
 
     def test_registration_maps_the_geometry_node(self):
         spec = importlib.util.spec_from_file_location(

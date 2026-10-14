@@ -75,6 +75,7 @@ const GROUPS = [
   { show: ["rmbg_mode", "rmbg_threshold", "rmbg_resize"],
     when: [["use_rmbg", true]] },
   { show: ["offset_glomap", "offset_splat"], when: [["use_rmbg", true]] },
+  { show: ["subject_focus"], when: [["use_rmbg", true]] },
   { show: ["face_frames", "face_mask_mode", "face_prompt", "face_threshold", "face_mask_dilate"],
     when: [["prepare_masks_for_face_detail", true]] },
   { show: ["glomap_path"], when: [["mapper_backend", "glomap"]] },

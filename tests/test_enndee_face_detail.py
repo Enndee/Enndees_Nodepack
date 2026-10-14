@@ -113,6 +113,18 @@ class GateContractTests(unittest.TestCase):
         self.assertIn(fd.resolve_device("Auto"), ("cuda", "cpu"))
         self.assertEqual(fd.resolve_device("CPU"), "cpu")
 
+    def test_sam3_masks_survive_face_detection(self):
+        mask = torch.zeros(1, 20, 40, dtype=torch.bool)
+        mask[0, 6:12, 9:17] = True
+        faces = fd._faces_from_state({
+            "boxes": torch.tensor([[4.0, 3.0, 22.0, 16.0]]),
+            "scores": torch.tensor([0.9]),
+            "masks": mask,
+        }, width=40, height=20, threshold=0.75)
+        self.assertEqual(len(faces), 1)
+        self.assertTrue((faces[0]["mask"] == mask[0, 6:12, 9:17].numpy()).all())
+        self.assertEqual(faces[0]["mask_bounds"], (9, 6, 17, 12))
+
 
 class FaceMaskTests(unittest.TestCase):
     """The COLMAP node's mask pass: geometry, both modes, and the off switch."""
@@ -133,38 +145,88 @@ class FaceMaskTests(unittest.TestCase):
             self.images, self.alpha, chosen, self.boxes, self.WIDTH, self.HEIGHT,
             self.COUNT, dilate, mode, "test")
 
+    def _segmentation_masks(self, chosen, mode, dilate=0):
+        detections = []
+        for index, box in enumerate(self.boxes):
+            detection = dict(box)
+            face_mask = torch.zeros(self.HEIGHT, self.WIDTH, dtype=torch.bool)
+            # An L-shaped SAM3 region inside the bbox makes rectangular fallback
+            # behavior observably wrong in both area and included pixels.
+            face_mask[22:30, 52:60] = True
+            face_mask[30:38, 52:56] = True
+            ys, xs = torch.where(face_mask)
+            y0, y1, x0, x1 = int(ys.min()), int(ys.max()) + 1, int(xs.min()), int(xs.max()) + 1
+            detection["mask"] = face_mask[y0:y1, x0:x1]
+            detection["mask_bounds"] = (x0, y0, x1, y1)
+            detection["mask_size"] = (self.HEIGHT, self.WIDTH)
+            detections.append(detection)
+        return self.node._face_mask_from_boxes(
+            self.images, self.alpha, chosen, detections, self.WIDTH, self.HEIGHT,
+            self.COUNT, dilate, mode, "test")
+
+    def test_cut_and_union_use_the_sam3_segmentation_not_its_box(self):
+        cut, _ = self._segmentation_masks([], glomap_mod.FACE_MASK_CUT)
+        union, _ = self._segmentation_masks([], glomap_mod.FACE_MASK_UNION)
+        # A pixel in the detector bbox but outside the actual segmentation stays intact.
+        self.assertAlmostEqual(float(cut[0, 0, 26, 65]), 1.0, places=5)
+        self.assertAlmostEqual(float(union[0, 0, 26, 65]), 0.7, places=5)
+        # Pixels in SAM3's face mask are cut/added as requested.
+        self.assertEqual(float(cut[0, 0, 26, 53]), 0.0)
+        self.assertEqual(float(union[0, 0, 26, 53]), 1.0)
+        self.assertLess(float((cut[0, 0] == 0).sum()), 19 * 14)
+
+    def test_sam3_segmentation_dilation_expands_the_mask(self):
+        tight, _ = self._segmentation_masks([1], glomap_mod.FACE_MASK_CUT, dilate=0)
+        expanded, _ = self._segmentation_masks([1], glomap_mod.FACE_MASK_CUT, dilate=2)
+        self.assertLess(float(expanded[0].mean()), float(tight[0].mean()))
+
     def _head(self, mask):
         return mask[0, int(0.25 * self.HEIGHT):int(0.32 * self.HEIGHT),
                     int(0.42 * self.WIDTH):int(0.53 * self.WIDTH)]
 
     def test_cut_removes_the_head_from_the_body_frames_only(self):
         masks, report = self._masks([1, 2], glomap_mod.FACE_MASK_CUT)
-        self.assertIn("head removed from 4 body frame(s)", report)
+        self.assertIn("face removed from 4 body frame(s)", report)
         for index in range(self.COUNT):
             kept = float(self._head(masks[index]).mean())
             if index in (1, 2):
                 self.assertAlmostEqual(kept, 1.0, places=5)     # close-up kept whole
             else:
                 self.assertAlmostEqual(kept, 0.0, places=5)     # head cut out
+            if index not in (1, 2):
+                self.assertAlmostEqual(float(masks[index, 0, 2, 2]), 1.0, places=5)
 
-    def test_cut_keeps_the_rest_of_the_rmbg_foreground(self):
-        """Only the (dilated) head box goes; the rest stays at the RMBG alpha."""
+    def test_cut_does_not_include_any_rmbg_mask(self):
+        """Head cut-out mode exports only the face mask, never the subject alpha."""
         masks, _ = self._masks([1, 2], glomap_mod.FACE_MASK_CUT, dilate=0)
-        self.assertAlmostEqual(float(masks[0].mean()), 0.7 * (1 - 0.0225), places=3)
-        # inside the undilated box: 0, outside: the alpha
+        self.assertAlmostEqual(float(masks[0].mean()), 1.0 - 0.0225, delta=0.001)
+        # inside the undilated box: 0, outside: white/unmasked
         self.assertAlmostEqual(float(masks[0][0, int(0.25 * self.HEIGHT),
                                                int(0.45 * self.WIDTH)]), 0.0, places=5)
-        self.assertAlmostEqual(float(masks[0][0, 2, 2]), 0.7, places=5)
+        self.assertAlmostEqual(float(masks[0][0, 2, 2]), 1.0, places=5)
 
     def test_the_dilated_cut_covers_the_dilated_box(self):
         masks, _ = self._masks([1], glomap_mod.FACE_MASK_CUT, dilate=8)
         # 8 px of margin around the 19x14 px box, so the cut is bigger than the box
-        self.assertLess(float(masks[0].mean()), 0.7 * (1 - 0.0225))
-        self.assertGreater(float(masks[0].mean()), 0.5)
+        self.assertLess(float(masks[0].mean()), 1.0 - 0.0225)
+        self.assertGreater(float(masks[0].mean()), 0.9)
+
+    def test_union_uses_subject_mask_and_adds_face_region(self):
+        masks, _ = self.node._face_mask_from_boxes(
+            self.images, self.alpha, [1], self.boxes, self.WIDTH, self.HEIGHT,
+            self.COUNT, 0, glomap_mod.FACE_MASK_UNION, "test",
+            base_masks=torch.full((self.COUNT, 1, self.HEIGHT, self.WIDTH), 0.4))
+        self.assertAlmostEqual(float(masks[0, 0, 2, 2]), 0.4, places=5)
+        self.assertEqual(float(masks[0, 0, 26, 53]), 1.0)
+        self.assertEqual(float(masks[1, 0, 26, 53]), 1.0)
+
+    def test_no_rmbg_and_no_face_detail_returns_no_export_mask(self):
+        masks, _ = self.node._prepare_face_masks(self.images, None, "", False)
+        self.assertIsNone(masks)
 
     def test_union_only_adds_and_never_removes(self):
         masks, report = self._masks([1, 2], glomap_mod.FACE_MASK_UNION)
-        self.assertIn("face region added to 4 body frame(s)", report)
+        self.assertIn("face region added to 6 body frame(s)", report)
         for index in range(self.COUNT):
             self.assertAlmostEqual(float(self._head(masks[index]).mean()), 1.0, places=5)
 
@@ -185,7 +247,7 @@ class FaceMaskTests(unittest.TestCase):
             masks, report = self.node._prepare_face_masks(
                 self.images, self.alpha, "", True)
         self.assertIsNone(masks)
-        self.assertIn("no frame stands out", report)
+        self.assertIn("SAM3 found no face", report)
 
     def test_the_scan_picks_the_close_ups_when_no_signal_is_connected(self):
         areas = [0.005] * self.COUNT
@@ -213,8 +275,8 @@ class FaceMaskTests(unittest.TestCase):
                                return_value=([0.0] * self.COUNT, self.boxes, "fake")):
             masks, report = self.node._prepare_face_masks(
                 self.images, self.alpha, "6", True)
-        self.assertIn("no usable frame", report)
-        self.assertIsNone(masks)
+        self.assertIsNotNone(masks)
+        self.assertIn("no face-orbit frames were selected", report)
 
     def test_junk_in_the_signal_is_dropped(self):
         with mock.patch.object(glomap_mod.GLOMAPLichtfeldTracker, "_scan_faces",
@@ -311,10 +373,8 @@ class WidgetContractTests(unittest.TestCase):
         import enndee_meridian_parameters as meridian
 
         required = list(meridian.MeridianParametersAndCamera.INPUT_TYPES()["required"])
-        # The face block, with `depth_relief` appended after it (2026-10-13) - both go LAST
-        # so no saved workflow's positional widget_values move.
-        self.assertEqual(required[-6:], ["face_orbit", "face_fill", "face_yaw_span",
-                                         "face_prompt", "face_threshold", "depth_relief"])
+        self.assertEqual(required[-5:], ["face_orbit", "face_fill", "face_yaw_span",
+                                         "face_prompt", "face_threshold"])
 
     def test_the_camera_node_exposes_face_frames(self):
         import enndee_meridian_parameters as meridian
@@ -362,6 +422,105 @@ class FaceOrbitGeometryTests(unittest.TestCase):
         with mock.patch.object(self.cam, "FACE_ORBIT_WHOLE_TOP_BAND", False):
             self.assertEqual(self.cam.face_orbit_window(keys, pivot, span=10.0), [])
         self.assertEqual(self.cam.face_orbit_window(keys, pivot, span=10.0), [0, 1])
+
+    def test_face_frames_include_every_rendered_frame_between_orbit_keys(self):
+        # The face band occupies key slots 2..4; render frames are denser than keys,
+        # so the COLMAP signal must include all interpolated frames in that interval.
+        self.assertEqual(self.cam._rendered_frame_span([2, 3, 4], 7, 25),
+                         list(range(8, 17)))
+        # The adjacent taper key slots are part of the orbit pass too.
+        self.assertEqual(self.cam._rendered_frame_span([1, 2, 3, 4, 5], 7, 25),
+                         list(range(4, 21)))
+        self.assertEqual(self.cam._rendered_frame_span([], 7, 25), [])
+
+    def test_banded_face_orbit_is_inserted_between_two_body_bands(self):
+        pivot = [0.0, 0.0, 0.0]
+        face = [0.0, -0.4, -1.0]
+        elevations = [-10.0, 30.0]
+        original = self.cam._band_samples(25, pivot, 3.0, 90.0, elevations, 120.0)
+        keys = [{"pos": position, "look": list(pivot), "src": index, "t": index}
+                for index, position in enumerate(original)]
+        out, info = self.cam.add_face_height_orbit(
+            keys, 25, pivot, face, 60.0, 0.5, 0.2,
+            coverage=self.cam.BAND_COVERAGE, bands_start_yaw=90.0,
+            bands_width=120.0, bands_elevations=elevations)
+        self.assertEqual(len(out), 25)
+        self.assertEqual(info["band_width"], 120.0)
+        self.assertAlmostEqual(info["lower_elevation"], -10.0)
+        self.assertAlmostEqual(info["higher_elevation"], 30.0)
+        self.assertAlmostEqual(info["lower_yaw_start"], 90.0)
+        self.assertAlmostEqual(info["lower_yaw_end"], -30.0)
+        self.assertAlmostEqual(info["face_yaw_start"], 0.0)
+        self.assertAlmostEqual(info["face_yaw_end"], 60.0)
+        self.assertAlmostEqual(info["higher_yaw_start"], 90.0)
+        self.assertAlmostEqual(info["higher_yaw_end"], -30.0)
+        face_indices = info["face_orbit_keys"]
+        self.assertEqual(info["frames"], list(range(face_indices[0], face_indices[-1] + 1)))
+        self.assertLess(info["face_start"], face_indices[0])
+        self.assertGreater(info["face_end"], face_indices[-1])
+        self.assertTrue(all(out[index].get("face") for index in face_indices))
+        self.assertFalse(out[info["face_start"]].get("face"))
+        self.assertFalse(out[info["face_end"]].get("face"))
+        face_angles = [self.cam._yaw_elevation_of(out[index]["pos"], face)[0]
+                       for index in face_indices]
+        unwrapped = [self.cam._angle_delta(yaw, face_angles[0]) for yaw in face_angles]
+        self.assertAlmostEqual(max(unwrapped) - min(unwrapped), 60.0, places=2)
+        orbit_elevations = [self.cam._yaw_elevation_of(out[index]["pos"], face)[1]
+                            for index in face_indices]
+        self.assertTrue(all(abs(value) < 1e-6 for value in orbit_elevations))
+        self.assertAlmostEqual(face_angles[0], 0.0, places=6)
+        self.assertAlmostEqual(face_angles[-1], 60.0, places=6)
+        low_boundary_yaw = self.cam._yaw_elevation_of(
+            out[info["transition_in_keys"][0]]["pos"], pivot)[0]
+        high_boundary_yaw = self.cam._yaw_elevation_of(
+            out[info["transition_out_keys"][-1]]["pos"], pivot)[0]
+        final_high_yaw = self.cam._yaw_elevation_of(out[-1]["pos"], pivot)[0]
+        self.assertAlmostEqual(low_boundary_yaw, info["lower_yaw_end"], places=6)
+        self.assertAlmostEqual(high_boundary_yaw, info["higher_yaw_start"], places=6)
+        self.assertAlmostEqual(final_high_yaw, info["higher_yaw_end"], places=6)
+        self.assertLessEqual(max(self.cam._yaw_elevation_of(out[index]["pos"], pivot)[1]
+                                 for index in info["transition_in_keys"]), 30.0)
+        for actual, expected in zip(out[0]["pos"], keys[0]["pos"]):
+            self.assertAlmostEqual(actual, expected, places=12)
+        self.assertEqual(out[-1]["src"], 24)
+
+    def test_face_orbit_marks_both_transitions_and_keeps_the_face_height(self):
+        pivot = [0.0, 0.0, 0.0]
+        face = [0.1, -0.4, -1.0]
+        keys = [{"pos": self.cam._place(pivot, 3.0, yaw, elevation),
+                 "look": list(pivot), "src": index, "t": index}
+                for index, (yaw, elevation) in enumerate(
+                    ((90.0, -10.0), (30.0, 10.0), (-30.0, 30.0)))]
+        out, info = self.cam.add_face_height_orbit(
+            keys, 31, pivot, face, 60.0, 0.5, 0.2,
+            coverage=self.cam.BAND_COVERAGE, bands_start_yaw=90.0,
+            bands_width=120.0, bands_elevations=[-10.0, 30.0])
+        self.assertEqual(info["status"], "applied")
+        self.assertTrue(all(out[index].get("face") for index in info["face_orbit_keys"]))
+        self.assertAlmostEqual(info["face_elevation"],
+                               self.cam._yaw_elevation_of(face, pivot)[1])
+        self.assertGreaterEqual(len(info["transition_in_keys"]), 4)
+        self.assertGreaterEqual(len(info["transition_out_keys"]), 4)
+        self.assertAlmostEqual(info["face_yaw_start"], 0.0)
+        self.assertAlmostEqual(info["face_yaw_end"], 60.0)
+        self.assertAlmostEqual(info["higher_yaw_start"], 90.0)
+        self.assertAlmostEqual(info["higher_yaw_end"], -30.0)
+        for actual, expected in zip(
+                out[info["face_orbit_keys"][0]]["pos"],
+                self.cam._place(face, 0.5, 0.0, 0.0)):
+            self.assertAlmostEqual(actual, expected, places=12)
+        for actual, expected in zip(
+                out[info["face_orbit_keys"][-1]]["pos"],
+                self.cam._place(face, 0.5, 60.0, 0.0)):
+            self.assertAlmostEqual(actual, expected, places=12)
+        for index in range(len(out)):
+            self.assertEqual(out[index]["src"], index)
+            self.assertEqual(out[index]["t"], index)
+
+    def test_face_transition_frame_allocation_handles_minimum_count(self):
+        self.assertIsNone(self.cam._face_path_intervals(10))
+        self.assertEqual(sum(self.cam._face_path_intervals(11)), 10)
+        self.assertEqual(sum(self.cam._face_path_intervals(25)), 24)
 
     def test_no_face_box_leaves_the_keys_untouched(self):
         pivot = [0.0, 0.0, 0.0]
@@ -495,10 +654,11 @@ class FaceOrbitDeviceTests(unittest.TestCase):
             keys, surface, _box(cx=self.FACE_U, cy=self.FACE_V,
                                 width=self.FACE_W, height=self.FACE_H),
             fill=20.0, span=60.0, pivot=self.pivot,
-            front_position=self.front, front_look=self.look)
+            front_position=self.front, front_look=self.look, frames_total=25,
+            coverage=self.cam.BAND_COVERAGE)
         self.assertEqual(info["status"], info["status"])          # never raises
         self.assertEqual(info["status"], "applied")
-        self.assertEqual(len(info["frames"]), 3)
+        self.assertGreater(len(info["frames"]), 3)
         # The distance now comes from `head_distance_for_fill`, which models the patch as
         # a SPHERE of radius r. `_projection_area` measures the percentile bbox of the
         # actual points, so for a non-spherical patch the two differ by the shape factor.
@@ -547,9 +707,11 @@ class FaceOrbitDeviceTests(unittest.TestCase):
             keys, surface, _box(cx=self.FACE_U, cy=self.FACE_V,
                                 width=self.FACE_W, height=self.FACE_H),
             fill=20.0, span=60.0, pivot=self.pivot,
-            front_position=self.front, front_look=self.look)
-        self.assertEqual(info["status"], "applied")
-        self.assertEqual(len(info["frames"]), 3)
+            front_position=self.front, front_look=self.look, frames_total=25,
+            coverage=self.cam.BAND_COVERAGE)
+        self.assertEqual(info["face_span"], 60.0)
+        self.assertGreater(len(info["frames"]), 3)
+        self.assertTrue(info["transition_out_keys"])
 
         for key in out:
             self.assertIsInstance(key["src"], int, f"src became {key['src']!r}")
@@ -570,10 +732,10 @@ class FaceOrbitDeviceTests(unittest.TestCase):
         _out, info = self.cam.apply_face_orbit(
             keys, surface, _box(cx=self.FACE_U, cy=self.FACE_V,
                                 width=self.FACE_W, height=self.FACE_H),
-            fill=20.0, span=60.0, pivot=self.pivot,
-            front_position=self.front, front_look=self.look)
-        self.assertEqual(info["status"], "applied")
-
+            front_position=self.front, front_look=self.look, frames_total=25,
+            coverage=self.cam.BAND_COVERAGE)
+        self.assertTrue(info["transition_in_keys"])
+        self.assertTrue(info["transition_out_keys"])
 
 if __name__ == "__main__":
     unittest.main()

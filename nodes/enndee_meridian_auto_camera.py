@@ -175,8 +175,8 @@ BACK_ORBIT_HOME_FACTOR = 1.0                         # the 8 o'clock -> dial-cen
 #     subject, +90 = its viewer-left side, 180 = its back, 270/-90 = its right side. The aim stays
 #     the pivot, so the subject keeps its place in the picture - only the side the camera visits
 #     first moves.
-#   * Auto Orbit Coverage - "Front only" (the front O alone, ending on the circle's side),
-#     "Front and Back" (the front O, the SHORTEST level connection - 180 deg minus the O's own
+#   * Auto Orbit Coverage - "O-Orbit Front" (the front O alone, ending on the circle's side),
+#     "O-Orbit Front&Back" (the front O, the SHORTEST level connection - 180 deg minus the O's own
 #     DIAMETER, straight to the back orbit's near edge - and that back orbit: a full clockwise loop
 #     from the connection's first contact point, the back clock's "9 o'clock", over the subject's
 #     back head ("12"), out to the far level point ("3"), under the back ("6") and back up to "8" -
@@ -189,7 +189,7 @@ BACK_ORBIT_HOME_FACTOR = 1.0                         # the 8 o'clock -> dial-cen
 ORBIT_VIEW_ANGLE_DEFAULT = 0.0    # deg, 0 = the orbit is centred on the frontal view
 ORBIT_VIEW_ANGLE_MIN = -180.0
 ORBIT_VIEW_ANGLE_MAX = 360.0
-ORBIT_COVERAGES = ("Front only", "Front and Back", "Spiral", "Banded Orbits",
+ORBIT_COVERAGES = ("O-Orbit Front", "O-Orbit Front&Back", "Spiral", "Banded Orbits",
                    "Banded Orbits Front & Back")
 ORBIT_COVERAGE_DEFAULT = ORBIT_COVERAGES[1]
 SPIRAL_COVERAGE = ORBIT_COVERAGES[2]
@@ -198,9 +198,8 @@ BAND_FRONT_BACK_COVERAGE = ORBIT_COVERAGES[4]
 ORBIT_COVERAGE_DEGREES = 180.0    # deg from the front circle's middle to the back circle's middle
                                   # (the level connection stops one O radius short of this, at the
                                   # back orbit's own edge - see `_back_orbit_point`)
-# Deprecated predecessors, kept so every saved workflow and old caller still loads. `orbit_end` was
-# the azimuth the path ended at: 0 meant "the front O alone" (now "Front only"), anything larger
-# meant "go round" (now "Front and Back").
+# Predecessor parameter for the standalone legacy choreography (`coverage=None`). The Meridian
+# Parameters node now exposes only the explicit coverage selector.
 ORBIT_END_DEFAULT = 360.0
 ORBIT_END_MIN = 0.0
 ORBIT_END_MAX = 720.0
@@ -398,9 +397,14 @@ BAND_WIDTH_MAX = 360.0            # a full turn - and then the bands never alter
 BAND_START_YAW_DEFAULT = 0.0      # deg, the built-in start is the frontal azimuth
 BAND_START_YAW_MIN = -360.0
 BAND_START_YAW_MAX = 360.0
-BAND_STEP_DEFAULT = 0.0           # deg, 0 = auto (spread over the available range)
+BAND_STEP_DEFAULT = 0.0
 BAND_STEP_MIN = 0.0
 BAND_STEP_MAX = 90.0
+BAND_STOP_ANGLE_DEFAULT = 60.0    # deg, second endpoint of the evenly spaced band stack
+BAND_STOP_ANGLE_MIN = -90.0
+BAND_STOP_ANGLE_MAX = 90.0
+# Deprecated compatibility API state; the serialized node widget now means stop angle.
+_ACTIVE_BAND_STEP = BAND_STEP_DEFAULT
 BAND_ELEVATION_LIMIT = 88.0       # deg: keep the look/up frame away from the poles
 BAND_MIN_STEP = 5.0               # deg, below this the auto step is degenerate
 
@@ -435,6 +439,7 @@ _ACTIVE_BAND_COUNT = BAND_COUNT_DEFAULT
 _ACTIVE_BAND_WIDTH = BAND_WIDTH_DEFAULT
 _ACTIVE_BAND_START_YAW = BAND_START_YAW_DEFAULT
 _ACTIVE_BAND_STEP = BAND_STEP_DEFAULT
+_ACTIVE_BAND_STOP_ANGLE = BAND_STOP_ANGLE_DEFAULT
 
 
 def band_start_angle():
@@ -457,8 +462,13 @@ def band_start_yaw():
     return _ACTIVE_BAND_START_YAW
 
 
+def band_stop_angle():
+    """Elevation (deg) of the final band in the estimate being built."""
+    return _ACTIVE_BAND_STOP_ANGLE
+
+
 def band_step():
-    """Elevation rise (deg) per band in the estimate being built (0 = auto)."""
+    """Deprecated compatibility API; returns the legacy per-band step default."""
     return _ACTIVE_BAND_STEP
 
 
@@ -492,37 +502,39 @@ def resolve_band_start_yaw(degrees=None):
                min(BAND_START_YAW_MAX, _finite(degrees, "Band start yaw")))
 
 
+def resolve_band_stop_angle(degrees=None):
+    """Clamp a Band Stop Angle widget value."""
+    if degrees is None:
+        return BAND_STOP_ANGLE_DEFAULT
+    return max(BAND_STOP_ANGLE_MIN,
+               min(BAND_STOP_ANGLE_MAX, _finite(degrees, "Band stop angle")))
+
+
 def resolve_band_step(degrees=None):
-    """Clamp a Band Step widget value; None keeps `BAND_STEP_DEFAULT` (auto)."""
+    """Deprecated compatibility helper; band layout now uses start/stop elevations."""
     if degrees is None:
         return BAND_STEP_DEFAULT
     return max(BAND_STEP_MIN, min(BAND_STEP_MAX, _finite(degrees, "Band step")))
 
 
-def band_elevations(count=None, start=None, step=None):
+def band_elevations(count=None, start=None, stop=None):
     """The elevation (deg) of every band, the first one first.
 
-    `step = 0` (auto) spreads the bands over the FULL available range in whichever
-    direction has more room, so the requested count always gives a real stack: start
-    -88 with three bands becomes -88 / 0 / +88 and start +88 becomes +88 / 0 / -88.
-    A stack pushed at a pole is clamped to BAND_ELEVATION_LIMIT, so it flattens there
-    instead of flipping the up vector.
+    Bands are evenly spaced between the configured start and stop elevations; both
+    endpoints are clamped away from the poles to keep the camera up vector stable.
 
     A `None` argument means **the widget the estimate is currently flying**
-    (`band_start_angle()` / `band_count()` / `band_step()`), not the built-in default:
+    (`band_start_angle()` / `band_count()` / `band_stop_angle()`), not the built-in default:
     a caller that passes nothing must get the stack the node asked for.
     """
     count = band_count() if count is None else resolve_band_count(count)
     start = band_start_angle() if start is None else resolve_band_start_angle(start)
-    step = band_step() if step is None else resolve_band_step(step)
+    start = max(-BAND_ELEVATION_LIMIT, min(BAND_ELEVATION_LIMIT, start))
+    stop = band_stop_angle() if stop is None else resolve_band_stop_angle(stop)
+    stop = max(-BAND_ELEVATION_LIMIT, min(BAND_ELEVATION_LIMIT, stop))
     if count <= 1:
-        return [max(-BAND_ELEVATION_LIMIT, min(BAND_ELEVATION_LIMIT, start))]
-    if step <= 1e-9:
-        up = BAND_ELEVATION_LIMIT - start
-        down = start + BAND_ELEVATION_LIMIT
-        step = (up if up >= down else -down) / (count - 1)
-    return [max(-BAND_ELEVATION_LIMIT, min(BAND_ELEVATION_LIMIT, start + index * step))
-            for index in range(count)]
+        return [start]
+    return [start + (stop - start) * index / (count - 1) for index in range(count)]
 
 
 # The direction the estimated clip is *levelled to*: the camera frame keeps this up, so nothing
@@ -1049,7 +1061,7 @@ def _envelope_angles(size, include_back=True, orbit_end=None, direction=ORBIT_DI
         return [_spiral_point(fraction, centre, direction_mirror(direction))
                 for fraction in (0.0, 0.25, 0.5, 0.75, 1.0)]
     if mode != ORBIT_COVERAGES[1]:
-        return angles                      # "Front only": no back poses to make room for
+        return angles                  # "O-Orbit Front": no back poses to make room for
     full = max(0.0, ORBIT_COVERAGE_DEGREES - 2.0 * amplitude)   # level, to the back orbit's edge
     span = full if back_span is None else min(full, max(0.0, float(back_span)))
     if span <= 1e-9:
@@ -1384,7 +1396,7 @@ def enforce_subject_visibility(surface, pivot, distance, scale, size, frames, he
     """
     _, extents = subject_box(surface)
     # The path this pass guarantees is the path the keys come from - the orbit's own options travel
-    # with it (view angle, coverage mode), so a "Front and Back" round is judged where it really goes.
+    # with it (view angle, coverage mode), so an "O-Orbit Front&Back" round is judged where it really goes.
     options = path_options(view_angle, coverage, back_span)
     # The pool is the caller's (the cylinder-trimmed 95 % subject) when given, so the guarantee and
     # the framing judge the same points; otherwise the full cloud.
@@ -1641,9 +1653,8 @@ def _key_frames(frames, target=KEY_TARGET):
 def coverage_for_end(orbit_end=None):
     """The coverage mode a (DEPRECATED) `orbit_end` asks for: 0 = the front O alone, else round.
 
-    `orbit_end` was replaced by Auto Orbit View Angle + Auto Orbit Coverage; old callers and saved
-    workflows keep working, `orbit_end=0` mapping onto "Front only" and anything larger onto
-    "Front and Back" (the complete front + back).
+    `orbit_end` was replaced by Auto Orbit View Angle + Auto Orbit Coverage; `orbit_end=0` maps to
+    "O-Orbit Front" and anything larger maps to "O-Orbit Front&Back" (the complete front + back).
     """
     if orbit_end is None:
         return ORBIT_COVERAGE_DEFAULT
@@ -2139,22 +2150,15 @@ def _band_info(start_yaw=None, width=None):
     start_yaw = band_start_yaw() if start_yaw is None else resolve_band_start_yaw(start_yaw)
     elevations = band_elevations()
     legs = _band_legs(start_yaw, elevations, width)
-    # `band_step` is the WIDGET value as well (0 = auto). With an auto step the flown gap is
-    # reported instead, so the summary always names a real number; `band_elevations` lists the
-    # stack as flown, which is where a clamped first band shows up.
-    step = band_step()
-    if step <= 1e-9:
-        step = (elevations[1] - elevations[0]) if len(elevations) > 1 else 0.0
+    stop = band_stop_angle()
     return {"front_yaw": 0.0, "orbit_end": width, "front_share": 1.0,
-            "back_span": 0.0, "back_orbit": False,
-            # `band_start_angle` is the WIDGET value; `band_elevations` is the stack the path really
-            # flies, whose first entry is clamped to BAND_ELEVATION_LIMIT (so a requested -90 is
-            # flown as -88). The report shows both, so the difference is never a surprise.
+            "back_span": 0.0, "back_orbit": False, "band_front_back": False,
             "band_start_angle": band_start_angle(), "band_count": len(elevations),
-            "band_width": width, "band_start_yaw": start_yaw, "band_step": step,
+            "band_stop_angle": stop, "band_width": width, "band_start_yaw": start_yaw,
             "band_elevations": elevations, "band_lowest": min(elevations),
             "band_highest": max(elevations), "band_travel": sum(leg[0] for leg in legs),
             "band_end_yaw": legs[-1][3], "band_end_elevation": legs[-1][4],
+            "band_front_end_yaw": legs[-1][3],
             "orbit_coverage": min(FULL_CIRCLE, abs(width)), "view_angle": None}
 
 
@@ -2246,7 +2250,7 @@ def subject_samples(frames, pivot, radius, scale=1.0, size=1.0, orbit_end=None,
     mirrors the whole path to a crane to 10 and a 10 -> ... -> 9 sweep), ending on the circle's side
     at level elevation.
 
-    **"Front and Back"** (`coverage`) then adds the back orbit: the SHORTEST connection first - a
+    **"O-Orbit Front&Back"** (`coverage`) then adds the back orbit: the SHORTEST connection first - a
     level azimuth sweep from where the front O ended straight to the back orbit's *near edge*, i.e.
     180 deg minus the O's own DIAMETER, never a round trip and never past the back circle's middle -
     and then that back orbit from exactly that first contact point (`_back_orbit_point`): a full
@@ -2465,7 +2469,7 @@ def _cut_back_span(pool, surface, frames, pivot, radius, scale, size, direction,
     mode = ORBIT_COVERAGE_DEFAULT if coverage is None else str(coverage)
     amplitude = front_amplitudes(scale, size)[0]
     full = max(0.0, ORBIT_COVERAGE_DEGREES - 2.0 * amplitude) if mode == ORBIT_COVERAGES[1] else 0.0
-    if full <= 1e-9:                        # "Front only": the front O takes every frame
+    if full <= 1e-9:                        # "O-Orbit Front": the front O takes every frame
         samples = subject_samples(frames, pivot, radius, scale, size, None, direction,
                                   view_angle=view_angle, coverage=ORBIT_COVERAGES[0])
         drift, typical = subject_drift(pool, samples, pivot, surface)
@@ -2499,7 +2503,8 @@ def _orbit_candidate(pool, surface, frames, pivot, radius, scale, size, end, dir
                                                       size, end, direction, cap_px)
         amplitude = front_amplitudes(scale, size)[0]
         info = {"front_yaw": amplitude, "orbit_end": end,
-                "front_share": balanced_front_share(amplitude, max(0.0, end - amplitude))}
+                "front_share": balanced_front_share(amplitude, max(0.0, end - amplitude)),
+                "orbit_coverage": min(FULL_CIRCLE, amplitude + max(amplitude, end))}
         return scale, samples, drift, typical, info
     if str(coverage) in (SPIRAL_COVERAGE, BAND_COVERAGE, BAND_FRONT_BACK_COVERAGE):
         # Nothing to cut here: the spiral's winding and the band stack are the node's own
@@ -2514,6 +2519,7 @@ def _orbit_candidate(pool, surface, frames, pivot, radius, scale, size, end, dir
         info = (_spiral_info(view_angle, direction) if str(coverage) == SPIRAL_COVERAGE
                 else _band_front_back_info() if str(coverage) == BAND_FRONT_BACK_COVERAGE
                 else _band_info())
+        info["coverage"] = str(coverage)
         return scale, samples, drift, typical, info
     span, samples, drift, typical = _cut_back_span(pool, surface, frames, pivot, radius, scale, size,
                                                    direction, cap_px, view_angle, coverage)
@@ -2666,7 +2672,8 @@ def _fit_orbit_world(frames, pivot, radius, surface, size, budget, orbit_end=Non
                     samples, travel = cut_samples, cut_travel
         amplitude = front_amplitudes(scale, size)[0]
         info = {"front_yaw": amplitude, "orbit_end": end,
-                "front_share": balanced_front_share(amplitude, max(0.0, end - amplitude))}
+                "front_share": balanced_front_share(amplitude, max(0.0, end - amplitude)),
+                "orbit_coverage": min(FULL_CIRCLE, amplitude + max(amplitude, end))}
         return scale, samples, travel, info
     if str(coverage) in (SPIRAL_COVERAGE, BAND_COVERAGE, BAND_FRONT_BACK_COVERAGE):
         # Same rule as the pixel fit: the winding and the band stack are the node's own widgets, so
@@ -2928,7 +2935,8 @@ def automatic_keys(frames, pivot, radius, content_radius, target, max_speed=DEFA
         "t": int(tick),
     } for tick in ticks]
     info = {"style": style, "amplitude_scale": scale, "travel_per_frame": travel,
-            "budget_per_frame": budget, "keys": len(keys), "fit": fit_name}
+            "budget_per_frame": budget, "keys": len(keys), "fit": fit_name,
+            "orbit_coverage": meta.get("orbit_coverage")}
     if drift is not None:
         info.update({"drift_px": drift, "drift_typical_px": typical,
                      "drift_cap_px": float(cap_px)})
@@ -2941,24 +2949,48 @@ def automatic_keys(frames, pivot, radius, content_radius, target, max_speed=DEFA
             requested = ORBIT_END_DEFAULT if orbit_end is None else max(ORBIT_END_MIN,
                                                                         float(orbit_end))
             span = max(0.0, meta["orbit_end"] - amplitude)
+            info.update({"front_yaw": amplitude, "lap_span": span,
+                         "orbit_end": meta["orbit_end"], "orbit_end_requested": requested,
+                         "front_share": meta.get("front_share", 1.0),
+                         "orbit_direction": str(direction), "coverage": None,
+                         "back_orbit": False, "orbit_coverage": meta.get("orbit_coverage")})
         elif str(coverage) == SPIRAL_COVERAGE:  # the spherical spiral: the winding the node asked for
             requested = _spiral_sweep()
             span = 0.0
             # The spiral's "amplitude" is its winding (the end angle is the Spiral End Angle widget),
             # that winding is the user's Spiral End parameter - the fit does not scale it, so the
             # scale really is 1.0 and the summary reports the drift instead of a cut.
-            info["amplitude_scale"] = 1.0
+            info.update({"front_yaw": 0.0, "lap_span": 0.0,
+                         "orbit_end": meta.get("orbit_end"),
+                         "orbit_end_requested": meta.get("orbit_end"),
+                         "front_share": 1.0, "orbit_direction": str(direction),
+                         "view_angle": meta.get("view_angle"), "coverage": str(coverage),
+                         "back_orbit": False, "orbit_coverage": meta.get("orbit_coverage"),
+                         "spiral_end": meta.get("spiral_end"),
+                         "spiral_end_arc": meta.get("spiral_end_arc"),
+                         "spiral_slope": meta.get("spiral_slope"),
+                         "spiral_end_clock": meta.get("spiral_end_clock"),
+                         "spiral_end_elevation": meta.get("spiral_end_elevation")})
         elif str(coverage) in (BAND_COVERAGE, BAND_FRONT_BACK_COVERAGE):  # the band stack: exactly the widgets asked for
             requested = float(meta.get("band_width") or BAND_WIDTH_DEFAULT)
             span = 0.0
-            # Same story as the spiral: the band geometry IS the user's widgets (start angle,
-            # count, width, start yaw, step), so nothing is fitted and the scale really is 1.0 -
+            # Same story as the spiral: the band geometry IS the user's widgets (start/stop angle,
+            # count, width, start yaw), so nothing is fitted and the scale really is 1.0 -
             # the summary reports the drift and the band list instead of a cut.
             info["amplitude_scale"] = 1.0
+            info.update({"front_yaw": 0.0, "lap_span": 0.0,
+                         "orbit_end": meta.get("orbit_end"),
+                         "orbit_end_requested": meta.get("orbit_end"),
+                         "front_share": 1.0, "orbit_direction": str(direction),
+                         "view_angle": None, "coverage": str(coverage),
+                         "back_orbit": bool(meta.get("band_front_back")),
+                         "orbit_coverage": meta.get("orbit_coverage"),
+                         **{key: value for key, value in meta.items()
+                            if key.startswith("band_")}})
         else:                                  # the front/back path: the request is the full back
             requested = amplitude + max(0.0, ORBIT_COVERAGE_DEGREES - 2.0 * amplitude)
             span = max(0.0, meta.get("back_span", 0.0))
-        info.update({"front_yaw": amplitude, "lap_span": span,
+            info.update({"front_yaw": amplitude, "lap_span": span,
                      "orbit_end": meta["orbit_end"], "orbit_end_requested": requested,
                      "front_share": meta["front_share"], "orbit_direction": str(direction),
                      "view_angle": None if view_angle is None else float(view_angle),
@@ -2970,10 +3002,10 @@ def automatic_keys(frames, pivot, radius, content_radius, target, max_speed=DEFA
                      "spiral_end_clock": meta.get("spiral_end_clock"),
                      "spiral_end_elevation": meta.get("spiral_end_elevation"),
                      "band_start_angle": meta.get("band_start_angle"),
+                     "band_stop_angle": meta.get("band_stop_angle"),
                      "band_count": meta.get("band_count"),
                      "band_width": meta.get("band_width"),
                      "band_start_yaw": meta.get("band_start_yaw"),
-                     "band_step": meta.get("band_step"),
                      "band_elevations": meta.get("band_elevations"),
                      "band_lowest": meta.get("band_lowest"),
                      "band_highest": meta.get("band_highest"),
@@ -3044,14 +3076,6 @@ def probe_surface(reference, target=SUBJECT_TARGET, subject_mask=None, model_siz
     # pivot, collision surface and emitted camera keys must all see the exact point cloud
     # the Geometry node will render. Apply it in the renderer's gauge before unprojection.
     depth = fast_depth.apply_depth_relief(depth, depth_relief)
-    # DIAGNOSTIC: which depth model actually ran (`depth_model` is the candidate that
-    # returned), whether the measured FOV was published, and whether this module's
-    # `fast_depth` reference is the same object that set it. Four fixes have left
-    # `face_fill_vfov = 55.0` untouched; this settles whether the MoGe branch runs at all.
-    print(f"[dbg] probe_surface: depth_model={depth_model!r} "
-          f"LAST_VFOV_DEGREES={getattr(fast_depth, 'LAST_VFOV_DEGREES', 'MISSING')!r} "
-          f"id(fast_depth)={id(fast_depth)} "
-          f"model_size={model_size!r} MOGE_PREFIX={fast_depth.MOGE_PREFIX!r}", flush=True)
     cloud = surface_points(depth)
     scene_pivot, scene_extents = geometric_pivot(cloud)
     scene_radius = pivot_radius(cloud, scene_pivot)
@@ -3204,7 +3228,8 @@ def estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DEF
                          direction=ORBIT_DIRECTION_DEFAULT, view_angle=None, coverage=None,
                          orbit_amplitude=None, spiral_end=None, spiral_end_arc=None,
                          spiral_slope=None, bands_start_angle=None, bands_count=None,
-                         bands_width=None, bands_start_yaw=None, bands_step=None, orbit_look=None,
+                         bands_width=None, bands_start_yaw=None, bands_stop_angle=None,
+                         orbit_look=None,
                          face_box=None, face_fill=None, face_span=None, depth_relief=1.0):
     """(signal JSON, summary) for one still, with the O Orbit Angle and the spiral widgets applied.
 
@@ -3228,11 +3253,11 @@ def estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DEF
     by every other one: `bands_start_angle`
     (deg) is the elevation of the FIRST band - the node's "Band Start Angle", 0 = level with the
     pivot, -90 = from straight below the subject (looking up at the feet), +90 = from straight above
-    its head; `bands_count` is how many bands (1, 2, 3 ...); `bands_width` (deg, 1..360) is the
-    azimuth each band sweeps (360 = a full turn, which never alternates); `bands_start_yaw` (deg) is
-    the azimuth the FIRST band begins at, measured around the subject (negative = from its left,
-    positive = from its right) and `bands_step` (deg) is the elevation rise per band, 0 = auto
-    (spread the stack over the full available range in whichever direction has more room).
+     its head; `bands_stop_angle` is the elevation of the final band, and `bands_count` is how many
+     bands (1, 2, 3 ...), distributed evenly between start and stop; `bands_width` (deg, 1..360) is
+     the azimuth each band sweeps (360 = a full turn, which never alternates); `bands_start_yaw`
+     (deg) is the azimuth the FIRST band begins at, measured around the subject (negative = from its
+     left, positive = from its right).
     `orbit_look` is the node's "Auto Orbit Look" widget and one of `ORBIT_LOOK_MODES`:
     'Pivot point' (the default) aims every pose at the pivot, 'Horizontally straight' keeps
     the forward level - the camera aims at the vertical axis through the pivot at its own
@@ -3243,7 +3268,7 @@ def estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DEF
     global _ACTIVE_FRONT_ORBIT_AMPLITUDE, _ACTIVE_SPIRAL_END, _ACTIVE_SPIRAL_END_ARC
     global _ACTIVE_SPIRAL_SLOPE, _ACTIVE_ROLL_UP, _ACTIVE_LOOK_MODE
     global _ACTIVE_BAND_START_ANGLE, _ACTIVE_BAND_COUNT, _ACTIVE_BAND_WIDTH
-    global _ACTIVE_BAND_START_YAW, _ACTIVE_BAND_STEP
+    global _ACTIVE_BAND_START_YAW, _ACTIVE_BAND_STOP_ANGLE
     previous = _ACTIVE_FRONT_ORBIT_AMPLITUDE
     previous_end = _ACTIVE_SPIRAL_END
     previous_arc = _ACTIVE_SPIRAL_END_ARC
@@ -3251,7 +3276,7 @@ def estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DEF
     previous_up = _ACTIVE_ROLL_UP
     previous_look = _ACTIVE_LOOK_MODE
     previous_bands = (_ACTIVE_BAND_START_ANGLE, _ACTIVE_BAND_COUNT, _ACTIVE_BAND_WIDTH,
-                      _ACTIVE_BAND_START_YAW, _ACTIVE_BAND_STEP)
+                      _ACTIVE_BAND_START_YAW, _ACTIVE_BAND_STOP_ANGLE)
     _ACTIVE_FRONT_ORBIT_AMPLITUDE = resolve_front_orbit_amplitude(orbit_amplitude)
     _ACTIVE_SPIRAL_END = resolve_spiral_end(spiral_end)
     _ACTIVE_SPIRAL_END_ARC = resolve_spiral_end_arc(spiral_end_arc)
@@ -3261,7 +3286,7 @@ def estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DEF
     _ACTIVE_BAND_COUNT = resolve_band_count(bands_count)
     _ACTIVE_BAND_WIDTH = resolve_band_width(bands_width)
     _ACTIVE_BAND_START_YAW = resolve_band_start_yaw(bands_start_yaw)
-    _ACTIVE_BAND_STEP = resolve_band_step(bands_step)
+    _ACTIVE_BAND_STOP_ANGLE = resolve_band_stop_angle(bands_stop_angle)
     # The clip is levelled to the spiral's own up when it flies a sloped coil, the world up
     # otherwise (see `_ACTIVE_ROLL_UP`); the slope is ignored by every other coverage, so the tilt
     # only ever reaches the frame where it belongs. The level look always keeps the WORLD up: a
@@ -3287,7 +3312,7 @@ def estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DEF
         _ACTIVE_ROLL_UP = previous_up
         _ACTIVE_LOOK_MODE = previous_look
         (_ACTIVE_BAND_START_ANGLE, _ACTIVE_BAND_COUNT, _ACTIVE_BAND_WIDTH,
-         _ACTIVE_BAND_START_YAW, _ACTIVE_BAND_STEP) = previous_bands
+         _ACTIVE_BAND_START_YAW, _ACTIVE_BAND_STOP_ANGLE) = previous_bands
 
 
 def _estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DEFAULT_MAX_SPEED,
@@ -3313,23 +3338,20 @@ def _estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DE
     for the node's console line. `depth_fn` injects a depth map instead of running a depth model
     (tests).
 
-    Two shape knobs and one framing target ride on top of the estimate, all from the node's
+    The coverage, view angle, orbit radius, and framing target ride on top of the estimate, all from the node's
     automatic-path widgets: `subject_fill` (percent of the picture area, subject target only) frames
-    the subject by *solving* the distance, so the subject fills that share of the frame - and it is
-    the ONLY distance control for a subject now (`orbit_distance` is deprecated and ignored: whether
-    0 or a value, the fill decides, and a bigger fill means a closer camera); `orbit_size`
+    the subject by *solving* the distance, so the subject fills that share of the frame; a bigger
+    fill means a closer camera. `orbit_size`
     multiplies the path's swing amplitudes (None/1.0 keeps the built-in swing; the subject fit
     searches *up* from there to the view limits, the scene fit can shrink it). `view_angle` (deg) is
     the azimuth the front O is centred on (0 = the frontal view, +90 = the subject's viewer-left
-    side, 180 = its back, 270/-90 = its right) and `coverage` one of `ORBIT_COVERAGES` - "Front
-    only" or "Front and Back" (the front O, the level connection straight to the back orbit's near
+    side, 180 = its back, 270/-90 = its right) and `coverage` one of `ORBIT_COVERAGES` - "O-Orbit
+    Front" or "O-Orbit Front&Back" (the front O, the level connection straight to the back orbit's near
     edge, then that orbit's full clockwise loop over the back's head, under it and up to 8 o'clock,
     followed by a glide to the level pose at the back's centre; the back gives way when the speed
-    cap cannot pay for it). `direction`
-    ('counter-clockwise'/'clockwise') mirrors the whole path. `orbit_end` is the DEPRECATED
-    predecessor of `coverage` - without a coverage mode the older concluding orbit is fitted, so
-    saved callers behave as before; all of it is honoured as far as the max camera speed allows, and
-    the summary reports what was achieved. The "Banded Orbits" coverages ignore the front-O shape
+    cap cannot pay for it). `direction` ('counter-clockwise'/'clockwise') mirrors the whole path.
+    Without an explicit coverage mode, the standalone estimator uses its original concluding-orbit
+    choreography. The "Banded Orbits" coverages ignore the front-O shape
     entirely (their stack IS the path, described by the `bands_*` widgets); the "Banded Orbits
     Front & Back" variant flies that stack on the front and then repeats it mirrored and reversed
     down the back side, wrapping between the two halves at the top band's elevation.
@@ -3464,12 +3486,13 @@ def _estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DE
         pivot = [pivot[axis] + look_shift[axis] for axis in range(3)]
 
     # --- face-detail orbit -------------------------------------------------------
-    # The highest band's central frames are re-aimed onto the face (see
-    # `apply_face_orbit`). It runs here - on the finished keys, in absolute depth
+    # The face-height orbit is inserted between body-path sections (see `apply_face_orbit`). It runs
+    # here - on the finished keys, in absolute depth
     # units, before the collision guard and before the median-depth conversion - so
     # it sees exactly the path the render will fly and every later pass still gets
     # its say. Without a face box this is a no-op, and the summary says so.
     face_info = None
+    face_frames = []
     if face_box is not None:
         box = face_box
         if isinstance(box, str):
@@ -3499,7 +3522,9 @@ def _estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DE
                     # with the hard-coded 55 deg instead of the measured ~38 deg (a 1.509x
                     # error in f), which mis-sizes the face patch and the solved distance.
                     vfov_degrees=surface.get("vfov"),
+                    coverage=coverage,
                 )
+                face_frames = list((face_info or {}).get("frames") or [])
 
     keys, fixed, worst_before, worst_after = guard_collisions(keys, surface)
     if _ACTIVE_LOOK_MODE == HORIZONTAL_LOOK:
@@ -3591,19 +3616,19 @@ def _estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DE
                       f"{info['orbit_end'] + info['front_yaw']:.0f} deg"
                       + (" - cut there by the speed cap"
                          if info['orbit_end'] < info['orbit_end_requested'] - 0.5 else "")
-                      + f", covering {info['orbit_coverage']:.0f} deg around the subject")
+              + f", covering {info['orbit_coverage']:.0f} deg around the subject")
         elif info.get("coverage") == SPIRAL_COVERAGE:
             winding = float(info.get("spiral_end") or SPIRAL_END_DEFAULT)
             arc = float(info.get("spiral_end_arc") or SPIRAL_END_ARC_DEFAULT)
             slope = float(info.get("spiral_slope") or 0.0)
-            axis_text = (f"the view axis" if abs(slope) < 0.5
+            axis_text = ("the view axis" if abs(slope) < 0.5
                          else (f"the spiral's central axis, leaned {slope:.0f} deg out of the view "
                                f"axis ({'from straight above' if slope > 0 else 'from straight below'}"
                                f" at 90 deg)"))
             beyond = (f", then the O-orbit family around {axis_text}: the O-orbit's angle grows "
                       f"evenly from 0 deg at the first frame to {arc:.0f} deg at the last one "
                       f"(a spiral of those circles, ending "
-                      + (f"IN the picture's own plane - a side view of the picture)"
+                      + ("IN the picture's own plane - a side view of the picture)"
                          if arc >= SPIRAL_END_ARC_MAX - 0.5
                          else f"{SPIRAL_END_ARC_MAX - arc:.0f} deg short of the picture's plane)")
                       + f", while the clock angle winds {winding:.0f} deg "
@@ -3616,7 +3641,8 @@ def _estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DE
             elevations = "/".join(f"{value:.0f}" for value in info["band_elevations"])
             beyond = (f", then the band stack: {info['band_count']} circle segments of "
                       f"{info['band_width']:.0f} deg each at {elevations} deg elevation "
-                      f"({info['band_step']:+.0f} deg per step). The camera sweeps the first band "
+                      f"between {info['band_start_angle']:.0f} and {info['band_stop_angle']:.0f} deg. "
+                      f"The camera sweeps the first band "
                       f"from {info['band_start_yaw']:.0f} deg towards the left, steps STRAIGHT to "
                       f"the next one at the azimuth it stopped on, sweeps that one back, and so on "
                       f"- ending at {info['band_end_yaw']:.0f} deg / "
@@ -3626,7 +3652,8 @@ def _estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DE
             elevations = "/".join(f"{value:.0f}" for value in info["band_elevations"])
             beyond = (f", then the band stack on BOTH sides: {info['band_count']} circle segments "
                       f"of {info['band_width']:.0f} deg each at {elevations} deg elevation "
-                      f"({info['band_step']:+.0f} deg per step). The camera flies the FRONT stack "
+                      f"between {info['band_start_angle']:.0f} and {info['band_stop_angle']:.0f} deg. "
+                      f"The camera flies the FRONT stack "
                       f"from {info['band_start_yaw']:.0f} deg, stepping STRAIGHT between bands, then "
                       f"EXTENDS the top band's sweep - same heading, no turn back - across to "
                       f"the far side, then walks the SAME bands back DOWN there, each swept the "
@@ -3654,17 +3681,13 @@ def _estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DE
         if info.get("coverage") == SPIRAL_COVERAGE:
             opening = (f"the O-orbit family / spherical spiral (0 -> {info['spiral_end_arc']:.0f} "
                        f"deg out of the spiral's axis)")
-        elif info.get("coverage") == BAND_COVERAGE:
+        elif info.get("coverage") in (BAND_COVERAGE, BAND_FRONT_BACK_COVERAGE):
             opening = (f"a stack of {info['band_count']} banded orbits of "
                        f"{info['band_width']:.0f} deg each, starting at "
-                       f"{info['band_start_angle']:.0f} deg elevation and stepping "
-                       f"{info['band_step']:+.0f} deg per band")
-        elif info.get("coverage") == BAND_FRONT_BACK_COVERAGE:
-            opening = (f"a stack of {info['band_count']} banded orbits of "
-                       f"{info['band_width']:.0f} deg each, starting at "
-                       f"{info['band_start_angle']:.0f} deg elevation and stepping "
-                       f"{info['band_step']:+.0f} deg per band, flown on the front and then "
-                       f"walked back down the far side")
+                       f"evenly distributed between {info['band_start_angle']:.0f} and "
+                       f"{info['band_stop_angle']:.0f} deg elevation"
+                       + (", flown on the front and then walked back down the far side"
+                          if info.get("coverage") == BAND_FRONT_BACK_COVERAGE else ""))
         else:
             opening = f"the front O (+/-{info['front_yaw']:.0f} deg)"
     description = (
@@ -3677,10 +3700,10 @@ def _estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DE
         + (f", {visibility_text}" if visibility_text else "")
         + f", amplitudes at {info['amplitude_scale']:.2f} of the built-in swing ({speed_text}), "
         + f"orbit size {size:g}x"
-        + (f", looking horizontally straight at the pivot's vertical axis (a level horizon, and "
-           f"the straight distance to the axis is the orbit radius on every orbit)"
+        + (", looking horizontally straight at the pivot's vertical axis (a level horizon, and "
+           "the straight distance to the axis is the orbit radius on every orbit)"
            if _ACTIVE_LOOK_MODE == HORIZONTAL_LOOK else "")
-        + (f", the orbit centre equalised for a steady subject size"
+        + (", the orbit centre equalised for a steady subject size"
            f" ({equalizer['spread_before'] * 100:.0f}"
            f" % -> {equalizer['spread_after'] * 100:.0f} % path distance spread"
            + (f", scaled to {equalizer['factor']:.2f} for the visibility guarantee"
@@ -3721,7 +3744,7 @@ def _estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DE
                                          # The face orbit's frames, so the node can hand
                                          # them to COLMAP without threading a second return
                                          # value through every private builder.
-                                         "face_frames": (face_info or {}).get("frames") or [],
+                                          "face_frames": face_frames,
                                          "face_orbit": (face_info or {}).get("status"),
                                          # What the orbit SOLVED for. `face_want_distance`
                                          # is the stand-off it asked for; comparing it with
@@ -3734,7 +3757,7 @@ def _estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DE
                                          "face_fill_vfov": (face_info or {}).get("fill_vfov"),
                                          "face_window": (face_info or {}).get("window")})
     hint = ""
-    # The lever that frees frames for the front O. With the new modes it is 'Front only' (which
+    # The lever that frees frames for the front O. With the new modes it is 'O-Orbit Front' (which
     # drops the whole back visit); with the DEPRECATED `orbit_end` path it is a shorter end.
     lever = (f"set Auto Orbit Coverage to '{ORBIT_COVERAGES[0]}'" if info.get("coverage")
              else "a shorter Auto Orbit End")
@@ -3912,10 +3935,10 @@ def _estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DE
         # connection wraps to, so both halves can be told apart in the summary.
         "band_front_back": info.get("band_front_back"),
         "band_start_angle_deg": info.get("band_start_angle"),
+        "band_stop_angle_deg": info.get("band_stop_angle"),
         "band_count": info.get("band_count"),
         "band_width_deg": info.get("band_width"),
         "band_start_yaw_deg": info.get("band_start_yaw"),
-        "band_step_deg": info.get("band_step"),
         "band_elevations_deg": info.get("band_elevations"),
         "band_front_end_yaw_deg": info.get("band_front_end_yaw"),
         "band_front_end_elevation_deg": info.get("band_front_end_elevation"),
@@ -4105,8 +4128,8 @@ def format_summary(summary):
             + ")"
         )
     parts.append(f"orbit size {summary['orbit_size']:g}x over {summary['frames']} frames")
-    # What lies beyond the front circle: nothing at all ('Front only'), the level connection to the
-    # far orbit's near edge plus its clockwise loop ('Front and Back' - cut when the speed cap cannot
+    # What lies beyond the front circle: nothing at all ('O-Orbit Front'), the level connection to the
+    # far orbit's near edge plus its clockwise loop ('O-Orbit Front&Back' - cut when the speed cap cannot
     # pay for it), or the DEPRECATED concluding lap. The view angle is reported either way, because it
     # is the one azimuth that moves all of it.
     orbit = ""
@@ -4194,17 +4217,17 @@ def format_summary(summary):
         line += (f" - {summary['collision_fixes']} key(s) pushed out of the scene "
                  f"(closest approach {summary['clearance_before'] * 100:.1f} % -> "
                  f"{summary['clearance_after'] * 100:.1f} % of the content radius)")
-    # Face-detail orbit: the one number that matters is what the zoom achieved, so
-    # the line names the frame count and the face's share of the picture before and
-    # after - a "20 %" fill that landed at 6 % is the difference between a useful
-    # head orbit and a wasted one.
+    # Face-detail orbit: report the inserted face segment and the eased connections,
+    # along with its achieved fill; this is a middle pass, not an appended tail.
     face = summary.get("face_orbit") or {}
     status = face.get("status")
     if status == "applied":
         before = face.get("fill_before")
         after = face.get("fill_after")
-        line += (f" - face orbit on {len(face.get('frames') or [])} frame(s) of the highest "
-                 f"band ({face.get('span', 0):.0f} deg window)")
+        line += (f" - face orbit on {len(face.get('frames') or [])} frame(s) between the "
+                 f"body bands ({face.get('span', 0):.0f} deg, "
+                 f"{len(face.get('transition_in_keys') or [])} in / "
+                 f"{len(face.get('transition_out_keys') or [])} out transition keys)")
         if before is not None and after is not None:
             line += f", face {before * 100:.2f} % -> {after * 100:.2f} % of the picture"
     elif status and status not in ("off", "no face box"):
@@ -4217,10 +4240,8 @@ def format_summary(summary):
 # ---------------------------------------------------------------------------
 #
 # A full-body turntable shows the face at ~0.4-0.8 % of the frame, so the splat has
-# almost nothing to learn it from. The fix that costs no extra frames is to spend the
-# *centre of the highest band* on a short zoom onto the face: the top band is already
-# passing in front of the head, so those frames can look at the face instead of the
-# pivot, and the path is back on the normal orbit by the time the band sweeps on.
+# almost nothing to learn it from. Reallocate existing body-path frames to a face-height
+# orbit BETWEEN the lower and higher passes, easing camera and aim into and back out of it.
 #
 # Why re-aiming costs nothing: the per-frame weight of a training frame is
 # `iterations / n_frames` (both 2DGS and PGSR draw a shuffled epoch), so ADDING head
@@ -4266,12 +4287,8 @@ FACE_ORBIT_COLLISION_MARGIN = 0.05
 #:
 #: The pivot must be the MIDDLE of the face depth points (see `head_pivot`), with no
 #: correction on top. Raise this only if the aim is measurably BEHIND the face again.
-FACE_AIM_FORWARD_SHIFT = 0.0
-#: How many keys either side of the face window ease into the close-up. The face orbit used
-#: to move ONLY the window's keys, so the path jumped from the orbit radius to the face
-#: stand-off between two adjacent keys. That discontinuity makes camera extrinsics hard to
-#: solve downstream (the user's words: "it just jumps there"). With a taper the move ramps
-#: to full strength across `FACE_ORBIT_TAPER_KEYS` keys on each side.
+    #: Retained as a no-op compatibility constant. The additional orbit is explicitly allocated
+    #: output frames and no longer tapers body-orbit control keys.
 FACE_ORBIT_TAPER_KEYS = 2
 
 
@@ -4294,22 +4311,248 @@ def _yaw_elevation_of(position, pivot):
     return yaw, elevation, radius
 
 
-#: Which keys of the top band the face orbit acts on. True = ALL of them, so the highest
-#: orbit is flown ENTIRELY around the face pivot; False = only those inside
-#: `face_yaw_span` around `centre_yaw`.
-#:
-#: Whole-band is the better behaviour and is the default. With a narrow window just 3 of
-#: 21 keys move while the rest of the top band still orbits the SUBJECT pivot, so the
-#: Catmull-Rom interpolation between the untouched neighbours drags the camera straight
-#: back out - the zoom reads as a momentary blip instead of a close-up pass. Orbiting the
-#: whole band around the face makes the close-up the band's own geometry, and the distance
-#: solve then simply sets how tight that band is.
 FACE_ORBIT_WHOLE_TOP_BAND = True
+FACE_AIM_FORWARD_SHIFT = 0.0
 
 
 def _angle_delta(angle, centre):
     """Signed difference in degrees, wrapped into (-180, 180]."""
     return (float(angle) - float(centre) + 180.0) % 360.0 - 180.0
+
+
+def _rendered_frame_span(key_indices, key_count, frames_total):
+    """Inclusive output-frame range spanned by selected path control keys."""
+    if not key_indices:
+        return []
+    last = max(1, int(key_count) - 1)
+    total = max(2, int(frames_total or key_count))
+    first_frame = min(total - 1, int(round(min(key_indices) * (total - 1) / last)))
+    last_frame = min(total - 1, int(round(max(key_indices) * (total - 1) / last)))
+    return list(range(first_frame, last_frame + 1))
+
+
+def _face_path_intervals(frames):
+    """Distribute frame intervals across body, transitions, and the face orbit."""
+    segments = 5
+    total = max(0, int(frames) - 1)
+    minimum = 2
+    if total < segments * minimum:
+        return None
+    weights = (0.25, 0.18, 0.14, 0.18, 0.25)
+    remaining = total - segments * minimum
+    exact = [remaining * weight for weight in weights]
+    intervals = [minimum + int(value) for value in exact]
+    left = total - sum(intervals)
+    order = sorted(range(segments), key=lambda index: exact[index] - int(exact[index]),
+                   reverse=True)
+    for index in order[:left]:
+        intervals[index] += 1
+    return intervals
+
+
+def _ease_face_transition(start, stop, phase):
+    """Smoothly interpolate position and aim between a body pose and the face orbit."""
+    phase = min(1.0, max(0.0, float(phase)))
+    weight = phase * phase * (3.0 - 2.0 * phase)
+    return {
+        "pos": [float(a) + (float(b) - float(a)) * weight
+                for a, b in zip(start["pos"], stop["pos"])],
+        "look": [float(a) + (float(b) - float(a)) * weight
+                 for a, b in zip(start["look"], stop["look"])],
+    }
+
+
+def _sample_face_source(keys, phase, pivot=None, yaw_offset=0.0):
+    """Interpolate one source-path pose, optionally rotating it around its orbit pivot."""
+    old_first = float(keys[0]["t"])
+    old_last = float(keys[-1]["t"])
+    old_t = old_first + min(1.0, max(0.0, float(phase))) * (old_last - old_first)
+    right = next((index for index in range(1, len(keys))
+                  if float(keys[index]["t"]) >= old_t), len(keys) - 1)
+    left = max(0, right - 1)
+    segment = max(1e-9, float(keys[right]["t"]) - float(keys[left]["t"]))
+    blend = min(1.0, max(0.0, (old_t - float(keys[left]["t"])) / segment))
+    pos = [float(keys[left]["pos"][axis]) * (1.0 - blend)
+           + float(keys[right]["pos"][axis]) * blend for axis in range(3)]
+    look = [float(keys[left]["look"][axis]) * (1.0 - blend)
+            + float(keys[right]["look"][axis]) * blend for axis in range(3)]
+    if abs(float(yaw_offset)) > 1e-9 and pivot is not None:
+        yaw, elevation, radius = _yaw_elevation_of(pos, pivot)
+        pos = _place(pivot, radius, yaw + float(yaw_offset), elevation)
+    return {"pos": pos, "look": look}
+
+
+def _sample_face_segments(segment_functions, intervals):
+    """Join five sampled path pieces, sharing their boundary key exactly once."""
+    result = []
+    ranges = []
+    for index, (sample, count) in enumerate(zip(segment_functions, intervals)):
+        values = [sample(step / count) for step in range(count + 1)]
+        start = len(result) - 1 if index else 0
+        result.extend(values if not index else values[1:])
+        ranges.append((start, len(result) - 1))
+    return result, ranges
+
+
+def add_face_height_orbit(keys, frames_total, pivot, face_centre, face_span,
+                          face_distance, face_radius, direction=1.0, coverage=None,
+                          bands_start_yaw=None, bands_width=None, bands_elevations=None):
+    """Insert a face-height orbit between smoothly connected lower and upper path pieces.
+
+    A two-band path keeps both requested body sweeps and puts the face sweep between
+    them. Other paths are split at their midpoint; the upper half is yaw-offset by the
+    face sweep so the camera flows from face into that half rather than retracing it.
+    The output frame count and real-time ``src == t`` invariant are unchanged.
+    """
+    if not keys or face_centre is None:
+        return keys, {"status": "no face orbit", "frames": []}
+    total = int(frames_total)
+    if total < 6:
+        return keys, {"status": "not enough frames for body and face orbits", "frames": []}
+    intervals = _face_path_intervals(total)
+    if intervals is None:
+        return keys, {"status": "not enough frames for body and face transitions", "frames": []}
+    span = min(360.0, max(6.0, float(face_span)))
+    radius = max(float(face_distance), 1e-3)
+    face_centre = [float(value) for value in face_centre]
+    body_radius = max(1e-3, _yaw_elevation_of(keys[0]["pos"], pivot)[2])
+    try:
+        _face_yaw, face_angle, face_offset = _yaw_elevation_of(face_centre, pivot)
+        if not all(math.isfinite(value) for value in (face_angle, face_offset)):
+            face_angle = 0.0
+    except (TypeError, ValueError, OverflowError):
+        face_angle = 0.0
+    yaw_delta = -span if float(direction) < 0.0 else span
+
+    # For the two-band coverage, preserve the complete lower and upper sweeps and
+    # insert the 60-degree face pass at their turning point. Continuing in the upper
+    # band's direction avoids flying back over the just-completed face arc.
+    if str(coverage) == BAND_COVERAGE:
+        elevations = ([float(value) for value in bands_elevations]
+                      if bands_elevations is not None else band_elevations())
+        if len(elevations) == 2:
+            start_yaw = (band_start_yaw() if bands_start_yaw is None
+                         else resolve_band_start_yaw(bands_start_yaw))
+            width = (band_width() if bands_width is None
+                     else resolve_band_width(bands_width))
+            low_index = min(range(2), key=lambda index: elevations[index])
+            high_index = 1 - low_index
+            low_start, low_end = _band_orbit(low_index, 2, width, start_yaw)
+            low_direction = 1.0 if low_end >= low_start else -1.0
+            # Let the lower sweep finish its configured arc, then ease back by half
+            # the face span so the face orbit is centred on the lower sweep's endpoint.
+            # After the face arc, ease back to the lower sweep's start yaw and let the
+            # higher band repeat that same configured sweep. This keeps the body bands
+            # aligned instead of carrying the face orbit's yaw into the upper sweep.
+            face_start_yaw = low_end - low_direction * span / 2.0
+            face_end_yaw = face_start_yaw - low_direction * span
+            higher_start_yaw = low_start
+            higher_end_yaw = higher_start_yaw + low_direction * width
+            high_start_pose = {"pos": _place(pivot, body_radius, higher_start_yaw,
+                                             elevations[high_index]),
+                               "look": [float(value) for value in pivot]}
+            low_pose = lambda phase: {
+                "pos": _place(pivot, body_radius,
+                              low_start + (low_end - low_start) * phase,
+                              elevations[low_index]),
+                "look": [float(value) for value in pivot],
+            }
+            face_entry = {"pos": _place(face_centre, radius, face_start_yaw, 0.0),
+                          "look": face_centre}
+            face_exit = {"pos": _place(face_centre, radius, face_end_yaw, 0.0),
+                         "look": face_centre}
+            segments = (
+                low_pose,
+                lambda phase: _ease_face_transition(
+                    low_pose(1.0), face_entry, phase),
+                lambda phase: {
+                    "pos": _place(face_centre, radius,
+                                  face_start_yaw + (face_end_yaw - face_start_yaw) * phase, 0.0),
+                    "look": face_centre,
+                },
+                lambda phase: _ease_face_transition(face_exit, high_start_pose, phase),
+                lambda phase: {
+                    "pos": _place(pivot, body_radius,
+                                  higher_start_yaw + (higher_end_yaw - higher_start_yaw) * phase,
+                                  elevations[high_index]),
+                    "look": [float(value) for value in pivot],
+                },
+            )
+            body_info = {"lower_elevation": elevations[low_index],
+                         "higher_elevation": elevations[high_index],
+                         "lower_yaw_start": low_start, "lower_yaw_end": low_end,
+                         "face_yaw_start": face_start_yaw,
+                         "face_yaw_end": face_end_yaw,
+                         "higher_yaw_start": higher_start_yaw,
+                         "higher_yaw_end": higher_end_yaw,
+                         "band_width": width}
+        else:
+            body_info = None
+    else:
+        body_info = None
+
+    if body_info is None:
+        # Split an arbitrary path at its midpoint and continue the upper half in the
+        # face arc's direction. The two eased joins are explicit keys, never a jump.
+        middle = _sample_face_source(keys, 0.5, pivot)
+        before = _sample_face_source(keys, max(0.0, 0.5 - 1.0 / max(2, total - 1)), pivot)
+        after = _sample_face_source(keys, min(1.0, 0.5 + 1.0 / max(2, total - 1)), pivot)
+        yaw_before = _yaw_elevation_of(before["pos"], pivot)[0]
+        yaw_after = _yaw_elevation_of(after["pos"], pivot)[0]
+        yaw_direction = _angle_delta(yaw_after, yaw_before)
+        if abs(yaw_direction) < 1e-6:
+            yaw_direction = -span if float(direction) < 0.0 else span
+        yaw_delta = math.copysign(span, yaw_direction)
+        start_yaw = _yaw_elevation_of(middle["pos"], pivot)[0]
+        face_end_yaw = start_yaw + yaw_delta
+        face_entry = {"pos": _place(face_centre, radius, start_yaw, 0.0),
+                      "look": face_centre}
+        face_exit = {"pos": _place(face_centre, radius, face_end_yaw, 0.0),
+                     "look": face_centre}
+        upper_start = _sample_face_source(keys, 0.5, pivot, yaw_delta)
+        segments = (
+            lambda phase: _sample_face_source(keys, 0.5 * phase, pivot),
+            lambda phase: _ease_face_transition(middle, face_entry, phase),
+            lambda phase: {
+                "pos": _place(face_centre, radius,
+                              start_yaw + yaw_delta * phase, 0.0),
+                "look": face_centre,
+            },
+            lambda phase: _ease_face_transition(face_exit, upper_start, phase),
+            lambda phase: _sample_face_source(keys, 0.5 + 0.5 * phase, pivot, yaw_delta),
+        )
+
+    samples, segment_ranges = _sample_face_segments(segments, intervals)
+    if len(samples) != total:
+        return keys, {"status": "face orbit frame allocation failed", "frames": []}
+    face_start = segment_ranges[1][0]
+    face_end = segment_ranges[3][1]
+    face_orbit_start, face_orbit_end = segment_ranges[2]
+    face_keys = list(range(face_start, face_end + 1))
+    # Only the face-centred span is a face-detail frame. Keep the transition keys out
+    # of COLMAP's face mask so its close-up cut-out does not remove the head while the
+    # camera is still easing to/from it.
+    face_frames = _rendered_frame_span(range(face_orbit_start, face_orbit_end + 1),
+                                       total, total)
+    orbit_keys = []
+    for index, sample in enumerate(samples):
+        key = {"pos": [float(value) for value in sample["pos"]],
+               "look": [float(value) for value in sample["look"]],
+               "src": index, "t": index}
+        if face_orbit_start <= index <= face_orbit_end:
+            key["face"] = True
+        orbit_keys.append(key)
+    face_info = {
+        "status": "applied", "frames": face_frames, "face_start": face_start,
+        "face_end": face_end, "face_orbit_keys": list(range(face_orbit_start,
+                                                               face_orbit_end + 1)),
+        "transition_in_keys": list(range(segment_ranges[1][0], segment_ranges[1][1] + 1)),
+        "transition_out_keys": list(range(segment_ranges[3][0], segment_ranges[3][1] + 1)),
+        "keys": face_keys, "face_fill": float(face_distance), "face_span": span,
+        "face_elevation": float(face_angle), "face_elevation_about_pivot": float(face_angle),
+        **(body_info or {}),
+    }
+    return orbit_keys, face_info
 
 
 def face_orbit_window(keys, pivot, span=FACE_ORBIT_SPAN_DEFAULT, centre_yaw=0.0,
@@ -4564,8 +4807,8 @@ def apply_face_orbit(keys, surface, face_box, fill=FACE_ORBIT_FILL_DEFAULT,
                      span=FACE_ORBIT_SPAN_DEFAULT, height=CANVAS_HEIGHT,
                      centre_yaw=0.0, front_position=None, front_look=None,
                      clearance=FACE_ORBIT_CLEARANCE, pivot=None, frames_total=None,
-                     vfov_degrees=None, render_aspect=None):
-    """(keys, info) - spend the highest band's central frames on the face.
+                     vfov_degrees=None, render_aspect=None, coverage=None):
+    """(keys, info) - insert a face-height orbit between smoothly joined body sections.
 
     `face_box` is the normalised ``cx, cy, width, height`` the SAM3 gate measured on
     the reference still (see :mod:`enndee_face_detect`); ``None`` means "no face", and
@@ -4573,13 +4816,10 @@ def apply_face_orbit(keys, surface, face_box, fill=FACE_ORBIT_FILL_DEFAULT,
     reference still was taken from - the framing's own front pose - and are only used
     to find *which cloud points are the face*.
 
-    The frames that zoom are the ones already flying past the head (the highest band,
-    inside `centre_yaw +- span/2`). For each of them the camera moves along its own
-    line of sight onto the face until the face's projected box covers `fill` percent
-    of the frame, and the aim moves to the face; the frames before and after the
-    window keep the normal orbit, so the zoom grows and decays out of the band rather
-    than cutting. The frame COUNT never changes - that is the whole point, because the
-    training sampler weights every frame by ``iterations / n_frames``.
+    `span` sets the face yaw arc and `fill` its camera-to-face stand-off. For a two-band
+    path, the face orbit is flown between the complete lower and higher sweeps. Both
+    joins ease camera position and aim so there is no elevation jump or appended tail.
+    The total frame count and source-frame indexing are unchanged.
     """
     info = {"status": "off", "frames": [], "span": float(span), "fill": float(fill),
             "face_area": None, "face_radius": None, "points": 0,
@@ -4595,12 +4835,6 @@ def apply_face_orbit(keys, surface, face_box, fill=FACE_ORBIT_FILL_DEFAULT,
         return keys, info
     if front_look is None:
         front_look = _aim(pivot, front_position)
-
-    window = face_orbit_window(keys, pivot, span, centre_yaw)
-    if len(window) < FACE_ORBIT_MIN_FRAMES:
-        info["status"] = (f"only {len(window)} frame(s) on the highest orbit inside "
-                          f"the {span:g} deg window")
-        return keys, info
 
     # `fill_vfov`/`fill_aspect` must be known BEFORE the head is measured. `_face_points`
     # projects the SAM3 box onto the cloud to decide which points ARE the head, and doing
@@ -4694,87 +4928,22 @@ def apply_face_orbit(keys, surface, face_box, fill=FACE_ORBIT_FILL_DEFAULT,
     info["fill_target"] = float(target)
     info["fill_aspect"] = float(fill_aspect)
     info["fill_vfov"] = float(fill_vfov)
-    info["window"] = [int(i) for i in window]
-    moved = []
+    info["window"] = []
     hit_floor = False
-    # SMOOTH APPROACH. The camera used to JUMP from the orbit radius to the face stand-off
-    # between two adjacent keys, which the user reports as "it just jumps there" - and a
-    # discontinuity in the path is exactly what makes camera extrinsics hard to solve
-    # afterwards. So the face-orbit move is now TAPERED: full strength across the face
-    # window, ramping smoothly to zero over `FACE_ORBIT_TAPER_KEYS` keys either side, so
-    # the path eases in and out of the close-up instead of snapping.
-    face_indices = set(window)
-    lo, hi = (min(window), max(window)) if window else (0, -1)
-    taper = max(1, int(FACE_ORBIT_TAPER_KEYS))
-    for index in range(len(keys)):
-        if index in face_indices:
-            weight = 1.0
-        elif index < lo:
-            weight = max(0.0, 1.0 - float(lo - index) / float(taper + 1))
-        elif index > hi:
-            weight = max(0.0, 1.0 - float(index - hi) / float(taper + 1))
-        else:
-            weight = 1.0
-        if weight <= 1e-6:
-            continue
-        position = keys[index]["pos"]
-        # On the face's own device: the surface cloud is on the GPU in a real run.
-        offset = face_centre - torch.tensor(
-            [float(value) for value in position],
-            dtype=torch.float64, device=face_centre.device)
-        distance = float(offset.norm())
-        if distance <= floor:
-            continue
-        direction = offset / distance
-        target_distance = min(distance, max(floor, float(want)))
-        if index in face_indices and target_distance <= floor * 1.001:
-            hit_floor = True
-        # ADAPT THE BODY ORBIT, DO NOT INVENT A NEW ONE. The body path works because it
-        # PLACES the camera on a sphere around its pivot with `_place(centre, radius, yaw,
-        # elevation)`. The old face move slid each key radially toward `face_centre`, which
-        # preserves its OLD bearing - measured from the orbit centre, not the face - so all
-        # the keys clustered into a narrow cone and the camera "just looks from right to
-        # left" instead of circling the head. Same yaw/elevation, same `_place`, only the
-        # CENTRE changes: `face_centre` instead of the subject pivot.
-        yaw, elevation, _radius = _yaw_elevation_of(position, pivot)
-        orbited = _place(face_centre, target_distance, yaw, elevation)
-        # Blend from where the key already is toward the face orbit - `weight` is 1.0
-        # inside the window and eases to 0.0 at the ends of the taper.
-        blended = [position[axis] + (float(orbited[axis]) - position[axis]) * weight
-                   for axis in range(3)]
-        keys[index]["pos"] = [round(value, 6) for value in blended]
-        keys[index]["look"] = [
-            round(keys[index]["look"][axis] + (float(face_centre[axis])
-                                              - keys[index]["look"][axis]) * weight, 6)
-            for axis in range(3)]
-        if index in face_indices:
-            keys[index]["face"] = True
-            moved.append(index)
-
-    if not moved:
-        info["status"] = "no frame could be moved onto the face"
-        return keys, info
-
-    after = [_projection_area(face_patch, keys[index]["pos"], keys[index]["look"],
-                              height, aspect) for index in moved]
-    # The document holds KEYS and the renderer interpolates `frames_total` poses from
-    # them, so COLMAP needs frame numbers, not key slots.
-    last = max(1, len(keys) - 1)
-    total = max(2, int(frames_total or (len(keys))))
-    frames = sorted({min(total - 1, int(round(index * (total - 1) / last))) for index in moved})
-    info.update({"status": "applied", "frames": frames, "keys": list(moved),
-                 "fill_before": info["face_area"], "fill_after": sum(after) / len(after),
-                 "fill_target": target,
-                 "clearance_limited": bool(hit_floor),
-                 "clearance": float(clearance), "floor_distance": float(floor)})
-    achieved = info["fill_after"]
-    if hit_floor and achieved < target - 0.02:
-        print(
-            f"[Enndee] face orbit: face_fill {target * 100:.0f} % requested but the "
-            f"stand-off floor ({float(clearance):g} x face radius = {floor:.2f} units) "
-            f"stops the camera at {achieved * 100:.0f} %. The camera is as close as the "
-            f"clearance allows - lower FACE_ORBIT_CLEARANCE (or the clearance argument) "
-            f"to zoom tighter; below ~0.95 x face radius the camera reaches the head.",
-            flush=True)
-    return keys, info
+    orbit_keys, face_info = add_face_height_orbit(
+        keys, frames_total or len(keys), pivot, face_centre, span,
+        want, face_radius, direction=1.0, coverage=coverage,
+        bands_start_yaw=band_start_yaw(), bands_width=band_width(),
+        bands_elevations=band_elevations())
+    if face_info.get("status") != "applied":
+        return keys, dict(info, **face_info)
+    face_info.update({
+        "span": span, "fill": float(fill),
+        "face_radius": float(face_radius), "points": point_count,
+        "face_area": info["face_area"], "fill_before": info["face_area"],
+        "fill_after": target, "fill_target": target,
+        "clearance_limited": bool(hit_floor),
+        "clearance": float(clearance), "floor_distance": float(floor),
+    })
+    return orbit_keys, face_info
 

@@ -43,9 +43,11 @@ nonzero status when tests fail. Focused module reports are written by
 graphics/PyTorch environment; report the exact test names and traceback rather
 than attributing those failures to unrelated tracker code.
 
-Recent full-suite verification (2026-10-14): 787 tests passed. Meridian point
-splats intentionally keep their uncovered pixels visible because `point_size`
-and back-face culling are point-renderer controls; mesh mode alone applies the
+Full-suite verification before the latest Meridian UI schema cleanup (2026-10-14): 790 tests passed.
+The current focused Parameters, Geometry, and face-detail suites pass 31/31, 32/32, and 55/55;
+the full suite has not yet been rerun. Meridian point splats intentionally keep their uncovered
+pixels visible because `point_size` and back-face culling are point-renderer controls;
+mesh mode alone applies the
 hole-inpainting post-process. Applying that fill to point mode hides point-size
 coverage and culling results.
 

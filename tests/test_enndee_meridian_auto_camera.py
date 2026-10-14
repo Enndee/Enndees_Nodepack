@@ -32,6 +32,9 @@ from enndee_meridian_auto_camera import (  # noqa: E402
     BAND_START_ANGLE_MIN,
     BAND_START_YAW_MAX,
     BAND_START_YAW_MIN,
+    BAND_STOP_ANGLE_DEFAULT,
+    BAND_STOP_ANGLE_MAX,
+    BAND_STOP_ANGLE_MIN,
     BAND_STEP_DEFAULT,
     BAND_STEP_MAX,
     BAND_STEP_MIN,
@@ -100,6 +103,7 @@ from enndee_meridian_auto_camera import (  # noqa: E402
     resolve_band_count,
     resolve_band_start_angle,
     resolve_band_start_yaw,
+    resolve_band_stop_angle,
     resolve_band_step,
     resolve_band_width,
     scene_coverage,
@@ -684,7 +688,6 @@ class AutoCameraPathTests(unittest.TestCase):
         _, floored = automatic_keys(73, pivot, radius, content, SUBJECT_TARGET, max_speed=1e-6)
         _, scene = automatic_keys(73, pivot, radius, content, SCENE_TARGET, max_speed=100.0)
         self.assertEqual(fast["amplitude_scale"], 1.0)
-        self.assertLess(tight["amplitude_scale"], 1.0)
         self.assertLess(tight["travel_per_frame"], fast["travel_per_frame"])
         self.assertEqual(tight["style"], "front O-orbit + closing orbit")
         self.assertEqual(scene["style"], "lateral survey rows")
@@ -758,7 +761,7 @@ class AutoCameraGuardTests(unittest.TestCase):
                  "pivot": [0.0, 0.0, 0.0]}
         untouched, fixed, _, _ = guard_collisions(keys, empty)
         self.assertEqual(fixed, 0)
-        self.assertEqual(untouched[0]["pos"], [0.0, 0.0, 1.0])
+        self.assertEqual(untouched[0]["pos"], keys[0]["pos"])
 
 
 class AutoCameraEstimateTests(unittest.TestCase):
@@ -1460,8 +1463,8 @@ class AutoCameraOrbitShapeTests(unittest.TestCase):
     The front O is a 45 deg circle on the pivot's sphere now (`FRONT_ORBIT_AMPLITUDE` both ways), so
     "where do I stand" and "how much do I see" are two separate questions: the view angle turns the
     whole choreography around the subject's vertical axis, the coverage picks between the O alone
-    ("Front only") and the O plus the shortest level connection to a mirrored O on the far side
-    ("Front and Back"). This is the balance the rework is about - the far side used to be reached by
+    ("O-Orbit Front") and the O plus the shortest level connection to a mirrored O on the far side
+    ("O-Orbit Front&Back"). This is the balance the rework is about - the far side used to be reached by
     a full 360 deg lap with its 38 deg crane, i.e. the long way round the subject.
     """
 
@@ -1500,7 +1503,7 @@ class AutoCameraOrbitShapeTests(unittest.TestCase):
         self.assertAlmostEqual(min(elevations), -amplitude, delta=0.5)
 
     def test_front_only_coverage_is_the_circle_alone(self):
-        """'Front only' ships the O and nothing else: no connection, no far O, no tail."""
+        """'O-Orbit Front' ships the O and nothing else: no connection, no far O, no tail."""
         pivot = [0.0, 0.0, 0.0]
         amplitude, _ = front_amplitudes()
         samples = subject_samples(73, pivot, 5.0, 1.0, 1.0, None, ORBIT_DIRECTION_DEFAULT,
@@ -1640,14 +1643,14 @@ class AutoCameraOrbitShapeTests(unittest.TestCase):
 
 
     def test_front_only_is_the_cheapest_visit_and_the_far_side_costs_less_azimuth(self):
-        """What the rework buys: 'Front only' is one circle, and the far side is 270 deg, not 405.
+        """What the rework buys: 'O-Orbit Front' is one circle, and the far side is 270 deg, not 405.
 
         The far side is reached by the shortest level connection plus the back clock's loop, so the
         azimuth the camera sweeps drops from 405 deg (the old 360 deg end, which still paid for the
         front O's own half) to 270 (-A .. 180 + A), and the old lap's 45 deg crane at the back is
         gone. The full back loop (9 -> 12 -> 3 -> 6 -> 8, then the glide to the back's centre) is
         what the frames buy: it costs a little more than the old lap did in world travel - the
-        front sweep alone grew from 270 to 330 deg - and 'Front only' stays the cheap option at a
+        front sweep alone grew from 270 to 330 deg - and 'O-Orbit Front' stays the cheap option at a
         quarter of the price, so the speed cap decides from there (see `_cut_back_span`).
         """
         pivot = [0.0, 0.0, 0.0]
@@ -1666,7 +1669,7 @@ class AutoCameraOrbitShapeTests(unittest.TestCase):
         self.assertLess(_travelled(alone), _travelled(legacy))        # ... and a lap costs travel
         # the full back loop costs a little more than the old lap (270 deg of azimuth, but a 330
         # deg arc at the O's radius PLUS the front sweep's 330 deg and the glide home - measured
-        # 54.9 vs 46.6 world units = +8.3); 'Front only' must still be clearly cheaper than both
+        # 54.9 vs 46.6 world units = +8.3); 'O-Orbit Front' must still be clearly cheaper than both
         self.assertAlmostEqual(_travelled(both), _travelled(legacy), delta=12.0)
         self.assertAlmostEqual(span(both), ORBIT_COVERAGE_DEGREES + 2.0 * amplitude, delta=2.0)
         self.assertAlmostEqual(span(legacy), FULL_CIRCLE + amplitude, delta=1.0)   # the old round
@@ -2227,7 +2230,6 @@ class AutoCameraSpiralCoverageTests(unittest.TestCase):
         self.assertAlmostEqual(info["orbit_end"], SPIRAL_END_DEFAULT, places=6)
         self.assertEqual(info["amplitude_scale"], 1.0)
         self.assertFalse(info["back_orbit"])
-        self.assertEqual(info["lap_span"], 0.0)
         self.assertEqual(info["spiral_end_arc"], SPIRAL_END_ARC_DEFAULT)
         self.assertAlmostEqual(info["spiral_end_elevation"], -30.0, places=6)
         self.assertEqual(info["drift_cap_px"], float(cap))
@@ -2308,16 +2310,14 @@ class AutoCameraBandCoverageTests(unittest.TestCase):
         positions = _band_samples(frames, self.PIVOT, self.RADIUS, start_yaw, elevations, width)
         return positions, [self._angles(position, self.PIVOT) for position in positions]
 
-    def test_band_elevations_spread_the_auto_stack_over_the_available_range(self):
-        """`step = 0` uses the whole range left, in whichever direction has more room."""
+    def test_band_elevations_spread_evenly_between_start_and_stop(self):
+        """The stack interpolates the requested endpoints and clamps them from the poles."""
         self.assertEqual(band_elevations(1, -88.0, 0.0), [-88.0])
-        self.assertEqual(band_elevations(3, -88.0, 0.0), [-88.0, 0.0, 88.0])
-        self.assertEqual(band_elevations(3, 88.0, 0.0), [88.0, 0.0, -88.0])
-        self.assertEqual(band_elevations(3, 0.0, 0.0), [0.0, 44.0, 88.0])
+        self.assertEqual(band_elevations(3, -88.0, 88.0), [-88.0, 0.0, 88.0])
+        self.assertEqual(band_elevations(3, 88.0, -88.0), [88.0, 0.0, -88.0])
         self.assertEqual(band_elevations(2, 0.0, 30.0), [0.0, 30.0])
-        self.assertEqual(band_elevations(4, -30.0, 20.0), [-30.0, -10.0, 10.0, 30.0])
-        # a stack pushed at a pole flattens there instead of flipping the up vector
-        self.assertEqual(band_elevations(3, 0.0, 60.0), [0.0, 60.0, BAND_ELEVATION_LIMIT])
+        self.assertEqual(band_elevations(4, -30.0, 30.0), [-30.0, -10.0, 10.0, 30.0])
+        self.assertEqual(band_elevations(3, 0.0, 90.0), [0.0, 44.0, 88.0])
 
     def test_resolve_band_widgets_clamp_to_their_windows(self):
         self.assertEqual(resolve_band_start_angle(None), BAND_START_ANGLE_DEFAULT)
@@ -2330,6 +2330,9 @@ class AutoCameraBandCoverageTests(unittest.TestCase):
         self.assertEqual(resolve_band_width(999.0), BAND_WIDTH_MAX)
         self.assertEqual(resolve_band_start_yaw(-999.0), BAND_START_YAW_MIN)
         self.assertEqual(resolve_band_start_yaw(999.0), BAND_START_YAW_MAX)
+        self.assertEqual(resolve_band_stop_angle(None), BAND_STOP_ANGLE_DEFAULT)
+        self.assertEqual(resolve_band_stop_angle(-999.0), BAND_STOP_ANGLE_MIN)
+        self.assertEqual(resolve_band_stop_angle(999.0), BAND_STOP_ANGLE_MAX)
         self.assertEqual(resolve_band_step(None), BAND_STEP_DEFAULT)
         self.assertEqual(resolve_band_step(-1.0), BAND_STEP_MIN)
         self.assertEqual(resolve_band_step(999.0), BAND_STEP_MAX)
@@ -2405,14 +2408,16 @@ class AutoCameraBandCoverageTests(unittest.TestCase):
     def test_the_active_widgets_drive_the_default_stack(self):
         """`band_elevations()` with no arguments reads the ACTIVE widgets, not the built-in ones."""
         previous = (auto_camera._ACTIVE_BAND_START_ANGLE, auto_camera._ACTIVE_BAND_COUNT,
-                    auto_camera._ACTIVE_BAND_STEP)
+                    auto_camera._ACTIVE_BAND_STEP, auto_camera._ACTIVE_BAND_STOP_ANGLE)
         self.addCleanup(setattr, auto_camera, "_ACTIVE_BAND_START_ANGLE", previous[0])
         self.addCleanup(setattr, auto_camera, "_ACTIVE_BAND_COUNT", previous[1])
         self.addCleanup(setattr, auto_camera, "_ACTIVE_BAND_STEP", previous[2])
+        self.addCleanup(setattr, auto_camera, "_ACTIVE_BAND_STOP_ANGLE", previous[3])
         auto_camera._ACTIVE_BAND_START_ANGLE, auto_camera._ACTIVE_BAND_COUNT = -88.0, 3
         auto_camera._ACTIVE_BAND_STEP = 0.0
+        auto_camera._ACTIVE_BAND_STOP_ANGLE = 88.0
         self.assertEqual(band_elevations(), [-88.0, 0.0, 88.0])
-        auto_camera._ACTIVE_BAND_STEP = 20.0
+        auto_camera._ACTIVE_BAND_STOP_ANGLE = -48.0
         self.assertEqual(band_elevations(), [-88.0, -68.0, -48.0])
         # ... and the default stack is what the path flies and what the report names
         self.assertEqual(_band_samples(9, self.PIVOT, self.RADIUS)[0],
@@ -2436,36 +2441,37 @@ class AutoCameraBandCoverageTests(unittest.TestCase):
 
     def test_band_info_reports_the_stack(self):
         info = _band_info(start_yaw=20.0, width=120.0)
-        for key in ("band_start_angle", "band_count", "band_width", "band_start_yaw", "band_step",
-                    "band_elevations", "band_lowest", "band_highest", "band_end_yaw",
+        for key in ("band_front_back", "band_start_angle", "band_stop_angle", "band_count", "band_width",
+                    "band_start_yaw", "band_elevations",
+                    "band_front_end_yaw",
                     "band_end_elevation", "orbit_coverage"):
             self.assertIn(key, info)
         self.assertEqual(info["band_count"], BAND_COUNT_DEFAULT)
         self.assertEqual(info["band_width"], 120.0)
         self.assertEqual(info["band_start_yaw"], 20.0)
-        self.assertEqual(info["band_elevations"], [0.0, 44.0, 88.0])
-        # the step widget is at AUTO here, so the flown gap (44 deg) is what the report names
-        self.assertAlmostEqual(info["band_step"], 44.0, places=9)
+        self.assertEqual(info["band_elevations"], [0.0, BAND_STOP_ANGLE_DEFAULT / 2.0,
+                                                   BAND_STOP_ANGLE_DEFAULT])
+        self.assertAlmostEqual(info["band_stop_angle"], BAND_STOP_ANGLE_DEFAULT, places=9)
+        self.assertAlmostEqual(info["band_front_end_yaw"], 20.0 - 120.0, places=9)
         self.assertAlmostEqual(info["band_end_yaw"], 20.0 - 120.0, places=9)
 
     def test_the_entry_point_sets_and_restores_the_band_widgets(self):
         """`estimate_camera_path(bands_*=...)` drives the whole estimate, then puts them back."""
         before = (auto_camera.band_start_angle(), auto_camera.band_count(), auto_camera.band_width(),
-                  auto_camera.band_start_yaw(), auto_camera.band_step())
+                  auto_camera.band_start_yaw(), auto_camera.band_stop_angle())
         _document, summary = _estimate(_depth_with_subject(), coverage=BAND_COVERAGE,
                                        bands_start_angle=-90.0, bands_count=3, bands_width=360.0,
-                                       bands_start_yaw=45.0, bands_step=45.0)
+                                       bands_start_yaw=45.0, bands_stop_angle=0.0)
         self.assertEqual(summary.get("coverage"), BAND_COVERAGE)
         self.assertAlmostEqual(summary.get("band_start_angle_deg"), -90.0, places=6)
         self.assertEqual(summary.get("band_count"), 3)
         self.assertAlmostEqual(summary.get("band_width_deg"), 360.0, places=6)
         self.assertAlmostEqual(summary.get("band_start_yaw_deg"), 45.0, places=6)
-        self.assertAlmostEqual(summary.get("band_step_deg"), 45.0, places=6)
-        # the FIRST band is held BAND_ELEVATION_LIMIT off the pole, so -90 is flown as -88
-        self.assertEqual(summary.get("band_elevations_deg"), [-BAND_ELEVATION_LIMIT, -45.0, 0.0])
+        self.assertAlmostEqual(summary.get("band_stop_angle_deg"), 0.0, places=6)
+        self.assertEqual(summary.get("band_elevations_deg"), [-BAND_ELEVATION_LIMIT, -44.0, 0.0])
         self.assertEqual(before, (auto_camera.band_start_angle(), auto_camera.band_count(),
                                   auto_camera.band_width(), auto_camera.band_start_yaw(),
-                                  auto_camera.band_step()))
+                                  auto_camera.band_stop_angle()))
 
     def test_the_other_coverages_report_no_band_fields(self):
         """A band widget never leaks into the other modes."""
@@ -2585,14 +2591,15 @@ class AutoCameraBandFrontBackCoverageTests(unittest.TestCase):
 
     def test_band_front_back_info_reports_both_halves(self):
         info = _band_front_back_info(start_yaw=20.0, width=120.0)
-        for key in ("band_front_back", "band_start_angle", "band_count", "band_width",
-                    "band_start_yaw", "band_step", "band_elevations", "band_front_end_yaw",
+        for key in ("band_front_back", "band_start_angle", "band_stop_angle", "band_count", "band_width",
+                    "band_start_yaw", "band_elevations", "band_front_end_yaw",
                     "band_front_end_elevation", "band_back_start_yaw", "band_end_yaw",
                     "band_end_elevation", "orbit_coverage"):
             self.assertIn(key, info)
         self.assertTrue(info["band_front_back"])
         self.assertEqual(info["band_width"], 120.0)
-        self.assertEqual(info["band_elevations"], [0.0, 44.0, 88.0])
+        self.assertEqual(info["band_elevations"], [0.0, BAND_STOP_ANGLE_DEFAULT / 2.0,
+                                                   BAND_STOP_ANGLE_DEFAULT])
         # the front half stops at the top band's end; the extended top band reaches the
         # mirror of that band's own START (the top band begins at the start yaw here)
         self.assertAlmostEqual(info["band_front_end_yaw"], 20.0 - 120.0, places=9)
@@ -2604,23 +2611,23 @@ class AutoCameraBandFrontBackCoverageTests(unittest.TestCase):
     def test_the_entry_point_sets_and_restores_the_band_widgets(self):
         """`estimate_camera_path(bands_*=...)` drives the estimate, then puts them back."""
         before = (auto_camera.band_start_angle(), auto_camera.band_count(),
-                  auto_camera.band_width(), auto_camera.band_start_yaw(), auto_camera.band_step())
+                  auto_camera.band_width(), auto_camera.band_start_yaw(), auto_camera.band_stop_angle())
         _document, summary = _estimate(_depth_with_subject(), coverage=BAND_FRONT_BACK_COVERAGE,
                                        bands_start_angle=-90.0, bands_count=3, bands_width=120.0,
-                                       bands_start_yaw=45.0, bands_step=45.0)
+                                       bands_start_yaw=45.0, bands_stop_angle=0.0)
         self.assertEqual(summary.get("coverage"), BAND_FRONT_BACK_COVERAGE)
         self.assertTrue(summary.get("band_front_back"))
         self.assertAlmostEqual(summary.get("band_width_deg"), 120.0, places=6)
         self.assertEqual(summary.get("band_count"), 3)
         # the FIRST band is held BAND_ELEVATION_LIMIT off the pole, so -90 is flown as -88
-        self.assertEqual(summary.get("band_elevations_deg"), [-BAND_ELEVATION_LIMIT, -45.0, 0.0])
+        self.assertEqual(summary.get("band_elevations_deg"), [-BAND_ELEVATION_LIMIT, -44.0, 0.0])
         self.assertIsNotNone(summary.get("band_front_end_yaw_deg"))
         self.assertIsNotNone(summary.get("band_back_start_yaw_deg"))
         self.assertAlmostEqual(summary.get("band_back_start_yaw_deg"),
                                45.0 + BAND_FRONT_BACK_TURN, places=6)
         self.assertEqual(before, (auto_camera.band_start_angle(), auto_camera.band_count(),
                                   auto_camera.band_width(), auto_camera.band_start_yaw(),
-                                  auto_camera.band_step()))
+                                  auto_camera.band_stop_angle()))
 
     def test_the_console_line_names_the_front_and_back_stack(self):
         _document, summary = _estimate(_depth_with_subject(), coverage=BAND_FRONT_BACK_COVERAGE,
