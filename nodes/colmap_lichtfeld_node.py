@@ -386,19 +386,20 @@ class ColmapLichtfeldTracker(GLOMAPLichtfeldTracker):
               masks_glomap=None, masks_lichtfeld=None, use_rmbg=True,
               rmbg_mode=RMBG_DEFAULT_MODE, rmbg_threshold=0.5, rmbg_resize="static",
               use_gpu=True, keep_workspace=False, auto_align=True,
-              sequential_overlap=15, max_image_size=5120, frame_step=2,
-              downscale_factor=1.0, offset_glomap=4, offset_splat=12,
+              sequential_overlap=15, max_image_size=5120, frame_step=1,
+              downscale_factor=1.0, offset_glomap=4, offset_splat=0,
               mapper_backend="global", auto_install_binaries=True,
-              embed_alpha_in_images=False, image_format="PNG", jpeg_quality=90,
+              embed_alpha_in_images=False, image_format="JPEG", jpeg_quality=97,
               export_depth_maps=False, dense_max_image_size=1024,
               dense_geom_consistency=True, fuse_dense_cloud=False,
               dense_cloud_max_points=400000, mesh_dense_surface=False,
               mesh_method="poisson",
-              face_frames="", prepare_masks_for_face_detail=False,
+              face_frames="", prepare_masks_for_face_detail=True,
               face_mask_mode=FACE_MASK_CUT, face_prompt="face",
               face_threshold=0.75, face_mask_dilate=FACE_MASK_DILATE_DEFAULT,
-              subject_focus="full frame", sharp_selection=False,
-              sharp_method="batched_topn", sharp_batch=4, sharp_num_frames=3,
+              subject_focus="subject only", sharp_selection=True,
+              sharp_method="batched_topn", sharp_batch=4, sharp_num_frames=1,
+              split_subject_background=False,
               unique_id=None):
         """Run the shared pipeline with the native backend (plus live status)."""
         backend = LEGACY_MAPPER_BACKENDS.get(str(mapper_backend).lower(),
@@ -457,6 +458,7 @@ class ColmapLichtfeldTracker(GLOMAPLichtfeldTracker):
             sharp_method=sharp_method,
             sharp_batch=sharp_batch,
             sharp_num_frames=sharp_num_frames,
+            split_subject_background=split_subject_background,
         )
         self._status.finish(self._summary(result))
         # ``ui.text`` is ComfyUI's built-in text preview (see PreviewAny); the live

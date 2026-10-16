@@ -57,6 +57,21 @@ except Exception as _e:
     print(f"\033[31m[Enndee] EnndeeMeridianGeometry unavailable: {_e}\033[0m")
     EnndeeMeridianGeometry = None
 
+# Meridian Geometry copy with the rendered camera rig as a MERIDIAN_EXTRINSICS
+# output, and the reduced tracker that exports datasets with those ground-truth
+# poses instead of running COLMAP/GLOMAP.
+try:
+    from enndee_meridian_geometry_extrinsics import EnndeeMeridianGeometryExtrinsics
+except Exception as _e:
+    print(f"\033[31m[Enndee] EnndeeMeridianGeometryExtrinsics unavailable: {_e}\033[0m")
+    EnndeeMeridianGeometryExtrinsics = None
+
+try:
+    from enndee_path_pose_dataset import EnndeePathPoseDataset
+except Exception as _e:
+    print(f"\033[31m[Enndee] EnndeePathPoseDataset unavailable: {_e}\033[0m")
+    EnndeePathPoseDataset = None
+
 try:
     from lichtfeld_training_node import LichtfeldHeadlessTrainer
 except Exception as _e:
@@ -168,6 +183,14 @@ if MeridianParametersAndCamera is not None:
 if EnndeeMeridianGeometry is not None:
     NODE_CLASS_MAPPINGS["Enndee_MeridianGeometry"] = EnndeeMeridianGeometry
     NODE_DISPLAY_NAME_MAPPINGS["Enndee_MeridianGeometry"] = "Meridian Geometry (Enndee)"
+
+if EnndeeMeridianGeometryExtrinsics is not None:
+    NODE_CLASS_MAPPINGS["Enndee_MeridianGeometryExtrinsics"] = EnndeeMeridianGeometryExtrinsics
+    NODE_DISPLAY_NAME_MAPPINGS["Enndee_MeridianGeometryExtrinsics"] = "Meridian Geometry + Extrinsics (Enndee)"
+
+if EnndeePathPoseDataset is not None:
+    NODE_CLASS_MAPPINGS["Enndee_PathPoseDataset"] = EnndeePathPoseDataset
+    NODE_DISPLAY_NAME_MAPPINGS["Enndee_PathPoseDataset"] = "Path Pose Dataset - no COLMAP (Enndee)"
 
 if LichtfeldHeadlessTrainer is not None:
     NODE_CLASS_MAPPINGS["Enndee_LichtfeldHeadlessTrainer"] = LichtfeldHeadlessTrainer

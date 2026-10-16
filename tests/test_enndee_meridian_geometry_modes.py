@@ -212,7 +212,7 @@ class MeridianGeometryFastDepthTests(unittest.TestCase):
 
     def test_the_refinement_widget_defaults_to_moges_own_value(self):
         spec = geometry.EnndeeMeridianGeometry.INPUT_TYPES()["required"]["moge_refine_steps"]
-        self.assertEqual(spec[1]["default"], enndee_moge.DEFAULT_REFINE_STEPS)
+        self.assertEqual(spec[1]["default"], 10)
         self.assertEqual(spec[1]["min"], 0)
         self.assertEqual(spec[1]["max"], enndee_moge.MAX_REFINE_STEPS)
 

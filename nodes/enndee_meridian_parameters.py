@@ -174,8 +174,8 @@ class MeridianParametersAndCamera:
         return {
             "required": {
                 "output_frames": (OUTPUT_FRAME_OPTIONS, {
-                    "default": "158",
-                    "tooltip": "Total reference/output frames and the camera-path length. Meridian has matching prompt assets only for these lengths. 158 is the length the Meridian_Splatting_1.0 example workflow ships with.",
+                    "default": "175",
+                    "tooltip": "Total reference/output frames and the camera-path length. Meridian has matching prompt assets only for these lengths. 175 is the length the Meridian_Splatting_1.4 example workflow ships with.",
                 }),
                 "camera_mode": (list(CAMERA_MODES), {
                     "default": AUTOMATIC_MODE,
@@ -554,11 +554,11 @@ class MeridianParametersAndCamera:
                     ),
                 }),
                 "face_orbit": (["Off", "Auto (SAM3)"], {
-                    "default": "Off",
+                    "default": "Auto (SAM3)",
                     "tooltip": "Face-height orbit. 'Auto (SAM3)' detects the face and APPENDS a separate orbit at face height after the configured body coverage. Face Orbit Yaw Span sets its arc; the body orbit configuration remains unchanged. 'Off' flies only the configured body path.",
                 }),
                 "face_fill": ("FLOAT", {
-                    "default": 20.0, "min": 1.0, "max": 80.0, "step": 0.5,
+                    "default": 10.0, "min": 1.0, "max": 80.0, "step": 0.5,
                     "tooltip": "How much of the picture the face should cover during the face orbit, in percent of the frame area. The turntable shows the face at about 0.4-0.8 %, so 20 % is roughly a 30x area gain (a 5.5x linear zoom). The camera stops at a stand-off of ~1.35 face radii, so a very high value is clamped by geometry rather than crashing into the head.",
                 }),
                 "face_yaw_span": ("FLOAT", {
@@ -572,6 +572,18 @@ class MeridianParametersAndCamera:
                 "face_threshold": ("FLOAT", {
                     "default": 0.75, "min": 0.05, "max": 0.95, "step": 0.01,
                     "tooltip": "SAM3 confidence floor for the face gate. SAM3's own default is 0.5, which on this capture also accepts boxes invented on frames that turned away from the face (0.51-0.73); the real face scores 0.80-0.92, so 0.75 keeps it and drops the inventions.",
+                }),
+                "face_orbit_mode": (["Horizontal", "Vertical", "Both"], {
+                    "default": "Horizontal",
+                    "tooltip": (
+                        "Face Orbit only: Horizontal keeps the existing level yaw sweep. Vertical "
+                        "uses the same starting and target yaws but arches over the face through "
+                        "the upper hemisphere, then eases back into the next body orbit. Its "
+                        "elevation is half the configured yaw span, capped at 60 degrees to "
+                        "avoid the camera pole. Both flies a full vertical loop first - over the "
+                        "top, then back under the face to the orbit's starting point - and "
+                        "continues with the horizontal sweep as if only Horizontal had been set."
+                    ),
                 }),
             },
             "optional": {
@@ -737,6 +749,7 @@ class MeridianParametersAndCamera:
                 face_box=(kwargs.get("face_box") if kwargs.get("face_orbit") == "Auto (SAM3)" else None),
                 face_fill=float(kwargs.get("face_fill", 20.0)),
                 face_span=float(kwargs.get("face_yaw_span", 60.0)),
+                face_mode=kwargs.get("face_orbit_mode", "Horizontal"),
                 depth_relief=depth_relief,
             )
             print(f"[Enndee] Meridian {format_summary(summary)}", flush=True)

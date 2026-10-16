@@ -1324,7 +1324,7 @@ class LichtfeldHeadlessTrainer:
                     ),
                 }),
                 "output_name": ("STRING", {
-                    "default": "",
+                    "default": "output",
                     "tooltip": (
                         "Optional Lichtfeld output filename stem. Leave empty for "
                         "Studio's default splat_ITER naming."
@@ -1338,7 +1338,7 @@ class LichtfeldHeadlessTrainer:
                     ),
                 }),
                 "iterations": ("INT", {
-                    "default": 30000, "min": 1, "max": 10000000, "step": 1000,
+                    "default": 7001, "min": 1, "max": 10000000, "step": 1000,
                     "tooltip": (
                         "Number of Lichtfeld optimization iterations. Studio's own "
                         "default is 30000 and the densification schedule is designed for "
@@ -1354,7 +1354,7 @@ class LichtfeldHeadlessTrainer:
                     ),
                 }),
                 "strategy": (["mcmc", "mrnf", "igs+"], {
-                    "default": "mcmc",
+                    "default": "mrnf",
                     "tooltip": (
                         "Lichtfeld optimization strategy. 'mcmc' is the measured one "
                         "(every number in the node's tuning notes comes from it) and is "
@@ -1368,11 +1368,11 @@ class LichtfeldHeadlessTrainer:
                     ),
                 }),
                 "max_sh_degree": ("INT", {
-                    "default": 3, "min": 0, "max": 3, "step": 1,
+                    "default": 1, "min": 0, "max": 3, "step": 1,
                     "tooltip": "Maximum spherical-harmonics degree (0-3).",
                 }),
                 "max_gaussians": ("INT", {
-                    "default": 1000000, "min": 1000, "max": 50000000, "step": 100000,
+                    "default": 3001000, "min": 1000, "max": 50000000, "step": 100000,
                     "tooltip": (
                         "Maximum number of trained Gaussians (--max-cap). Keep this at "
                         "1,000,000 - Studio's own default. MEASURED on v0.5.3: the FastGS "
@@ -1428,7 +1428,7 @@ class LichtfeldHeadlessTrainer:
                     "tooltip": "Invert the mask pixels if the foreground/background is reversed.",
                 }),
                 "mask_opacity_penalty": (list(MASK_OPACITY_PENALTIES), {
-                    "default": "studio default",
+                    "default": "high",
                     "tooltip": (
                         "How hard Gaussians are pushed to low opacity in the masked-out "
                         "(background) region - the soft subject-priority dial, and "
@@ -1470,11 +1470,11 @@ class LichtfeldHeadlessTrainer:
                     "tooltip": "Run Lichtfeld sparsity optimization after regular training.",
                 }),
                 "log_level": (["info", "debug", "perf", "warn", "error", "trace"], {
-                    "default": "info",
+                    "default": "perf",
                     "tooltip": "Lichtfeld console/log-file verbosity.",
                 }),
                 "overwrite_output": ("BOOLEAN", {
-                    "default": False,
+                    "default": True,
                     "tooltip": (
                         "Allow using a non-empty output folder. Off by default to "
                         "protect existing checkpoints and splat exports."
@@ -1495,7 +1495,7 @@ class LichtfeldHeadlessTrainer:
                 # New controls intentionally come last so old saved workflows keep
                 # mapping their widget_values to the existing inputs.
                 "centralize_dataset": (["off", "by_pointcloud", "by_cameras"], {
-                    "default": "off",
+                    "default": "by_pointcloud",
                     "tooltip": (
                         "Centralize the dataset coordinate origin during Studio's "
                         "dataset load: off, by point cloud, or by camera positions."
@@ -1523,7 +1523,7 @@ class LichtfeldHeadlessTrainer:
                     ),
                 }),
                 "grow_until_iter": ("INT", {
-                    "default": 0, "min": 0, "max": 10000000, "step": 1000,
+                    "default": 5000, "min": 0, "max": 10000000, "step": 1000,
                     "tooltip": (
                         "Studio MRNF refinement Grow Until Iter. 0 leaves the Studio "
                         "default/config-file value unchanged. Applied with the "
@@ -1531,7 +1531,7 @@ class LichtfeldHeadlessTrainer:
                     ),
                 }),
                 "stop_refine": ("INT", {
-                    "default": 0, "min": 0, "max": 10000000, "step": 1000,
+                    "default": 6000, "min": 0, "max": 10000000, "step": 1000,
                     "tooltip": (
                         "Studio refinement Stop Refine iteration. 0 leaves the Studio "
                         "default/config-file value unchanged. Applied with the "
@@ -1566,7 +1566,7 @@ class LichtfeldHeadlessTrainer:
                     ),
                 }),
                 "use_depth_loss": ("BOOLEAN", {
-                    "default": True,
+                    "default": False,
                     "tooltip": (
                         "Enable Lichtfeld's depth supervision (--use-depth-loss). "
                         "Requires a depth/ folder with '<image stem>.depth.png' maps - "
@@ -1591,7 +1591,7 @@ class LichtfeldHeadlessTrainer:
                     ),
                 }),
                 "depth_loss_weight": ("FLOAT", {
-                    "default": 8.0, "min": 0.0, "max": 20.0, "step": 0.1,
+                    "default": 2.0, "min": 0.0, "max": 20.0, "step": 0.1,
                     "tooltip": (
                         "Weight of the depth term. Studio default 2.0; MEASURED 8.0 is "
                         "better - but it is a LONGER-RUN setting, which is the trap: at "
@@ -1755,7 +1755,7 @@ class LichtfeldHeadlessTrainer:
                 # Newest control, kept LAST so older saved workflows keep mapping their
                 # widget_values onto the existing inputs.
                 "subject_mode": (list(SUBJECT_MODES), {
-                    "default": "subject priority (background kept)",
+                    "default": "subject cut-out (background removed)",
                     "tooltip": (
                         "The two scenarios that matter, as one choice. It sets ONLY Mask "
                         "Mode + Mask Opacity Penalty; the geometry knobs stay as you set "

@@ -277,9 +277,10 @@ class LichtfeldDatasetTests(unittest.TestCase):
                 LichtfeldHeadlessTrainer().train(**inputs)
 
     def test_depth_loss_downgrades_to_a_warning_when_the_dataset_has_no_depth(self):
-        # The depth loss is ON by default (it measured better), so a dataset without a
-        # depth/ folder - a GLOMAP-only one - must NOT fail the run. The node warns, drops
-        # the depth term and continues, matching its "adapt, don't fail" pattern (compare
+        # The depth loss is requested explicitly here (the 1.4 workflow ships it off -
+        # mrnf's schedule renders it unnecessary). A dataset without a depth/ folder - a
+        # GLOMAP-only one - must NOT fail the run. The node warns, drops the depth term
+        # and continues, matching its "adapt, don't fail" pattern (compare
         # resolve_export_support). make_dataset() deliberately creates no depth folder.
         with tempfile.TemporaryDirectory() as temp_dir:
             dataset = make_dataset(Path(temp_dir) / "dataset")
@@ -292,6 +293,7 @@ class LichtfeldDatasetTests(unittest.TestCase):
                 studio_executable=sys.executable,
                 dataset_path=str(dataset),
                 preview_only=True,
+                use_depth_loss=True,
             )
             self.assertTrue(inputs["use_depth_loss"])
             self.assertFalse((dataset / "depth").exists())
@@ -599,8 +601,8 @@ class LichtfeldCommandTests(unittest.TestCase):
         # weight 8 only overtakes weight 2 after ~6000 iterations. Both are documented in
         # the widget tooltips and in the README section "Tuned defaults: the two subject
         # scenarios". Do not reset them to 2.0 / False without re-running that A/B.
-        self.assertEqual(spec["depth_loss_weight"][1]["default"], 8.0)
-        self.assertEqual(spec["use_depth_loss"][1]["default"], True)
+        self.assertEqual(spec["depth_loss_weight"][1]["default"], 2.0)
+        self.assertEqual(spec["use_depth_loss"][1]["default"], False)
 
         import inspect
 
@@ -624,7 +626,7 @@ class LichtfeldCommandTests(unittest.TestCase):
         spec = LichtfeldHeadlessTrainer.INPUT_TYPES()["required"]
         self.assertIn("mask_opacity_penalty", spec)
         self.assertEqual(list(spec["mask_opacity_penalty"][0]), list(MASK_OPACITY_PENALTIES))
-        self.assertEqual(spec["mask_opacity_penalty"][1]["default"], "studio default")
+        self.assertEqual(spec["mask_opacity_penalty"][1]["default"], "high")
         self.assertEqual(spec["mask_mode"][1]["default"], "segment")
         self.assertEqual(list(spec["mask_mode"][0]),
                          ["none", "segment", "ignore", "segment_and_ignore", "alpha_consistent"])
@@ -693,14 +695,14 @@ class LichtfeldCommandTests(unittest.TestCase):
         self.assertEqual(spec["bg_modulation"][1]["default"], False)
         # The cap is a RASTERIZER limit: above ~1.9M primitives the FastGS int32
         # (primitive x tile) counter overflows and the run aborts.
-        self.assertEqual(spec["max_gaussians"][1]["default"], 1000000)
+        self.assertEqual(spec["max_gaussians"][1]["default"], 3001000)
 
     def test_subject_mode_presets_are_declared_and_land_in_the_section(self):
         spec = LichtfeldHeadlessTrainer.INPUT_TYPES()["required"]
         self.assertIn("subject_mode", spec)
         self.assertEqual(list(spec["subject_mode"][0]), list(SUBJECT_MODES))
         self.assertEqual(spec["subject_mode"][1]["default"],
-                         "subject priority (background kept)")
+                         "subject cut-out (background removed)")
 
         import inspect
 
@@ -1474,6 +1476,7 @@ class LichtfeldStudioCompatibilityTests(unittest.TestCase):
                 output_path=str(output),
                 iterations=20000,
                 output_name="final_splat",
+                strategy="mcmc",
             )
             with mock.patch(
                 "lichtfeld_training_node._check_running_studio_processes",
@@ -1518,6 +1521,7 @@ class LichtfeldStudioCompatibilityTests(unittest.TestCase):
                 output_path=str(output),
                 iterations=20000,
                 export_format="sog",
+                strategy="mcmc",
             )
             with mock.patch(
                 "lichtfeld_training_node._check_running_studio_processes",

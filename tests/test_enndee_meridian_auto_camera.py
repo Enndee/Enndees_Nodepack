@@ -2421,7 +2421,7 @@ class AutoCameraBandCoverageTests(unittest.TestCase):
         self.assertEqual(band_elevations(), [-88.0, -68.0, -48.0])
         # ... and the default stack is what the path flies and what the report names
         self.assertEqual(_band_samples(9, self.PIVOT, self.RADIUS)[0],
-                         _place(self.PIVOT, self.RADIUS, 0.0, -88.0))
+                         _place(self.PIVOT, self.RADIUS, auto_camera.BAND_START_YAW_DEFAULT, -88.0))
         self.assertEqual(_band_info()["band_elevations"], [-88.0, -68.0, -48.0])
 
     def test_a_small_band_near_a_pole_takes_fewer_frames(self):
@@ -2449,11 +2449,16 @@ class AutoCameraBandCoverageTests(unittest.TestCase):
         self.assertEqual(info["band_count"], BAND_COUNT_DEFAULT)
         self.assertEqual(info["band_width"], 120.0)
         self.assertEqual(info["band_start_yaw"], 20.0)
-        self.assertEqual(info["band_elevations"], [0.0, BAND_STOP_ANGLE_DEFAULT / 2.0,
-                                                   BAND_STOP_ANGLE_DEFAULT])
+        self.assertEqual(info["band_elevations"],
+                         [BAND_START_ANGLE_DEFAULT + i *
+                          (BAND_STOP_ANGLE_DEFAULT - BAND_START_ANGLE_DEFAULT) /
+                          (BAND_COUNT_DEFAULT - 1) for i in range(BAND_COUNT_DEFAULT)])
         self.assertAlmostEqual(info["band_stop_angle"], BAND_STOP_ANGLE_DEFAULT, places=9)
-        self.assertAlmostEqual(info["band_front_end_yaw"], 20.0 - 120.0, places=9)
-        self.assertAlmostEqual(info["band_end_yaw"], 20.0 - 120.0, places=9)
+        # the bands alternate directions: an odd count ends one width left of the
+        # start yaw, an even count ends back at the start yaw (the last band flies back)
+        expected_end = 20.0 - 120.0 if BAND_COUNT_DEFAULT % 2 else 20.0
+        self.assertAlmostEqual(info["band_front_end_yaw"], expected_end, places=9)
+        self.assertAlmostEqual(info["band_end_yaw"], expected_end, places=9)
 
     def test_the_entry_point_sets_and_restores_the_band_widgets(self):
         """`estimate_camera_path(bands_*=...)` drives the whole estimate, then puts them back."""
@@ -2598,13 +2603,21 @@ class AutoCameraBandFrontBackCoverageTests(unittest.TestCase):
             self.assertIn(key, info)
         self.assertTrue(info["band_front_back"])
         self.assertEqual(info["band_width"], 120.0)
-        self.assertEqual(info["band_elevations"], [0.0, BAND_STOP_ANGLE_DEFAULT / 2.0,
-                                                   BAND_STOP_ANGLE_DEFAULT])
+        self.assertEqual(info["band_elevations"],
+                         [BAND_START_ANGLE_DEFAULT + i *
+                          (BAND_STOP_ANGLE_DEFAULT - BAND_START_ANGLE_DEFAULT) /
+                          (BAND_COUNT_DEFAULT - 1) for i in range(BAND_COUNT_DEFAULT)])
         # the front half stops at the top band's end; the extended top band reaches the
         # mirror of that band's own START (the top band begins at the start yaw here)
-        self.assertAlmostEqual(info["band_front_end_yaw"], 20.0 - 120.0, places=9)
+        expected_end = 20.0 - 120.0 if BAND_COUNT_DEFAULT % 2 else 20.0
+        self.assertAlmostEqual(info["band_front_end_yaw"], expected_end, places=9)
+        # the extended top band reaches the mirror of that band's own START: the top
+        # band begins at the start yaw when the count is odd, and one width earlier
+        # when it is even (the bands alternate directions)
+        top_band_start = (info["band_start_yaw"] if BAND_COUNT_DEFAULT % 2
+                          else info["band_start_yaw"] - 120.0)
         self.assertAlmostEqual(info["band_back_start_yaw"],
-                               info["band_start_yaw"] + BAND_FRONT_BACK_TURN, places=9)
+                               top_band_start + BAND_FRONT_BACK_TURN, places=9)
         # a band's width plus the half-turn bridge across the top is the azimuth shown
         self.assertAlmostEqual(info["orbit_coverage"], 120.0 + BAND_FRONT_BACK_TURN, places=9)
 

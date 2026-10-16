@@ -76,6 +76,7 @@ const GROUPS = [
     when: [["use_rmbg", true]] },
   { show: ["offset_glomap", "offset_splat"], when: [["use_rmbg", true]] },
   { show: ["subject_focus"], when: [["use_rmbg", true]] },
+  { show: ["split_subject_background"], when: [] },
   { show: ["face_frames", "face_mask_mode", "face_prompt", "face_threshold", "face_mask_dilate"],
     when: [["prepare_masks_for_face_detail", true]] },
   { show: ["glomap_path"], when: [["mapper_backend", "glomap"]] },
@@ -100,6 +101,7 @@ const LABELS = [
 
 const WATCHED_WIDGETS = new Set([
   "sharp_selection", "sharp_method", "matcher", "use_rmbg", "prepare_masks_for_face_detail",
+  "split_subject_background",
   "mapper_backend", "image_format", "export_depth_maps",
   "fuse_dense_cloud", "mesh_dense_surface",
 ]);

@@ -97,9 +97,10 @@ MASK_LICHTFELD_DIR = "masks"
 #: on its own. The body frames and the close-ups supervise the SAME Gaussians at very
 #: different projected scales, and the equilibrium is "many Gaussians, each slightly
 #: too big" - a structured but soft face (the scale conflict Mip-Splatting exists to
-#: fix). Removing the head from the body frames keeps their pose/scale/geometry
-#: context while applying *zero* gradient to the face, so the face is learned from the
-#: close-ups alone, at close-up sharpness. The union mode is the literal reading of
+#: Removing the head from body frames keeps their pose/scale/geometry context while
+#: applying *zero* gradient to the face; face close-ups then supervise only the face,
+#: not their artifact-prone backgrounds. The face is learned from the close-ups alone,
+#: at close-up sharpness. The union mode is the literal reading of
 #: "united with the RMBG masks" and is kept for comparison: it only guarantees the face
 #: region is inside the mask, which helps when RMBG erodes a dark face.
 FACE_MASK_CUT = "Head cut-out (face learned from the close-ups only)"
@@ -109,7 +110,7 @@ FACE_MASK_MODES = (FACE_MASK_CUT, FACE_MASK_UNION)
 #: Default head cut-out growth, in source pixels. The detector's box stops at the
 #: hair/skin boundary; the Gaussian splat does not, so a few pixels of margin keep the
 #: seam out of the face.
-FACE_MASK_DILATE_DEFAULT = 8
+FACE_MASK_DILATE_DEFAULT = 5
 #: sub folder Lichtfeld scans for depth maps; files are ``<image stem>.depth.png``
 #: (``depths/`` is accepted by Studio as well, but ``depth/`` is what we write).
 #: Shared with the VGGT node so both nodes produce a byte-identical layout.
@@ -221,7 +222,7 @@ class GLOMAPLichtfeldTracker:
                     ),
                 }),
                 "matcher": (["sequential", "exhaustive"], {
-                    "default": "sequential",
+                    "default": "exhaustive",
                     **tooltip(
                         "sequential = match neighbouring frames (fast, perfect "
                         "for video orbits). exhaustive = every image against "
@@ -356,7 +357,7 @@ class GLOMAPLichtfeldTracker:
                     ),
                 }),
                 "frame_step": ("INT", {
-                    "default": 2, "min": 1, "max": 10, "step": 1,
+                    "default": 1, "min": 1, "max": 10, "step": 1,
                     **tooltip(
                         "Use only every n-th frame. 1 = all frames (best "
                         "quality), 2 = half the frames (recommended for 24 fps "
@@ -381,7 +382,7 @@ class GLOMAPLichtfeldTracker:
                     ),
                 }),
                 "offset_splat": ("INT", {
-                    "default": 12, "min": -100, "max": 100, "step": 1,
+                    "default": 0, "min": -100, "max": 100, "step": 1,
                     **tooltip(
                         "Morphological offset for the Lichtfeld/splat masks. "
                         "Positive = erode to remove alpha halos, negative = "
@@ -422,7 +423,7 @@ class GLOMAPLichtfeldTracker:
                     ),
                 }),
                 "image_format": (["PNG", "JPEG"], {
-                    "default": "PNG",
+                    "default": "JPEG",
                     **tooltip(
                         "File format for exported images/. PNG is lossless and "
                         "preserves alpha. JPEG is smaller; alpha is kept in the "
@@ -430,7 +431,7 @@ class GLOMAPLichtfeldTracker:
                     ),
                 }),
                 "jpeg_quality": ("INT", {
-                    "default": 90, "min": 1, "max": 100, "step": 1,
+                    "default": 97, "min": 1, "max": 100, "step": 1,
                     **tooltip(
                         "JPEG quality from 1 (smallest/most artifacts) to 100 "
                         "(best/largest). Used only when Image Format is JPEG."
@@ -479,7 +480,7 @@ class GLOMAPLichtfeldTracker:
                 ),
             }),
             "prepare_masks_for_face_detail": ("BOOLEAN", {
-                "default": False,
+                "default": True,
                 **tooltip(
                     "Face-detail masks. Looks for a face on every frame (SAM3, "
                     "'face') and shapes the Lichtfeld masks around the result: the "
@@ -544,7 +545,7 @@ class GLOMAPLichtfeldTracker:
         """
         return {
         "subject_focus": (["full frame", "subject only"], {
-                "default": "full frame",
+                "default": "subject only",
                 **tooltip(
                     "Subject-focused camera alignment (the VGGT node's control of "
                     "the same name). 'full frame' extracts SIFT features everywhere. "
@@ -557,7 +558,7 @@ class GLOMAPLichtfeldTracker:
                 ),
             }),
             "sharp_selection": ("BOOLEAN", {
-                "default": False,
+                "default": True,
                 **tooltip(
                     "Sharp Frame Selection (the Sharp Frame Selector Top-N logic, "
                     "folded into the tracker). ON: only the sharpest frames are "
@@ -584,10 +585,19 @@ class GLOMAPLichtfeldTracker:
                 **tooltip("Chunk size for the batched_topn method."),
             }),
             "sharp_num_frames": ("INT", {
-                "default": 3, "min": 1, "max": 64, "step": 1,
+                "default": 1, "min": 1, "max": 64, "step": 1,
                 "label": "Num Frames",
                 **tooltip("Frames to keep per chunk (batched_topn) or in total "
                           "(best_n)."),
+            }),
+            "split_subject_background": ("BOOLEAN", {
+                "default": False,
+                **tooltip(
+                    "Run SfM once on the original images, then export complementary "
+                    "subject/background Lichtfeld views sharing the reconstructed camera "
+                    "poses. Requires a subject keep-mask from masks_lichtfeld, RGBA alpha, "
+                    "or RMBG. Cannot be combined with Face Detail Frames."
+                ),
             }),
         }
 
@@ -605,21 +615,26 @@ class GLOMAPLichtfeldTracker:
               use_rmbg=True, rmbg_mode=RMBG_DEFAULT_MODE, rmbg_threshold=0.5,
               rmbg_resize="static",
               use_gpu=True, keep_workspace=False, auto_align=True,
-              sequential_overlap=15, max_image_size=5120, frame_step=2,
-              downscale_factor=1.0, offset_glomap=4, offset_splat=12,
+              sequential_overlap=15, max_image_size=5120, frame_step=1,
+              downscale_factor=1.0, offset_glomap=4, offset_splat=0,
                mapper_backend="glomap", auto_install_binaries=True,
                binary_flavor="auto", embed_alpha_in_images=False,
-               image_format="PNG", jpeg_quality=90,
+               image_format="JPEG", jpeg_quality=97,
                export_depth_maps=False, dense_max_image_size=1024,
                dense_geom_consistency=True, fuse_dense_cloud=False,
                dense_cloud_max_points=400000, mesh_dense_surface=False,
                mesh_method="poisson",
-               face_frames="", prepare_masks_for_face_detail=False,
+               face_frames="", prepare_masks_for_face_detail=True,
                face_mask_mode=FACE_MASK_CUT, face_prompt="face",
                face_threshold=0.75, face_mask_dilate=FACE_MASK_DILATE_DEFAULT,
-               subject_focus="full frame", sharp_selection=False,
-               sharp_method="batched_topn", sharp_batch=4, sharp_num_frames=3):
+               subject_focus="subject only", sharp_selection=True,
+               sharp_method="batched_topn", sharp_batch=4, sharp_num_frames=1,
+               split_subject_background=False):
         """Run the complete tracking + export pipeline for one frame batch."""
+
+        if split_subject_background and prepare_masks_for_face_detail:
+            raise ValueError("Split Subject/Background Training cannot be combined "
+                             "with Face Detail Frames.")
 
         # ---------- 1. Make sure COLMAP / GLOMAP are available ------------
         colmap_exe, glomap_exe = self._setup_binaries(
@@ -726,7 +741,8 @@ class GLOMAPLichtfeldTracker:
         masks_glomap = self._prepare_masks(
             masks_glomap, masks_path, downscale_factor, offset_glomap, "GLOMAP")
         masks_lichtfeld = self._prepare_masks(
-            masks_lichtfeld, "", 1.0, offset_splat, "Lichtfeld")
+            masks_lichtfeld, "", 1.0,
+            0 if split_subject_background else offset_splat, "Lichtfeld")
 
         # RMBG means subject-focused COLMAP alignment. Explicit masks_glomap /
         # masks_path still take precedence; otherwise derive GLOMAP masks from
@@ -754,6 +770,15 @@ class GLOMAPLichtfeldTracker:
                 masks_glomap, kept_indices, frame_total, "GLOMAP")
             masks_lichtfeld = self._subset_prepared_masks(
                 masks_lichtfeld, kept_indices, frame_total, "Lichtfeld")
+
+
+        split_subject_mask = None
+        if split_subject_background:
+            subject_source = (masks_lichtfeld if masks_lichtfeld is not None else
+                              self._alpha_subject(alpha_images))
+            from enndee_colmap.split_training_views import prepare_subject_mask
+
+            split_subject_mask = prepare_subject_mask(subject_source, export_images)
 
         # ---------- 4.5 Face-detail masks (optional) --------------------
         # Runs BEFORE the frame stepping, so the frame numbers the camera node reports
@@ -794,6 +819,8 @@ class GLOMAPLichtfeldTracker:
                 masks_glomap = masks_glomap[::step]
             if masks_lichtfeld is not None:
                 masks_lichtfeld = masks_lichtfeld[::step]
+            if split_subject_mask is not None:
+                split_subject_mask = split_subject_mask[::step]
             log(f"frame_step={step}: {sf_images.shape[0]} frames kept")
         sf_images, masks_glomap = self._match_lengths(
             sf_images, masks_glomap, "GLOMAP masks")
@@ -805,6 +832,10 @@ class GLOMAPLichtfeldTracker:
         has_alpha = bool(alpha_images is not None and alpha_images.shape[-1] == 4)
 
         if export_dir is not None:
+            if split_subject_background:
+                from enndee_colmap.split_training_views import remove_background_views
+
+                remove_background_views(export_dir)
             self._write_sharp_selection_sidecar(export_dir, sharp_record)
             self._export_dataset_images(
                 export_dir, export_images, alpha_images,
@@ -818,6 +849,9 @@ class GLOMAPLichtfeldTracker:
             if masks_lichtfeld is not None:
                 self._save_masks(masks_lichtfeld, export_dir / MASK_LICHTFELD_DIR,
                                  "Lichtfeld")
+            elif split_subject_mask is not None:
+                self._save_masks(split_subject_mask, export_dir / MASK_LICHTFELD_DIR,
+                                 "Lichtfeld subject")
             elif has_alpha:
                 log("Extracting alpha channel as Lichtfeld splat masks")
                 self._save_alpha_masks(alpha_images, export_dir / MASK_LICHTFELD_DIR)
@@ -895,6 +929,14 @@ class GLOMAPLichtfeldTracker:
                 int(dense_cloud_max_points), bool(mesh_dense_surface),
                 str(mesh_method),
             )
+
+            if split_subject_background and export_dir is not None:
+                from enndee_colmap.split_training_views import export_complementary_training_views
+
+                export_complementary_training_views(
+                    export_dir, parser, self._to_numpy_masks(split_subject_mask),
+                    image_format=image_format, jpeg_quality=jpeg_quality, log=log,
+                )
 
             log(f"Done: {len(poses)}/{frames_out} poses registered, "
                 f"{len(points)} 3D points, confidence={confidence:.2f}")
@@ -1323,8 +1365,9 @@ class GLOMAPLichtfeldTracker:
         `enndee_face_detect.face_frame_indices`).
 
         `FACE_MASK_CUT` returns a face-only mask: body views are white except for the
-        (dilated) SAM3 face region, and face-orbit views are fully white. RMBG and
-        explicit subject masks are not carried into this mode.
+        (dilated) SAM3 face region, and face-orbit views keep ONLY that same face
+        region (white on the face, black background) so the close-ups supervise the
+        head alone. RMBG and explicit subject masks are not carried into this mode.
 
         `FACE_MASK_UNION` starts from `base_masks` (or the RMBG/RGBA alpha) and adds
         the SAM3 face region without cutting any subject pixels.
@@ -1429,12 +1472,8 @@ class GLOMAPLichtfeldTracker:
             masks = base.clamp(0.0, 1.0).clone()
 
         face_set = set(int(index) for index in chosen)
-        cut, added = 0, 0
+        cut, added, face_only = 0, 0, 0
         for index in range(count):
-            if index in face_set and str(mode) == FACE_MASK_CUT:
-                # Cut-mode face-orbit frames are deliberately retained in full.
-                masks[index] = 1.0
-                continue
             detection = detections[index] if index < len(detections) else None
             if detection is None:
                 continue
@@ -1472,6 +1511,18 @@ class GLOMAPLichtfeldTracker:
                     continue
                 face_mask = _torch.zeros((height, width), dtype=_torch.bool)
                 face_mask[y0:y1, x0:x1] = True
+            if index in face_set and str(mode) == FACE_MASK_CUT:
+                # Face-orbit frames keep ONLY the (dilated) SAM3 face region: the
+                # close-ups exist to supervise the head at close range, and their
+                # background would dilute exactly that. The mask is the same precise
+                # segmentation the body cut uses - never the rectangular box when a
+                # segmentation exists. A frame whose face mask came back empty keeps
+                # the whole picture rather than supervising nothing.
+                if face_mask.any():
+                    masks[index] = 0.0
+                    masks[index, 0][face_mask] = 1.0
+                    face_only += 1
+                continue
             if str(mode) == FACE_MASK_UNION:
                 masks[index, 0][face_mask] = 1.0
                 added += 1
@@ -1482,8 +1533,10 @@ class GLOMAPLichtfeldTracker:
         if str(mode) == FACE_MASK_UNION:
             detail = f"face region added to {added} body frame(s)"
         else:
+            face_part = (f"face-only masks on {face_only}/{len(face_set)} "
+                         f"face-orbit frame(s)" if face_set else "no face-orbit frames")
             detail = (f"face removed from {cut} body frame(s), "
-                      f"{len(face_set)} face-orbit frame(s) kept whole; no subject mask")
+                      f"{face_part}; no subject mask")
         report = (f"face-detail masks ({mode}): {detail}, dilate {int(dilate)} px at "
                   f"{width}x{height}, source {source}")
         log(report)

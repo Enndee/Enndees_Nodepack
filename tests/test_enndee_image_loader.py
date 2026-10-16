@@ -67,9 +67,9 @@ class ImageLoaderResizeEnndeeTests(unittest.TestCase):
             "scale dimensions", "scale by multiplier", "scale longer dimension",
             "scale shorter dimension", "scale width", "scale height",
             "scale total pixels", "match size", "scale to multiple"])
-        self.assertEqual(required["resize"][1]["default"], False)
+        self.assertEqual(required["resize"][1]["default"], True)
         self.assertEqual(required["keep_proportion"][1]["default"], True)
-        self.assertEqual(required["no_upscale"][1]["default"], False)
+        self.assertEqual(required["no_upscale"][1]["default"], True)
         self.assertEqual(required["mask_channel"][0], ["alpha", "red", "green", "blue"])
         self.assertTrue(all("tooltip" in metadata for _options, metadata in required.values()))
         self.assertEqual(

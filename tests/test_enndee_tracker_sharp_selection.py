@@ -187,7 +187,8 @@ class SidecarAndWidgetContractTests(unittest.TestCase):
         face = list(GLOMAPLichtfeldTracker._face_widgets())
         added = list(GLOMAPLichtfeldTracker._new_widgets())
         self.assertEqual(added, ["subject_focus", "sharp_selection", "sharp_method",
-                                 "sharp_batch", "sharp_num_frames"])
+                                 "sharp_batch", "sharp_num_frames",
+                                 "split_subject_background"])
         sharp_methods = GLOMAPLichtfeldTracker.INPUT_TYPES()["optional"]["sharp_method"][0]
         self.assertEqual(list(sharp_methods), ["batched_topn", "best_n"])
         for cls in (GLOMAPLichtfeldTracker, ColmapLichtfeldTracker):
@@ -200,6 +201,7 @@ class SidecarAndWidgetContractTests(unittest.TestCase):
         self.assertIn("tooltip", spec["sharp_method"][1])
         self.assertIn("tooltip", spec["sharp_batch"][1])
         self.assertIn("tooltip", spec["sharp_num_frames"][1])
+        self.assertIn("tooltip", spec["split_subject_background"][1])
         js_path = PACK_DIR / "web" / "js" / "enndee_colmap_widgets.js"
         js = js_path.read_text(encoding="utf-8")
         self.assertIn('"sharp_selection", true', js)
@@ -213,6 +215,7 @@ class SidecarAndWidgetContractTests(unittest.TestCase):
         self.assertIn('"Selection Method"', js)
         self.assertIn('"Batch Size"', js)
         self.assertIn('"Num Frames"', js)
+        self.assertIn('["split_subject_background"]', js)
 
     def test_the_rmbg_widget_key_is_unchanged_for_saved_workflows(self):
         for cls in (GLOMAPLichtfeldTracker, ColmapLichtfeldTracker):
@@ -224,7 +227,8 @@ class SidecarAndWidgetContractTests(unittest.TestCase):
         for cls in (GLOMAPLichtfeldTracker, ColmapLichtfeldTracker):
             params = inspect.signature(cls.track).parameters
             for name in ("subject_focus", "sharp_selection", "sharp_method",
-                         "sharp_batch", "sharp_num_frames"):
+                         "sharp_batch", "sharp_num_frames",
+                         "split_subject_background"):
                 self.assertIn(name, params, f"{cls.__name__}.{name}")
 
 

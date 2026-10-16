@@ -56,3 +56,42 @@ changing `__init__.py` or `web/js/enndee_colmap_widgets.js`, restart ComfyUI to
 observe registration and frontend-widget changes. The tracker feature tests are
 unit tests; they do not replace visual validation against the face-detail
 comparison datasets.
+
+## Ground-truth extrinsics pipeline (2026-10-15)
+
+Two nodes export Lichtfeld datasets with the camera rig the Meridian render flew
+instead of solving SfM (added for camera-path-driven videos where the path IS the
+pose source):
+
+- `Enndee_MeridianGeometryExtrinsics` (`nodes/enndee_meridian_geometry_extrinsics.py`)
+  - a copy of Meridian Geometry with a sixth output `extrinsics`
+    (`MERIDIAN_EXTRINSICS`, JSON): per-frame c2w [F,4,4] (columns right, down,
+    forward - the renderer's OpenCV frame, `zm` gauge), focal multipliers [F],
+    `vfov_degrees`, canvas size and frame count. The rig is published by
+    `render_depth_aligned` through `fast_depth.LAST_CAMERA_EVAL` (same one-shot
+    pattern as `LAST_VFOV_DEGREES`), so the signal always matches the render.
+- `Enndee_PathPoseDataset` (`nodes/enndee_path_pose_dataset.py`, display
+  "Path Pose Dataset - no COLMAP (Enndee)") - the GLOMAP tracker minus SfM. It
+  reuses the tracker's helpers (sharp selection, frame_step, Lichtfeld masks from
+  explicit masks/RGBA alpha/RMBG, image export) and assigns each exported frame
+  the extrinsics of its ORIGINAL input index (`final_output_to_input`, recorded
+  in `sharp_selection.json` alongside the pose mapping). Writes the tracker's
+  dataset layout with `sparse/0/{cameras,images,points3D}.txt`; `points3D.txt` is
+  empty (no SfM ran), `images.txt` carries the ground-truth poses (COLMAP
+  world-to-camera, `c2w_to_w2c`, qvec via a local `rotmat_to_qvec`).
+  Frame mapping (`extrinsics_mapping`): 'auto' uniform resample (identity when
+  counts match), 'manual' index+offset for chunked clips. Focal (`focal_mode`):
+  'vfov from signal' (the renderer's model, `0.5*H/tan(vFOV/2)` at export res),
+  'manual focal px', 'manual hfov' - use the manual modes when the generated
+  video's lens differs from the planning vFOV.
+
+Tests: `tests/test_enndee_path_pose_dataset.py` (18 tests, no binaries/models:
+signal round trip, qvec round trip through COLMAPParser, mapping math, the
+geometry node's appended output with a stubbed render, end-to-end dataset export
+including sharp-selection pose assignment and `validate_dataset`). Known caveat
+(from the 20261014__23_43_33 comparison): diffusion-generated videos only
+approximate the planned path (~5-7 deg rotation deviation measured), so path
+poses are exact for warp-rendered flights but an approximation for AI videos -
+the `focal_mode` manual options and the GLOMAP tracker remain the fallback.
+QC helper: `tools/compare_path_vs_colmap.py <dataset_folder>` measures the
+planned-path-vs-SfM deviation for a clip (Umeyama fit + per-frame errors).

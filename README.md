@@ -1339,6 +1339,46 @@ options share one PatchMatch pass, it never runs twice.
 
 ---
 
+## Node: Meridian Geometry + Extrinsics (Enndee)
+
+A copy of **Meridian Geometry (Enndee)** with one extra output: `extrinsics`
+(`MERIDIAN_EXTRINSICS`) - the exact camera rig the render flew. The JSON signal
+carries per-frame c2w matrices (renderer frame: columns right/down/forward, the
+`zm` gauge), the path's focal multipliers, the vFOV and the canvas size. Because
+the rig is published by the renderer itself (`fast_depth.LAST_CAMERA_EVAL`), the
+signal can never disagree with the rendered flight. Wire it into **Path Pose
+Dataset** to splat-train on ground-truth poses.
+
+## Node: Path Pose Dataset - no COLMAP (Enndee)
+
+The GLOMAP tracker minus Structure-from-Motion: the same sharp-frame selection
+(`sharp_selection`, `sharp_method`, `sharp_batch`, `sharp_num_frames`), the same
+`frame_step`, the same Lichtfeld masking (explicit `masks` / RGBA alpha / RMBG)
+and the same dataset layout (`images/`, `masks/`, `sharp_selection.json`,
+`sparse/0/{cameras,images,points3D}.txt`) - but `images.txt` carries the
+**ground-truth extrinsics** of the Meridian camera path instead of a SfM solve,
+and no COLMAP/GLOMAP binary is needed. `points3D.txt` is written empty (no SfM
+ran; the trainer only requires the file to exist).
+
+Poses are assigned by ORIGINAL input frame index, so sharp selection and
+`frame_step` can drop frames freely - the mapping lands in `sharp_selection.json`
+(`final_output_to_input`) and in the `pose_report` output.
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `extrinsics` | `MERIDIAN_EXTRINSICS` | - | the geometry node's `extrinsics` output (the only required socket) |
+| `images` | IMAGE *(optional)* | - | the frames to train on (folder fallback: `images_path`) |
+| `masks` | MASK *(optional)* | - | Lichtfeld masks (white = keep); else RGBA alpha / RMBG |
+| `extrinsics_mapping` | choice | `auto` | `auto` = uniform resample (identity when the counts match, also covers interpolated videos); `manual` = `index + extrinsics_offset` for chunked clips |
+| `extrinsics_offset` | INT | 0 | trim/chunk correction on the mapped index |
+| `focal_mode` | choice | `vfov from signal` | `vfov from signal` = `0.5*H/tan(vFOV/2)` from the STILL's measured vFOV - only correct if the video keeps that lens (generated videos usually don't; oversized frustum symbols in Lichtfeld are the tell-tale); `manual focal px` / `manual hfov` = the video's true lens; `from cameras.txt` = copy it from a GLOMAP-tracked reference (`focal_reference_path`), rescaled to the export size |
+| `focal_reference_path` | STRING | - | reference dataset folder (or its `cameras.txt`) for `focal_mode='from cameras.txt`' |
+
+Caveat: a diffusion-generated video only approximately follows the planned path
+(measured deviation on a real clip: ~5-7 deg rotation, ~6-11 % position after
+best-fit alignment). The path poses are exact for warp-rendered flights; for AI
+videos treat them as the pose prior and keep the GLOMAP tracker as fallback.
+
 ## Node: VGGT for Lichtfeld (Enndee)
 
 A drop-in alternative to the COLMAP/GLOMAP tracker: instead of SIFT features plus

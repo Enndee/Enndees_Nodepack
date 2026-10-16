@@ -92,9 +92,14 @@ class MeridianParametersWidgetTests(unittest.TestCase):
         for removed in ("model_size", "auto_orbit_distance", "auto_orbit_end", "auto_orbit_size"):
             self.assertNotIn(removed, required)
         self.assertIn("auto_scene_survey_width", required)
-        self.assertEqual(list(required)[-5:],
+        self.assertEqual(list(required)[-6:],
                          ["face_orbit", "face_fill", "face_yaw_span", "face_prompt",
-                          "face_threshold"])
+                          "face_threshold", "face_orbit_mode"])
+        self.assertEqual(required["face_orbit_mode"][0], ["Horizontal", "Vertical", "Both"])
+        self.assertEqual(required["face_orbit_mode"][1]["default"], "Horizontal")
+        source = JS_PATH.read_text(encoding="utf-8")
+        self.assertIn('"face_orbit_mode"]', source)
+        self.assertIn("FACE_PANEL.forEach((name) => visible.add(name))", source)
         self.assertEqual(set(NODE.INPUT_TYPES()["optional"]),
                          {"reference_image", "subject_mask"})
         self.assertIn("auto_orbit_angle", required)
@@ -106,6 +111,27 @@ class MeridianParametersWidgetTests(unittest.TestCase):
         with mock.patch.object(parameters, "estimate_camera_path", side_effect=fake):
             NODE().build(reference_image=torch.zeros(1, 8, 8, 3), **values)
         self.assertAlmostEqual(calls[0]["depth_relief"], 1.0)
+
+    def test_vertical_face_orbit_mode_reaches_automatic_estimator(self):
+        fake, calls, _report = estimate_stub()
+        values = all_defaults()
+        values.update(camera_mode=parameters.AUTOMATIC_MODE,
+                      face_orbit="Auto (SAM3)", face_orbit_mode="Vertical")
+        with mock.patch.object(parameters, "estimate_camera_path", side_effect=fake), \
+                mock.patch.object(NODE, "_face_gate", return_value=("0.5,0.5,0.1,0.1", "test")):
+            NODE().build(reference_image=torch.zeros(1, 8, 8, 3), **values)
+        self.assertEqual(calls[0]["face_mode"], "Vertical")
+        self.assertEqual(calls[0]["face_box"], "0.5,0.5,0.1,0.1")
+
+    def test_both_face_orbit_mode_reaches_automatic_estimator(self):
+        fake, calls, _report = estimate_stub()
+        values = all_defaults()
+        values.update(camera_mode=parameters.AUTOMATIC_MODE,
+                      face_orbit="Auto (SAM3)", face_orbit_mode="Both")
+        with mock.patch.object(parameters, "estimate_camera_path", side_effect=fake), \
+                mock.patch.object(NODE, "_face_gate", return_value=("0.5,0.5,0.1,0.1", "test")):
+            NODE().build(reference_image=torch.zeros(1, 8, 8, 3), **values)
+        self.assertEqual(calls[0]["face_mode"], "Both")
 
     def test_face_bbox_socket_has_been_removed(self):
         self.assertNotIn("face_bbox", NODE.INPUT_TYPES()["optional"])
@@ -198,7 +224,7 @@ class MeridianParametersWidgetTests(unittest.TestCase):
         coverage = required["auto_orbit_coverage"]
         self.assertEqual(coverage[0], list(parameters.ORBIT_COVERAGES))
         self.assertEqual(coverage[1]["default"], parameters.ORBIT_COVERAGE_DEFAULT)
-        self.assertEqual(parameters.ORBIT_COVERAGE_DEFAULT, "O-Orbit Front&Back")
+        self.assertEqual(parameters.ORBIT_COVERAGE_DEFAULT, "Banded Orbits")
         self.assertNotIn("auto_orbit_distance", required)
         self.assertNotIn("auto_orbit_end", required)
         source = JS_PATH.read_text(encoding="utf-8")
@@ -247,7 +273,7 @@ class MeridianManualCameraTests(unittest.TestCase):
         self.assertEqual(document["stations"], ["Right", "Front", "Left"])
         keys = document["path"]
         self.assertEqual(keys[0]["t"], 0)
-        self.assertEqual(keys[-1]["t"], 157)      # 158 frames = the example workflow's default
+        self.assertEqual(keys[-1]["t"], 174)      # 175 frames = the example workflow's default
         self.assertTrue(all(key["src"] == key["t"] for key in keys))
 
     def test_alternating_height_mode_builds_the_pendulum(self):
@@ -310,6 +336,7 @@ class MeridianAutomaticCameraTests(unittest.TestCase):
         self.assertEqual(calls[0]["frames"], 73)
         self.assertEqual(calls[0]["target"], "scene")
         self.assertAlmostEqual(calls[0]["max_speed"], 0.2)
+        self.assertEqual(calls[0]["face_mode"], "Horizontal")
         self.assertEqual(calls[0]["pivot_offset"], (0.25, 0.0, 0.0))
         self.assertIs(calls[0]["subject_mask"], mask)
         self.assertIs(calls[0]["reference"], reference)

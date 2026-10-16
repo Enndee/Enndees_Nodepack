@@ -126,7 +126,7 @@ def resolve_front_orbit_amplitude(degrees):
 # pivot is re-centred on the subject's projected midpoint. The speed cap is then expressed in the
 # subject's own pixels (drift per frame as a fraction of its apparent radius): a nearer/framed
 # bigger subject buys a larger step, the background never enters the budget.
-SUBJECT_FILL_DEFAULT = 40.0       # percent of the frame area (Auto Subject Fill widget default)
+SUBJECT_FILL_DEFAULT = 30.0       # percent of the frame area (Auto Subject Fill widget default)
 SUBJECT_FILL_MIN = 0.0            # 0 = off: fly at the Auto Orbit Distance / built-in fill
 SUBJECT_FILL_MAX = 90.0
 SUBJECT_PROJECTION_MARGIN = 1.10  # projected surface points -> visible silhouette allowance
@@ -191,7 +191,7 @@ ORBIT_VIEW_ANGLE_MIN = -180.0
 ORBIT_VIEW_ANGLE_MAX = 360.0
 ORBIT_COVERAGES = ("O-Orbit Front", "O-Orbit Front&Back", "Spiral", "Banded Orbits",
                    "Banded Orbits Front & Back")
-ORBIT_COVERAGE_DEFAULT = ORBIT_COVERAGES[1]
+ORBIT_COVERAGE_DEFAULT = ORBIT_COVERAGES[3]
 SPIRAL_COVERAGE = ORBIT_COVERAGES[2]
 BAND_COVERAGE = ORBIT_COVERAGES[3]
 BAND_FRONT_BACK_COVERAGE = ORBIT_COVERAGES[4]
@@ -385,22 +385,22 @@ def resolve_spiral_slope(degrees=None):
 # for. A 360 deg width ends where it started, so it cannot alternate - it keeps
 # turning the same way instead, exactly as the spec requires. The bands live on the
 # orbit sphere (`_place`), so the camera keeps one radius for the whole path.
-BAND_START_ANGLE_DEFAULT = 0.0    # deg, the built-in first band is level with the pivot
+BAND_START_ANGLE_DEFAULT = -10.0    # deg, the built-in first band is level with the pivot
 BAND_START_ANGLE_MIN = -90.0      # deg, the farthest below: looking up at the feet
 BAND_START_ANGLE_MAX = 90.0       # deg, straight above the head
-BAND_COUNT_DEFAULT = 3            # bands, the built-in stack
+BAND_COUNT_DEFAULT = 2            # bands, the built-in stack
 BAND_COUNT_MIN = 1
 BAND_COUNT_MAX = 12               # more bands than this buy nothing at 73-243 frames
-BAND_WIDTH_DEFAULT = 180.0        # deg of azimuth one band sweeps (half a turn)
+BAND_WIDTH_DEFAULT = 120.0        # deg of azimuth one band sweeps (half a turn)
 BAND_WIDTH_MIN = 1.0
 BAND_WIDTH_MAX = 360.0            # a full turn - and then the bands never alternate
-BAND_START_YAW_DEFAULT = 0.0      # deg, the built-in start is the frontal azimuth
+BAND_START_YAW_DEFAULT = 60.0      # deg, the built-in start is the frontal azimuth
 BAND_START_YAW_MIN = -360.0
 BAND_START_YAW_MAX = 360.0
 BAND_STEP_DEFAULT = 0.0
 BAND_STEP_MIN = 0.0
 BAND_STEP_MAX = 90.0
-BAND_STOP_ANGLE_DEFAULT = 60.0    # deg, second endpoint of the evenly spaced band stack
+BAND_STOP_ANGLE_DEFAULT = 45.0    # deg, second endpoint of the evenly spaced band stack
 BAND_STOP_ANGLE_MIN = -90.0
 BAND_STOP_ANGLE_MAX = 90.0
 # Deprecated compatibility API state; the serialized node widget now means stop angle.
@@ -3230,7 +3230,8 @@ def estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DEF
                          spiral_slope=None, bands_start_angle=None, bands_count=None,
                          bands_width=None, bands_start_yaw=None, bands_stop_angle=None,
                          orbit_look=None,
-                         face_box=None, face_fill=None, face_span=None, depth_relief=1.0):
+                         face_box=None, face_fill=None, face_span=None, depth_relief=1.0,
+                         face_mode="Horizontal"):
     """(signal JSON, summary) for one still, with the O Orbit Angle and the spiral widgets applied.
 
     `orbit_amplitude` (deg) is the front O's angular radius - the swing AND the rise, because the O
@@ -3303,6 +3304,7 @@ def estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DEF
             subject_fill=subject_fill, orbit_end=orbit_end, direction=direction,
             view_angle=view_angle, coverage=coverage,
             face_box=face_box, face_fill=face_fill, face_span=face_span,
+            face_mode=face_mode,
             depth_relief=depth_relief)
     finally:
         _ACTIVE_FRONT_ORBIT_AMPLITUDE = previous
@@ -3320,7 +3322,8 @@ def _estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DE
                           device=None, depth_fn=None, pivot_offset=(0.0, 0.0, 0.0),
                           orbit_distance=None, orbit_size=None, subject_fill=None, orbit_end=None,
                           direction=ORBIT_DIRECTION_DEFAULT, view_angle=None, coverage=None,
-                          face_box=None, face_fill=None, face_span=None, depth_relief=1.0):
+                          face_box=None, face_fill=None, face_span=None, depth_relief=1.0,
+                          face_mode="Horizontal"):
     """(signal JSON, summary) for one still: geometric pivot, automatic path, collision guard.
 
     The pivot is the target's **cylindrical centre**: a robust vertical-cylinder fit of the depth
@@ -3523,6 +3526,7 @@ def _estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DE
                     # error in f), which mis-sizes the face patch and the solved distance.
                     vfov_degrees=surface.get("vfov"),
                     coverage=coverage,
+                    face_mode=face_mode,
                 )
                 face_frames = list((face_info or {}).get("frames") or [])
 
@@ -3531,7 +3535,8 @@ def _estimate_camera_path(reference, frames, target=SUBJECT_TARGET, max_speed=DE
         # A level look is a function of the camera height, so it is re-derived once the pivot
         # offset and the collision guard have finished moving the poses: the forward stays
         # exactly level and the aim keeps pointing at the axis at the camera's own height.
-        keys = [dict(key, look=[round(value, 6) for value in _aim(pivot, key["pos"])])
+        keys = [key if key.get("_face_path") else
+                dict(key, look=[round(value, 6) for value in _aim(pivot, key["pos"])])
                 for key in keys]
     # Everything above works in absolute depth units; the *emitted* document is in median-depth
     # units, exactly like the Camera Path Configurator's paths - the fast-depth backend multiplies
@@ -4225,7 +4230,8 @@ def format_summary(summary):
         before = face.get("fill_before")
         after = face.get("fill_after")
         line += (f" - face orbit on {len(face.get('frames') or [])} frame(s) between the "
-                 f"body bands ({face.get('span', 0):.0f} deg, "
+                 f"body bands ({face.get('face_mode', 'Horizontal')} / "
+                 f"{face.get('span', 0):.0f} deg, "
                  f"{len(face.get('transition_in_keys') or [])} in / "
                  f"{len(face.get('transition_out_keys') or [])} out transition keys)")
         if before is not None and after is not None:
@@ -4331,8 +4337,22 @@ def _rendered_frame_span(key_indices, key_count, frames_total):
     return list(range(first_frame, last_frame + 1))
 
 
+#: The face orbit deliberately flies at half the path's speed: its segment gets
+#: ``FACE_TIME_SCALE`` times its proportional share and the body/transition
+#: segments surrender the extra keys (the frame budget is fixed by Output Frames).
+FACE_TIME_SCALE = 2
+
+
 def _face_path_intervals(frames):
-    """Distribute frame intervals across body, transitions, and the face orbit."""
+    """Distribute frame intervals across body, transitions, and the face orbit.
+
+    The face orbit is the slow part of the flight on purpose - the close-up is
+    the point of the shot - so its interval is multiplied by ``FACE_TIME_SCALE``
+    ("half as fast": the same face arc flown in twice the frames) and the body
+    and transition segments give up the extra keys one at a time, largest first,
+    never below ``minimum``. The total is unchanged, so ``src == t`` and the
+    Output Frames budget still hold.
+    """
     segments = 5
     total = max(0, int(frames) - 1)
     minimum = 2
@@ -4347,6 +4367,13 @@ def _face_path_intervals(frames):
                    reverse=True)
     for index in order[:left]:
         intervals[index] += 1
+    donors = [index for index in range(segments) if index != 2]
+    spare = sum(max(0, intervals[index] - minimum) for index in donors)
+    extra = min(intervals[2] * (FACE_TIME_SCALE - 1), spare)
+    for _ in range(extra):
+        donor = max(donors, key=lambda index: (intervals[index], -index))
+        intervals[donor] -= 1
+        intervals[2] += 1
     return intervals
 
 
@@ -4360,6 +4387,66 @@ def _ease_face_transition(start, stop, phase):
         "look": [float(a) + (float(b) - float(a)) * weight
                  for a, b in zip(start["look"], stop["look"])],
     }
+
+
+def _face_orbit_position(centre, radius, yaw_degrees, elevation_degrees):
+    """Spherical face-orbit pose, independent of the body's horizontal-look mode."""
+    yaw = math.radians(float(yaw_degrees))
+    elevation = math.radians(float(elevation_degrees))
+    offset = (math.cos(elevation) * math.sin(yaw),
+              -math.sin(elevation),
+              -math.cos(elevation) * math.cos(yaw))
+    return [float(centre[axis]) + float(radius) * offset[axis] for axis in range(3)]
+
+
+def _face_orbit_pose(centre, radius, start_yaw, end_yaw, phase, mode):
+    """Camera pose along the selected face arc.
+
+    Horizontal sweeps level at face height, Vertical arches over the face through
+    the upper hemisphere, and Both flies a full vertical loop first - over the top
+    and back under the face to the orbit's starting point - before it continues
+    with the horizontal sweep as if only Horizontal had been selected. Every
+    sweep eases in and out of its endpoints (zero angular velocity at the joins),
+    so the sub-arcs and the eased body transitions hand over without a kick.
+    """
+    phase = min(1.0, max(0.0, float(phase)))
+    if mode == "Both":
+        third = phase * 3.0
+        if third < 1.0:
+            return _vertical_face_arc(centre, radius, start_yaw, end_yaw, third, 1.0)
+        if third < 2.0:
+            return _vertical_face_arc(centre, radius, end_yaw, start_yaw,
+                                      third - 1.0, -1.0)
+        return _horizontal_face_sweep(centre, radius, start_yaw, end_yaw,
+                                      third - 2.0)
+    if mode == "Vertical":
+        return _vertical_face_arc(centre, radius, start_yaw, end_yaw, phase, 1.0)
+    return _horizontal_face_sweep(centre, radius, start_yaw, end_yaw, phase)
+
+
+def _face_arc_yaw(start_yaw, end_yaw, phase):
+    """Yaw on a cos-eased sweep: exact endpoints, zero angular velocity at both."""
+    yaw_delta = float(end_yaw) - float(start_yaw)
+    yaw_radius = abs(yaw_delta) / 2.0
+    midpoint = (float(start_yaw) + float(end_yaw)) / 2.0
+    return midpoint - math.copysign(yaw_radius, yaw_delta or 1.0) * math.cos(
+        math.pi * phase)
+
+
+def _vertical_face_arc(centre, radius, start_yaw, end_yaw, phase, elevation_sign):
+    """Upper (+1) or mirrored lower (-1) O-style arc; spherical, look-mode free."""
+    yaw = _face_arc_yaw(start_yaw, end_yaw, phase)
+    arc_radius = min(60.0, abs(float(end_yaw) - float(start_yaw)) / 2.0)
+    elevation = elevation_sign * arc_radius * math.sin(math.pi * phase)
+    return {"pos": _face_orbit_position(centre, radius, yaw, elevation),
+            "look": [float(value) for value in centre]}
+
+
+def _horizontal_face_sweep(centre, radius, start_yaw, end_yaw, phase):
+    """Level yaw sweep at face height on the body's orbit surface."""
+    yaw = _face_arc_yaw(start_yaw, end_yaw, phase)
+    return {"pos": _place(centre, radius, yaw, 0.0),
+            "look": [float(value) for value in centre]}
 
 
 def _sample_face_source(keys, phase, pivot=None, yaw_offset=0.0):
@@ -4396,7 +4483,8 @@ def _sample_face_segments(segment_functions, intervals):
 
 def add_face_height_orbit(keys, frames_total, pivot, face_centre, face_span,
                           face_distance, face_radius, direction=1.0, coverage=None,
-                          bands_start_yaw=None, bands_width=None, bands_elevations=None):
+                          bands_start_yaw=None, bands_width=None, bands_elevations=None,
+                          orbit_mode="Horizontal"):
     """Insert a face-height orbit between smoothly connected lower and upper path pieces.
 
     A two-band path keeps both requested body sweeps and puts the face sweep between
@@ -4413,6 +4501,9 @@ def add_face_height_orbit(keys, frames_total, pivot, face_centre, face_span,
     if intervals is None:
         return keys, {"status": "not enough frames for body and face transitions", "frames": []}
     span = min(360.0, max(6.0, float(face_span)))
+    mode = str(orbit_mode or "Horizontal")
+    if mode not in ("Horizontal", "Vertical", "Both"):
+        raise ValueError(f"Unknown face orbit mode {mode!r}.")
     radius = max(float(face_distance), 1e-3)
     face_centre = [float(value) for value in face_centre]
     body_radius = max(1e-3, _yaw_elevation_of(keys[0]["pos"], pivot)[2])
@@ -4457,19 +4548,16 @@ def add_face_height_orbit(keys, frames_total, pivot, face_centre, face_span,
                               elevations[low_index]),
                 "look": [float(value) for value in pivot],
             }
-            face_entry = {"pos": _place(face_centre, radius, face_start_yaw, 0.0),
-                          "look": face_centre}
-            face_exit = {"pos": _place(face_centre, radius, face_end_yaw, 0.0),
-                         "look": face_centre}
+            face_entry = _face_orbit_pose(
+                face_centre, radius, face_start_yaw, face_end_yaw, 0.0, mode)
+            face_exit = _face_orbit_pose(
+                face_centre, radius, face_start_yaw, face_end_yaw, 1.0, mode)
             segments = (
                 low_pose,
                 lambda phase: _ease_face_transition(
                     low_pose(1.0), face_entry, phase),
-                lambda phase: {
-                    "pos": _place(face_centre, radius,
-                                  face_start_yaw + (face_end_yaw - face_start_yaw) * phase, 0.0),
-                    "look": face_centre,
-                },
+                lambda phase: _face_orbit_pose(
+                    face_centre, radius, face_start_yaw, face_end_yaw, phase, mode),
                 lambda phase: _ease_face_transition(face_exit, high_start_pose, phase),
                 lambda phase: {
                     "pos": _place(pivot, body_radius,
@@ -4505,19 +4593,16 @@ def add_face_height_orbit(keys, frames_total, pivot, face_centre, face_span,
         yaw_delta = math.copysign(span, yaw_direction)
         start_yaw = _yaw_elevation_of(middle["pos"], pivot)[0]
         face_end_yaw = start_yaw + yaw_delta
-        face_entry = {"pos": _place(face_centre, radius, start_yaw, 0.0),
-                      "look": face_centre}
-        face_exit = {"pos": _place(face_centre, radius, face_end_yaw, 0.0),
-                     "look": face_centre}
+        face_entry = _face_orbit_pose(
+            face_centre, radius, start_yaw, face_end_yaw, 0.0, mode)
+        face_exit = _face_orbit_pose(
+            face_centre, radius, start_yaw, face_end_yaw, 1.0, mode)
         upper_start = _sample_face_source(keys, 0.5, pivot, yaw_delta)
         segments = (
             lambda phase: _sample_face_source(keys, 0.5 * phase, pivot),
             lambda phase: _ease_face_transition(middle, face_entry, phase),
-            lambda phase: {
-                "pos": _place(face_centre, radius,
-                              start_yaw + yaw_delta * phase, 0.0),
-                "look": face_centre,
-            },
+            lambda phase: _face_orbit_pose(
+                face_centre, radius, start_yaw, face_end_yaw, phase, mode),
             lambda phase: _ease_face_transition(face_exit, upper_start, phase),
             lambda phase: _sample_face_source(keys, 0.5 + 0.5 * phase, pivot, yaw_delta),
         )
@@ -4539,6 +4624,10 @@ def add_face_height_orbit(keys, frames_total, pivot, face_centre, face_span,
         key = {"pos": [float(value) for value in sample["pos"]],
                "look": [float(value) for value in sample["look"]],
                "src": index, "t": index}
+        if mode in ("Vertical", "Both") and segment_ranges[1][0] <= index <= segment_ranges[3][1]:
+            # Preserve the face-centred aim through both smooth joins, including when
+            # the body's selected look mode normally re-levels every camera pose.
+            key["_face_path"] = True
         if face_orbit_start <= index <= face_orbit_end:
             key["face"] = True
         orbit_keys.append(key)
@@ -4549,6 +4638,9 @@ def add_face_height_orbit(keys, frames_total, pivot, face_centre, face_span,
         "transition_in_keys": list(range(segment_ranges[1][0], segment_ranges[1][1] + 1)),
         "transition_out_keys": list(range(segment_ranges[3][0], segment_ranges[3][1] + 1)),
         "keys": face_keys, "face_fill": float(face_distance), "face_span": span,
+        "face_mode": mode,
+        "face_peak_elevation": (min(60.0, span / 2.0)
+                               if mode in ("Vertical", "Both") else 0.0),
         "face_elevation": float(face_angle), "face_elevation_about_pivot": float(face_angle),
         **(body_info or {}),
     }
@@ -4807,7 +4899,8 @@ def apply_face_orbit(keys, surface, face_box, fill=FACE_ORBIT_FILL_DEFAULT,
                      span=FACE_ORBIT_SPAN_DEFAULT, height=CANVAS_HEIGHT,
                      centre_yaw=0.0, front_position=None, front_look=None,
                      clearance=FACE_ORBIT_CLEARANCE, pivot=None, frames_total=None,
-                     vfov_degrees=None, render_aspect=None, coverage=None):
+                     vfov_degrees=None, render_aspect=None, coverage=None,
+                     face_mode="Horizontal"):
     """(keys, info) - insert a face-height orbit between smoothly joined body sections.
 
     `face_box` is the normalised ``cx, cy, width, height`` the SAM3 gate measured on
@@ -4934,7 +5027,7 @@ def apply_face_orbit(keys, surface, face_box, fill=FACE_ORBIT_FILL_DEFAULT,
         keys, frames_total or len(keys), pivot, face_centre, span,
         want, face_radius, direction=1.0, coverage=coverage,
         bands_start_yaw=band_start_yaw(), bands_width=band_width(),
-        bands_elevations=band_elevations())
+        bands_elevations=band_elevations(), orbit_mode=face_mode)
     if face_info.get("status") != "applied":
         return keys, dict(info, **face_info)
     face_info.update({

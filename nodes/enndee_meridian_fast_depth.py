@@ -132,6 +132,12 @@ KEEP_PARENT_RATIO = 0.999             # recam/geometry.py `upsample`: a hi-res p
 # the previous frame is carried by parallel transport and walked back to level over the next
 # HORIZON_RELOCK frames, so a coil that grazes the top re-locks smoothly instead of flipping.
 WORLD_UP = np.array([0.0, -1.0, 0.0], dtype=np.float32)   # OpenCV frame: -y is up
+#: The last camera rig `render_depth_aligned` flew: per-frame c2w [F,4,4] (columns
+#: right, down, forward - OpenCV), focal multipliers [F], the vFOV the rig was built
+#: at and the `zm` gauge the positions live in. Published for the "Meridian Geometry
+#: + Extrinsics" node so it can hand the EXACT rendered poses to the dataset export
+#: without re-deriving them (same one-shot pattern as `LAST_VFOV_DEGREES`).
+LAST_CAMERA_EVAL = None
 HORIZON_MIN_SIN = 1e-6                # |cross(look, up)| below this = the look is vertical (no horizon)
 HORIZON_RELOCK = 24                   # frames to settle back to level after the look crosses the pole
 
@@ -1842,6 +1848,19 @@ def render_depth_aligned(first, device, model_size="Depth-Anything-V2-Small-hf",
     # to both axes exactly as `intr_t[ti, 0, 0] *= f; intr_t[ti, 1, 1] *= f` in sample.py
     f_canvas = 0.5 * out_h / math.tan(math.radians(vfov_degrees) / 2.0)
     focal_px = f_canvas * focal.to(device)      # [F]
+
+    # Publish the evaluated rig for downstream pose consumers (see LAST_CAMERA_EVAL).
+    # Both camera branches converge here, so the stash always matches what is rendered.
+    global LAST_CAMERA_EVAL
+    LAST_CAMERA_EVAL = {
+        "c2w": c2w.detach().cpu().numpy().astype(np.float32),
+        "focal": focal.detach().cpu().numpy().astype(np.float32),
+        "vfov_degrees": float(vfov_degrees),
+        "zm": float(zm),
+        "width": int(out_w),
+        "height": int(out_h),
+        "frames": int(num_frames),
+    }
 
     # --- surface: the depth grid as a mesh or as splatted points (`surface_mode`) ----------------
     # The mesh's topology and per-vertex colour are fixed for the whole flight - only the

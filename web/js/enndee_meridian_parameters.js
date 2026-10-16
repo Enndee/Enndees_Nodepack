@@ -19,7 +19,8 @@ const AUTO_PANEL = ["auto_target", "auto_max_speed", "auto_path_mode", "auto_sub
   "auto_pivot_y", "auto_pivot_z", "auto_orbit_angle", "spiral_end", "spiral_slope",
   "band_start_angle", "band_count", "band_width", "band_start_yaw", "band_stop_angle",
   "auto_orbit_look"];
-const FACE_PANEL = ["face_fill", "face_yaw_span", "face_prompt", "face_threshold"];
+const FACE_PANEL = ["face_fill", "face_yaw_span", "face_prompt", "face_threshold",
+  "face_orbit_mode"];
 const ALL_HIDEABLE = [...PATH_PANEL, ...AUTO_PANEL, ...FACE_PANEL];
 const FACE_SWITCH = "face_orbit";
 const MODE_PANELS = new Map([

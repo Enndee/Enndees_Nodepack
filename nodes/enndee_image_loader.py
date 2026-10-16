@@ -98,19 +98,19 @@ class ImageLoaderResizeEnndee:
                     "tooltip": "Image from ComfyUI's input folder. Use 'choose file to upload' to add files.",
                 }),
                 "resize": ("BOOLEAN", {
-                    "default": False,
+                    "default": True,
                     "tooltip": "Resize the loaded image; the untouched file stays available on 'original_image'.",
                 }),
                 "resize_type": (list(resize_modes.RESIZE_TYPES), {
-                    "default": "scale dimensions",
+                    "default": "scale total pixels",
                     "tooltip": "Resize behaviour copied from ComfyUI's Resize Image/Mask node.",
                 }),
                 "width": ("INT", {
-                    "default": 512, "min": 0, "max": MAX_RESOLUTION, "step": 1,
+                    "default": 1000, "min": 0, "max": MAX_RESOLUTION, "step": 1,
                     "tooltip": "'scale dimensions' / 'scale width': target width. 0 derives it from the height.",
                 }),
                 "height": ("INT", {
-                    "default": 512, "min": 0, "max": MAX_RESOLUTION, "step": 1,
+                    "default": 1000, "min": 0, "max": MAX_RESOLUTION, "step": 1,
                     "tooltip": "'scale dimensions' / 'scale height': target height. 0 derives it from the width.",
                 }),
                 "repeat": ("INT", {
@@ -122,7 +122,7 @@ class ImageLoaderResizeEnndee:
                     "tooltip": "Keep the aspect ratio and fill the remainder with 'background_color' when the target size disagrees; off stretches to the exact size. Applies to 'scale dimensions' and 'match size'.",
                 }),
                 "divisible_by": ("INT", {
-                    "default": 2, "min": 1, "max": 1024, "step": 1,
+                    "default": 32, "min": 1, "max": 1024, "step": 1,
                     "tooltip": "Round the final width/height down to this multiple (2 keeps even sizes).",
                 }),
                 "mask_channel": (list(MASK_CHANNELS), {
@@ -154,11 +154,11 @@ class ImageLoaderResizeEnndee:
                     "tooltip": "'scale to multiple': floor width/height to this step, then cover-resize and center-crop.",
                 }),
                 "scale_method": (list(resize_modes.SCALE_METHODS), {
-                    "default": "lanczos",
+                    "default": "area",
                     "tooltip": "Interpolation for the resized image and mask. 'area' is best for downscaling, 'lanczos' for upscaling.",
                 }),
                 "no_upscale": ("BOOLEAN", {
-                    "default": False,
+                    "default": True,
                     "tooltip": "Never enlarge: when the resize target is bigger than the loaded image, keep the image at its current size ('keep_proportion' still fills the target canvas with 'background_color').",
                 }),
             },
